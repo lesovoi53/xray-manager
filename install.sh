@@ -170,25 +170,25 @@ try:
 
     # 1.1 Обеспечиваем наличие и корректную конфигурацию ВСЕХ 3 шлюзов в таблице inbounds базы 3X-UI
     try:
-        # Порт 10808 (Mieru): protocol mixed, UDP включен, без авторизации, sniffing выключен
+        # Порт 10808: protocol mixed, UDP включен, без авторизации, sniffing выключен
         mixed_settings = json.dumps({"auth": "noauth", "udp": True, "ip": "127.0.0.1"})
         row_10808 = c.execute("SELECT id FROM inbounds WHERE port=10808").fetchone()
         if row_10808:
             c.execute("""
                 UPDATE inbounds 
-                SET protocol='mixed', remark='Mieru Mixed Gateway', settings=?, stream_settings='{}',
-                    tag='in-mieru-gateway', listen='127.0.0.1', enable=1, sniffing='{"enabled":false}'
+                SET protocol='mixed', remark='Mixed Gateway', settings=?, stream_settings='{}',
+                    tag='in-mixed-gateway', listen='127.0.0.1', enable=1, sniffing='{"enabled":false}'
                 WHERE id=?
             """, (mixed_settings, row_10808[0]))
             print("UPDATED_INBOUNDS_MIXED=10808")
         else:
             c.execute("""
                 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'Mieru Mixed Gateway', 1, 0, '127.0.0.1', 10808, 'mixed', ?, '{}', 'in-mieru-gateway', '{"enabled":false}')
+                VALUES (1, 0, 0, 0, 'Mixed Gateway', 1, 0, '127.0.0.1', 10808, 'mixed', ?, '{}', 'in-mixed-gateway', '{"enabled":false}')
             """, (mixed_settings,))
             print("INSERTED_INBOUNDS_MIXED=10808")
 
-        # Порт 12345 (WDTT): protocol dokodemo-door (TPROXY)
+        # Порт 12345: protocol dokodemo-door (TPROXY)
         tproxy_settings = json.dumps({"network": "tcp,udp", "followRedirect": True})
         tproxy_stream = json.dumps({"sockopt": {"tproxy": "tproxy"}})
         tproxy_sniffing = json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
@@ -196,34 +196,34 @@ try:
         if row_12345:
             c.execute("""
                 UPDATE inbounds
-                SET protocol='dokodemo-door', remark='WDTT TPROXY Gateway', settings=?, stream_settings=?,
-                    tag='in-wdtt-tproxy', listen='127.0.0.1', enable=1, sniffing=?
+                SET protocol='dokodemo-door', remark='TPROXY Gateway', settings=?, stream_settings=?,
+                    tag='in-tproxy-gateway', listen='127.0.0.1', enable=1, sniffing=?
                 WHERE id=?
             """, (tproxy_settings, tproxy_stream, tproxy_sniffing, row_12345[0]))
             print("UPDATED_INBOUNDS_TPROXY=12345")
         else:
             c.execute("""
                 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'WDTT TPROXY Gateway', 1, 0, '127.0.0.1', 12345, 'dokodemo-door', ?, ?, 'in-wdtt-tproxy', ?)
+                VALUES (1, 0, 0, 0, 'TPROXY Gateway', 1, 0, '127.0.0.1', 12345, 'dokodemo-door', ?, ?, 'in-tproxy-gateway', ?)
             """, (tproxy_settings, tproxy_stream, tproxy_sniffing))
             print("INSERTED_INBOUNDS_TPROXY=12345")
 
-        # Порт 12346 (Snell): protocol dokodemo-door (REDIRECT)
-        redirect_settings = json.dumps({"network": "tcp", "followRedirect": True})
+        # Порт 12346: protocol dokodemo-door (REDIRECT TCP + UDP)
+        redirect_settings = json.dumps({"network": "tcp,udp", "followRedirect": True})
         redirect_sniffing = json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
         row_12346 = c.execute("SELECT id FROM inbounds WHERE port=12346").fetchone()
         if row_12346:
             c.execute("""
                 UPDATE inbounds
-                SET protocol='dokodemo-door', remark='Snell REDIRECT Gateway', settings=?, stream_settings='{}',
-                    tag='in-snell-redirect', listen='127.0.0.1', enable=1, sniffing=?
+                SET protocol='dokodemo-door', remark='REDIRECT Gateway', settings=?, stream_settings='{}',
+                    tag='in-redirect-gateway', listen='127.0.0.1', enable=1, sniffing=?
                 WHERE id=?
             """, (redirect_settings, redirect_sniffing, row_12346[0]))
             print("UPDATED_INBOUNDS_REDIRECT=12346")
         else:
             c.execute("""
                 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'Snell REDIRECT Gateway', 1, 0, '127.0.0.1', 12346, 'dokodemo-door', ?, '{}', 'in-snell-redirect', ?)
+                VALUES (1, 0, 0, 0, 'REDIRECT Gateway', 1, 0, '127.0.0.1', 12346, 'dokodemo-door', ?, '{}', 'in-redirect-gateway', ?)
             """, (redirect_settings, redirect_sniffing))
             print("INSERTED_INBOUNDS_REDIRECT=12346")
 
@@ -243,7 +243,11 @@ try:
         # Чтобы исключить дублирование сокетов (Address already in use) при объединении конфига ядром 3X-UI,
         # удаляем их дубликаты из массива inbounds шаблона.
         gateway_ports = {10808, 12345, 12346}
-        gateway_tags = {"in-mieru-socks", "in-mieru-gateway", "in-wdtt-tproxy", "in-snell-redirect"}
+        gateway_tags = {
+            "in-mieru-socks", "in-mieru-gateway", "in-mixed-gateway",
+            "in-wdtt-tproxy", "in-tproxy-gateway",
+            "in-snell-redirect", "in-redirect-gateway"
+        }
         
         inbounds_clean = [ib for ib in inbounds if ib.get("port") not in gateway_ports and ib.get("tag") not in gateway_tags]
         if len(inbounds_clean) != len(inbounds):
@@ -295,33 +299,33 @@ EOF
         case "$line" in
             FOUND_TPROXY=*)
                 XRAY_TPROXY_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ TPROXY шлюз:${NC} :${XRAY_TPROXY_PORT} (WDTT TPROXY Gateway)"
+                echo -e "  ${GREEN}✓ TPROXY шлюз:${NC} :${XRAY_TPROXY_PORT} (TPROXY Gateway)"
                 ;;
             FOUND_SOCKS=*)
                 XRAY_SOCKS_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ SOCKS5/Mixed вход:${NC} :${XRAY_SOCKS_PORT} (Mieru Mixed Gateway)"
+                echo -e "  ${GREEN}✓ Mixed/SOCKS5 вход:${NC} :${XRAY_SOCKS_PORT} (Mixed Gateway)"
                 ;;
             FOUND_REDIRECT=*)
                 XRAY_REDIRECT_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ REDIRECT шлюз:${NC} :${XRAY_REDIRECT_PORT} (Snell REDIRECT Gateway)"
+                echo -e "  ${GREEN}✓ REDIRECT шлюз:${NC} :${XRAY_REDIRECT_PORT} (REDIRECT Gateway)"
                 ;;
             UPDATED_INBOUNDS_MIXED=*)
-                echo -e "  ${GREEN}✓ Mieru Mixed Gateway (:10808) синхронизирован в панели (mixed, UDP вкл, NoAuth)${NC}"
+                echo -e "  ${GREEN}✓ Mixed Gateway (:10808) синхронизирован в панели (mixed, UDP вкл, NoAuth)${NC}"
                 ;;
             INSERTED_INBOUNDS_MIXED=*)
-                echo -e "  ${GREEN}✓ Mieru Mixed Gateway (:10808) добавлен в таблицу inbounds панели (mixed)${NC}"
+                echo -e "  ${GREEN}✓ Mixed Gateway (:10808) добавлен в таблицу inbounds панели (mixed)${NC}"
                 ;;
             UPDATED_INBOUNDS_TPROXY=*)
-                echo -e "  ${GREEN}✓ WDTT TPROXY Gateway (:12345) синхронизирован в таблице inbounds панели${NC}"
+                echo -e "  ${GREEN}✓ TPROXY Gateway (:12345) синхронизирован в таблице inbounds панели${NC}"
                 ;;
             INSERTED_INBOUNDS_TPROXY=*)
-                echo -e "  ${GREEN}✓ WDTT TPROXY Gateway (:12345) добавлен в таблицу inbounds панели${NC}"
+                echo -e "  ${GREEN}✓ TPROXY Gateway (:12345) добавлен в таблицу inbounds панели${NC}"
                 ;;
             UPDATED_INBOUNDS_REDIRECT=*)
-                echo -e "  ${GREEN}✓ Snell REDIRECT Gateway (:12346) синхронизирован в таблице inbounds панели${NC}"
+                echo -e "  ${GREEN}✓ REDIRECT Gateway (:12346) синхронизирован в таблице inbounds панели${NC}"
                 ;;
             INSERTED_INBOUNDS_REDIRECT=*)
-                echo -e "  ${GREEN}✓ Snell REDIRECT Gateway (:12346) добавлен в таблицу inbounds панели${NC}"
+                echo -e "  ${GREEN}✓ REDIRECT Gateway (:12346) добавлен в таблицу inbounds панели${NC}"
                 ;;
             REMOVED_GATEWAYS_FROM_TEMPLATE=1)
                 echo -e "  ${GREEN}✓ Дубликаты шлюзов удалены из шаблона ядра (предотвращение конфликта портов)${NC}"
@@ -384,7 +388,7 @@ EOF
     chown -R snell:snell /etc/snell
     chmod 644 /etc/snell/snell-server.conf
 
-    # Скрипт маршрутизации snell-routing.sh с использованием подхваченного REDIRECT порта
+    # Скрипт маршрутизации snell-routing.sh с использованием подхваченного REDIRECT порта (TCP + UDP)
     cat << EOF > /usr/local/bin/snell-routing.sh
 #!/usr/bin/env bash
 MODE_FILE="/etc/snell/routing.mode"
@@ -396,11 +400,24 @@ iptables -w 5 -t nat -F SNELL_OUT 2>/dev/null || true
 iptables -w 5 -t nat -X SNELL_OUT 2>/dev/null || true
 
 if [ "\$MODE" = "xray" ]; then
+    SNELL_PORT=\$(grep -oP '^listen\s*=\s*.*:\K[0-9]+' /etc/snell/snell-server.conf 2>/dev/null || echo "1488")
+
     iptables -w 5 -t nat -N SNELL_OUT 2>/dev/null || true
     iptables -w 5 -t nat -F SNELL_OUT 2>/dev/null || true
+    
+    # Исключения: локальный трафик и IP сервера
     iptables -w 5 -t nat -A SNELL_OUT -d 127.0.0.0/8 -j RETURN
     iptables -w 5 -t nat -A SNELL_OUT -d ${SERVER_IP} -j RETURN 2>/dev/null || true
+    
+    # Исключения: установленные соединения и ответы клиентам с собственного порта Snell (TCP/QUIC)
+    iptables -w 5 -t nat -A SNELL_OUT -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null || true
+    [ -n "\$SNELL_PORT" ] && iptables -w 5 -t nat -A SNELL_OUT -p udp --sport "\$SNELL_PORT" -j RETURN 2>/dev/null || true
+    [ -n "\$SNELL_PORT" ] && iptables -w 5 -t nat -A SNELL_OUT -p tcp --sport "\$SNELL_PORT" -j RETURN 2>/dev/null || true
+
+    # Перехват исходящего TCP и UDP трафика в REDIRECT шлюз Xray
     iptables -w 5 -t nat -A SNELL_OUT -p tcp -j REDIRECT --to-ports ${XRAY_REDIRECT_PORT}
+    iptables -w 5 -t nat -A SNELL_OUT -p udp -j REDIRECT --to-ports ${XRAY_REDIRECT_PORT}
+
     iptables -w 5 -t nat -C OUTPUT -m owner --uid-owner snell -j SNELL_OUT 2>/dev/null || iptables -w 5 -t nat -I OUTPUT 1 -m owner --uid-owner snell -j SNELL_OUT
 fi
 EOF
