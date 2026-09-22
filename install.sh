@@ -457,7 +457,7 @@ if [ "$INSTALL_MIERU" = "yes" ]; then
     ln -sfn /etc/mita /etc/mieru
 
     echo -e "  -> Проверка последней доступной версии Mieru (mita) на GitHub..."
-    local latest_tag=$(curl -fsSL -I -o /dev/null -w '%{url_effective}' https://github.com/enfein/mieru/releases/latest 2>/dev/null | sed -e 's#.*/tag/##' -e 's#.*/tag/v##' -e 's#^v##')
+    latest_tag=$(curl -fsSL -I -o /dev/null -w '%{url_effective}' https://github.com/enfein/mieru/releases/latest 2>/dev/null | sed -e 's#.*/tag/##' -e 's#.*/tag/v##' -e 's#^v##')
     if [ -z "$latest_tag" ] || [[ "$latest_tag" =~ "github.com" ]]; then
         latest_tag=$(curl -fsSL https://api.github.com/repos/enfein/mieru/releases/latest 2>/dev/null | grep -o '"tag_name": *"[^"]*' | sed -e 's/"tag_name": *"//' -e 's/^v//')
     fi
@@ -470,11 +470,11 @@ if [ "$INSTALL_MIERU" = "yes" ]; then
         *) DEB_ARCH="amd64" ;;
     esac
 
-    local need_download=false
+    need_download=false
     if ! command -v mita &>/dev/null; then
         need_download=true
     else
-        local cur_mita_ver=$(mita version 2>/dev/null | head -n1 | tr -d 'v[:space:]')
+        cur_mita_ver=$(mita version 2>/dev/null | head -n1 | tr -d 'v[:space:]')
         if [ "$cur_mita_ver" != "$mita_ver" ]; then
             echo -e "  -> Обнаружена версия v${cur_mita_ver}. Обновляем до последней v${mita_ver}..."
             need_download=true
