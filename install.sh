@@ -168,36 +168,24 @@ try:
     except Exception:
         pass
 
-    # 1.1 Обеспечиваем наличие записей шлюзов в таблице inbounds базы 3X-UI
+    # 1.1 В таблице inbounds настраиваем ТОЛЬКО редактируемый mixed шлюз для Mieru
     try:
-        if not c.execute("SELECT id FROM inbounds WHERE port=10808").fetchone():
+        # Удаляем dokodemo-door из таблицы inbounds (они не поддерживаются редактором веб-панели и живут в шаблоне)
+        c.execute("DELETE FROM inbounds WHERE port IN (12345, 12346) OR tag IN ('in-snell-redirect', 'in-wdtt-tproxy')")
+        
+        # Порт 10808 настраиваем как protocol: mixed (SOCKS5+HTTP) с включенным UDP и noauth
+        mixed_settings = json.dumps({"auth": "noauth", "udp": True, "ip": "127.0.0.1"})
+        row_10808 = c.execute("SELECT id FROM inbounds WHERE port=10808").fetchone()
+        if row_10808:
+            c.execute("UPDATE inbounds SET protocol='mixed', remark='Mieru Gateway', settings=?, tag='in-mieru-gateway' WHERE id=?", (mixed_settings, row_10808[0]))
+            print("UPDATED_INBOUNDS_MIXED=10808")
+        else:
             c.execute("""
                 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'Mieru SOCKS5 Gateway', 1, 0, '127.0.0.1', 10808, 'socks', ?, '{}', 'in-mieru-socks', '{}')
-            """, (json.dumps({"auth": "noauth", "udp": True, "ip": "127.0.0.1"}),))
-            conn.commit()
-            print("INSERTED_INBOUNDS_SOCKS=10808")
-        if not c.execute("SELECT id FROM inbounds WHERE port=12345").fetchone():
-            c.execute("""
-                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'WDTT TPROXY Gateway', 1, 0, '127.0.0.1', 12345, 'dokodemo-door', ?, ?, 'in-wdtt-tproxy', ?)
-            """, (
-                json.dumps({"network": "tcp,udp", "followRedirect": True}),
-                json.dumps({"sockopt": {"tproxy": "tproxy"}}),
-                json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
-            ))
-            conn.commit()
-            print("INSERTED_INBOUNDS_TPROXY=12345")
-        if not c.execute("SELECT id FROM inbounds WHERE port=12346").fetchone():
-            c.execute("""
-                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'Snell REDIRECT Gateway', 1, 0, '127.0.0.1', 12346, 'dokodemo-door', ?, '{}', 'in-snell-redirect', ?)
-            """, (
-                json.dumps({"network": "tcp", "followRedirect": True}),
-                json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
-            ))
-            conn.commit()
-            print("INSERTED_INBOUNDS_REDIRECT=12346")
+                VALUES (1, 0, 0, 0, 'Mieru Gateway', 1, 0, '127.0.0.1', 10808, 'mixed', ?, '{}', 'in-mieru-gateway', '{"enabled":false}')
+            """, (mixed_settings,))
+            print("INSERTED_INBOUNDS_MIXED=10808")
+        conn.commit()
     except Exception as e_ib:
         pass
 
@@ -207,6 +195,14 @@ try:
     if row:
         cfg = json.loads(row[0])
         inbounds = cfg.setdefault("inbounds", [])
+        
+        # Убираем дубликат 10808 из шаблона (он теперь штатно живёт в таблице inbounds как mixed)
+        inbounds_clean = [ib for ib in inbounds if ib.get("port") != 10808 and ib.get("tag") != "in-mieru-socks"]
+        if len(inbounds_clean) != len(inbounds):
+            cfg["inbounds"] = inbounds_clean
+            inbounds = inbounds_clean
+            modified = True
+
         for ib in inbounds:
             proto = ib.get("protocol", "")
             port = ib.get("port")
@@ -214,7 +210,7 @@ try:
             stream_s = json.dumps(ib.get("streamSettings", {}))
             settings = json.dumps(ib.get("settings", {}))
 
-            if proto == "socks" and not socks_port:
+            if proto in ("socks", "mixed") and not socks_port:
                 socks_port = port
             elif proto == "dokodemo-door":
                 if "tproxy" in stream_s.lower() or "tproxy" in tag.lower() or port == 12345:
@@ -224,22 +220,8 @@ try:
                     if not redirect_port:
                         redirect_port = port
 
-        # Создаем недостающие шлюзы в шаблоне
-        modified = False
-        if not socks_port:
-            socks_port = 10808
-            inbounds.append({
-                "tag": "in-mieru-socks",
-                "port": socks_port,
-                "protocol": "socks",
-                "listen": "127.0.0.1",
-                "settings": {"auth": "noauth", "udp": True}
-            })
-            modified = True
-            print(f"CREATED_SOCKS={socks_port}")
-        else:
-            print(f"FOUND_SOCKS={socks_port}")
-
+        # Создаем недостающие dokodemo шлюзы в шаблоне
+        socks_port = 10808
         if not redirect_port:
             redirect_port = 12346
             inbounds.append({
@@ -249,6 +231,7 @@ try:
                 "listen": "127.0.0.1",
                 "settings": {"network": "tcp", "followRedirect": True}
             })
+            modified = True
             modified = True
             print(f"CREATED_REDIRECT={redirect_port}")
         else:

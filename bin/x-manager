@@ -2220,8 +2220,8 @@ detect_primary_ssl_cert() {
                 local cn=$(openssl x509 -subject -noout -in "$c_path" 2>/dev/null | grep -oP 'CN\s*=\s*\K[^,\/]+' || true)
                 [ -n "$cn" ] && d_label="$cn"
             fi
-            # Проверка срока действия
-            if openssl x509 -in "$c_path" -noout -checkend 0 2>/dev/null; then
+            # Проверка срока действия (redirect stdout and stderr to prevent text leak)
+            if openssl x509 -in "$c_path" -noout -checkend 0 >/dev/null 2>&1; then
                 echo "${c_path}|${k_path}|${d_label}|${exp}"
                 return 0
             else
@@ -2239,10 +2239,10 @@ detect_primary_ssl_cert() {
 }
 
 get_ssl_short_status() {
-    local cert_info=$(detect_primary_ssl_cert 2>/dev/null || true)
+    local cert_info=$(detect_primary_ssl_cert 2>/dev/null | tail -n 1 || true)
     if [ -n "$cert_info" ]; then
-        local d_label=$(echo "$cert_info" | cut -d'|' -f3)
-        local exp=$(echo "$cert_info" | cut -d'|' -f4)
+        local d_label=$(echo "$cert_info" | cut -d'|' -f3 | tr -d '\r\n')
+        local exp=$(echo "$cert_info" | cut -d'|' -f4 | tr -d '\r\n')
         if echo "$exp" | grep -qi "ИСТЕК"; then
             echo -e "${RED}ИСТЕК (${d_label})${NC}"
         else
