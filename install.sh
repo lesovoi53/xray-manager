@@ -168,26 +168,68 @@ try:
     except Exception:
         pass
 
-    # 1.1 В таблице inbounds настраиваем ТОЛЬКО редактируемый mixed шлюз для Mieru
+    # 1.1 Обеспечиваем наличие и корректную конфигурацию ВСЕХ 3 шлюзов в таблице inbounds базы 3X-UI
     try:
-        # Удаляем dokodemo-door из таблицы inbounds (они не поддерживаются редактором веб-панели и живут в шаблоне)
-        c.execute("DELETE FROM inbounds WHERE port IN (12345, 12346) OR tag IN ('in-snell-redirect', 'in-wdtt-tproxy')")
-        
-        # Порт 10808 настраиваем как protocol: mixed (SOCKS5+HTTP) с включенным UDP и noauth
+        # Порт 10808 (Mieru): protocol mixed, UDP включен, без авторизации, sniffing выключен
         mixed_settings = json.dumps({"auth": "noauth", "udp": True, "ip": "127.0.0.1"})
         row_10808 = c.execute("SELECT id FROM inbounds WHERE port=10808").fetchone()
         if row_10808:
-            c.execute("UPDATE inbounds SET protocol='mixed', remark='Mieru Gateway', settings=?, tag='in-mieru-gateway' WHERE id=?", (mixed_settings, row_10808[0]))
+            c.execute("""
+                UPDATE inbounds 
+                SET protocol='mixed', remark='Mieru Mixed Gateway', settings=?, stream_settings='{}',
+                    tag='in-mieru-gateway', listen='127.0.0.1', enable=1, sniffing='{"enabled":false}'
+                WHERE id=?
+            """, (mixed_settings, row_10808[0]))
             print("UPDATED_INBOUNDS_MIXED=10808")
         else:
             c.execute("""
                 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'Mieru Gateway', 1, 0, '127.0.0.1', 10808, 'mixed', ?, '{}', 'in-mieru-gateway', '{"enabled":false}')
+                VALUES (1, 0, 0, 0, 'Mieru Mixed Gateway', 1, 0, '127.0.0.1', 10808, 'mixed', ?, '{}', 'in-mieru-gateway', '{"enabled":false}')
             """, (mixed_settings,))
             print("INSERTED_INBOUNDS_MIXED=10808")
+
+        # Порт 12345 (WDTT): protocol dokodemo-door (TPROXY)
+        tproxy_settings = json.dumps({"network": "tcp,udp", "followRedirect": True})
+        tproxy_stream = json.dumps({"sockopt": {"tproxy": "tproxy"}})
+        tproxy_sniffing = json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
+        row_12345 = c.execute("SELECT id FROM inbounds WHERE port=12345").fetchone()
+        if row_12345:
+            c.execute("""
+                UPDATE inbounds
+                SET protocol='dokodemo-door', remark='WDTT TPROXY Gateway', settings=?, stream_settings=?,
+                    tag='in-wdtt-tproxy', listen='127.0.0.1', enable=1, sniffing=?
+                WHERE id=?
+            """, (tproxy_settings, tproxy_stream, tproxy_sniffing, row_12345[0]))
+            print("UPDATED_INBOUNDS_TPROXY=12345")
+        else:
+            c.execute("""
+                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+                VALUES (1, 0, 0, 0, 'WDTT TPROXY Gateway', 1, 0, '127.0.0.1', 12345, 'dokodemo-door', ?, ?, 'in-wdtt-tproxy', ?)
+            """, (tproxy_settings, tproxy_stream, tproxy_sniffing))
+            print("INSERTED_INBOUNDS_TPROXY=12345")
+
+        # Порт 12346 (Snell): protocol dokodemo-door (REDIRECT)
+        redirect_settings = json.dumps({"network": "tcp", "followRedirect": True})
+        redirect_sniffing = json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
+        row_12346 = c.execute("SELECT id FROM inbounds WHERE port=12346").fetchone()
+        if row_12346:
+            c.execute("""
+                UPDATE inbounds
+                SET protocol='dokodemo-door', remark='Snell REDIRECT Gateway', settings=?, stream_settings='{}',
+                    tag='in-snell-redirect', listen='127.0.0.1', enable=1, sniffing=?
+                WHERE id=?
+            """, (redirect_settings, redirect_sniffing, row_12346[0]))
+            print("UPDATED_INBOUNDS_REDIRECT=12346")
+        else:
+            c.execute("""
+                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+                VALUES (1, 0, 0, 0, 'Snell REDIRECT Gateway', 1, 0, '127.0.0.1', 12346, 'dokodemo-door', ?, '{}', 'in-snell-redirect', ?)
+            """, (redirect_settings, redirect_sniffing))
+            print("INSERTED_INBOUNDS_REDIRECT=12346")
+
         conn.commit()
     except Exception as e_ib:
-        pass
+        print(f"ERROR_INBOUNDS_TABLE={e_ib}")
 
     # 2. Проверяем xrayTemplateConfig в таблице settings
     c.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig'")
@@ -196,69 +238,26 @@ try:
         cfg = json.loads(row[0])
         inbounds = cfg.setdefault("inbounds", [])
         
-        # Убираем дубликат 10808 из шаблона (он теперь штатно живёт в таблице inbounds как mixed)
-        inbounds_clean = [ib for ib in inbounds if ib.get("port") != 10808 and ib.get("tag") != "in-mieru-socks"]
+        modified = False
+        # ВАЖНО: Все 3 шлюза (10808, 12345, 12346) живут в таблице inbounds базы 3X-UI.
+        # Чтобы исключить дублирование сокетов (Address already in use) при объединении конфига ядром 3X-UI,
+        # удаляем их дубликаты из массива inbounds шаблона.
+        gateway_ports = {10808, 12345, 12346}
+        gateway_tags = {"in-mieru-socks", "in-mieru-gateway", "in-wdtt-tproxy", "in-snell-redirect"}
+        
+        inbounds_clean = [ib for ib in inbounds if ib.get("port") not in gateway_ports and ib.get("tag") not in gateway_tags]
         if len(inbounds_clean) != len(inbounds):
             cfg["inbounds"] = inbounds_clean
             inbounds = inbounds_clean
             modified = True
+            print("REMOVED_GATEWAYS_FROM_TEMPLATE=1")
 
-        for ib in inbounds:
-            proto = ib.get("protocol", "")
-            port = ib.get("port")
-            tag = ib.get("tag", "")
-            stream_s = json.dumps(ib.get("streamSettings", {}))
-            settings = json.dumps(ib.get("settings", {}))
-
-            if proto in ("socks", "mixed") and not socks_port:
-                socks_port = port
-            elif proto == "dokodemo-door":
-                if "tproxy" in stream_s.lower() or "tproxy" in tag.lower() or port == 12345:
-                    if not tproxy_port:
-                        tproxy_port = port
-                elif "redirect" in settings.lower() or "redirect" in tag.lower() or "snell" in tag.lower() or port == 12346:
-                    if not redirect_port:
-                        redirect_port = port
-
-        # Создаем недостающие dokodemo шлюзы в шаблоне
         socks_port = 10808
-        if not redirect_port:
-            redirect_port = 12346
-            inbounds.append({
-                "tag": "in-snell-redirect",
-                "port": redirect_port,
-                "protocol": "dokodemo-door",
-                "listen": "127.0.0.1",
-                "settings": {"network": "tcp", "followRedirect": True}
-            })
-            modified = True
-            modified = True
-            print(f"CREATED_REDIRECT={redirect_port}")
-        else:
-            print(f"FOUND_REDIRECT={redirect_port}")
-
-        if not tproxy_port:
-            tproxy_port = 12345
-            inbounds.append({
-                "tag": "in-wdtt-tproxy",
-                "port": tproxy_port,
-                "protocol": "dokodemo-door",
-                "listen": "127.0.0.1",
-                "settings": {"network": "tcp,udp", "followRedirect": True},
-                "streamSettings": {"sockopt": {"tproxy": "tproxy"}}
-            })
-            modified = True
-            print(f"CREATED_TPROXY={tproxy_port}")
-        else:
-            print(f"FOUND_TPROXY={tproxy_port}")
-
-        # Очищаем sniffing на SOCKS5 входе ядра (предотвращает разрыв сессий и поломку туннелей)
-        for ib in inbounds:
-            if ib.get("protocol") == "socks" or ib.get("port") == socks_port or ib.get("tag") == "in-mieru-socks":
-                if "sniffing" in ib:
-                    del ib["sniffing"]
-                    modified = True
-                    print("CLEANED_SOCKS_SNIFFING=1")
+        tproxy_port = 12345
+        redirect_port = 12346
+        print(f"FOUND_SOCKS={socks_port}")
+        print(f"FOUND_TPROXY={tproxy_port}")
+        print(f"FOUND_REDIRECT={redirect_port}")
 
         # Обеспечиваем наличие blackhole outbound 'blocked'
         outbound_tags = [o.get("tag") for o in cfg.get("outbounds", [])]
@@ -296,30 +295,36 @@ EOF
         case "$line" in
             FOUND_TPROXY=*)
                 XRAY_TPROXY_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ Подхвачен существующий TPROXY шлюз:${NC} :${XRAY_TPROXY_PORT}"
-                ;;
-            CREATED_TPROXY=*)
-                XRAY_TPROXY_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ Создан новый TPROXY шлюз:${NC} :${XRAY_TPROXY_PORT}"
+                echo -e "  ${GREEN}✓ TPROXY шлюз:${NC} :${XRAY_TPROXY_PORT} (WDTT TPROXY Gateway)"
                 ;;
             FOUND_SOCKS=*)
                 XRAY_SOCKS_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ Подхвачен существующий SOCKS5 вход:${NC} :${XRAY_SOCKS_PORT}"
-                ;;
-            CREATED_SOCKS=*)
-                XRAY_SOCKS_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ Создан новый SOCKS5 вход:${NC} :${XRAY_SOCKS_PORT}"
+                echo -e "  ${GREEN}✓ SOCKS5/Mixed вход:${NC} :${XRAY_SOCKS_PORT} (Mieru Mixed Gateway)"
                 ;;
             FOUND_REDIRECT=*)
                 XRAY_REDIRECT_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ Подхвачен существующий REDIRECT шлюз:${NC} :${XRAY_REDIRECT_PORT}"
+                echo -e "  ${GREEN}✓ REDIRECT шлюз:${NC} :${XRAY_REDIRECT_PORT} (Snell REDIRECT Gateway)"
                 ;;
-            CREATED_REDIRECT=*)
-                XRAY_REDIRECT_PORT="${line#*=}"
-                echo -e "  ${GREEN}✓ Создан новый REDIRECT шлюз:${NC} :${XRAY_REDIRECT_PORT}"
+            UPDATED_INBOUNDS_MIXED=*)
+                echo -e "  ${GREEN}✓ Mieru Mixed Gateway (:10808) синхронизирован в панели (mixed, UDP вкл, NoAuth)${NC}"
                 ;;
-            CLEANED_SOCKS_SNIFFING=1)
-                echo -e "  ${GREEN}✓ Отключен sniffing на SOCKS5 входе ядра (предотвращение сбоев)${NC}"
+            INSERTED_INBOUNDS_MIXED=*)
+                echo -e "  ${GREEN}✓ Mieru Mixed Gateway (:10808) добавлен в таблицу inbounds панели (mixed)${NC}"
+                ;;
+            UPDATED_INBOUNDS_TPROXY=*)
+                echo -e "  ${GREEN}✓ WDTT TPROXY Gateway (:12345) синхронизирован в таблице inbounds панели${NC}"
+                ;;
+            INSERTED_INBOUNDS_TPROXY=*)
+                echo -e "  ${GREEN}✓ WDTT TPROXY Gateway (:12345) добавлен в таблицу inbounds панели${NC}"
+                ;;
+            UPDATED_INBOUNDS_REDIRECT=*)
+                echo -e "  ${GREEN}✓ Snell REDIRECT Gateway (:12346) синхронизирован в таблице inbounds панели${NC}"
+                ;;
+            INSERTED_INBOUNDS_REDIRECT=*)
+                echo -e "  ${GREEN}✓ Snell REDIRECT Gateway (:12346) добавлен в таблицу inbounds панели${NC}"
+                ;;
+            REMOVED_GATEWAYS_FROM_TEMPLATE=1)
+                echo -e "  ${GREEN}✓ Дубликаты шлюзов удалены из шаблона ядра (предотвращение конфликта портов)${NC}"
                 ;;
             PATCHED_BALANCER_FALLBACK=*)
                 b_name="${line#*=}"
