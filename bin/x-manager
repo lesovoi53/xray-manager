@@ -4472,6 +4472,287 @@ menu_system_opt() {
 }
 
 # ==============================================================================
+# РАЗДЕЛ 12: СЕРВЕР ПОДПИСОК TUNA (TUNA-SUBSCRIPTIONS)
+# ==============================================================================
+
+is_sub_server_installed() {
+    [ -f "/usr/local/bin/tuna-subscriptions" ] || [ -f "/etc/systemd/system/tuna-subscriptions.service" ]
+}
+
+get_sub_server_status() {
+    if ! is_sub_server_installed; then
+        echo -e "${RED}НЕ УСТАНОВЛЕН${NC}"
+        return
+    fi
+    if systemctl is-active --quiet tuna-subscriptions 2>/dev/null; then
+        echo -e "${GREEN}🟢 РАБОТАЕТ (Active)${NC}"
+    else
+        echo -e "${RED}🔴 ОСТАНОВЛЕН (Inactive)${NC}"
+    fi
+}
+
+get_sub_server_short_status() {
+    if systemctl is-active --quiet tuna-subscriptions 2>/dev/null; then
+        echo -e "${GREEN}Active${NC}"
+    else
+        echo -e "${RED}Inactive${NC}"
+    fi
+}
+
+extract_current_server_links() {
+    local nick="$1"
+    [ -z "$nick" ] && nick="user_$(date +%s)"
+
+    # 1. Snell URI
+    local s_uri=""
+    if is_snell_installed; then
+        local s_port=$(get_snell_port)
+        local s_psk=$(get_snell_psk)
+        if [ -n "$s_port" ] && [ -n "$s_psk" ]; then
+            s_uri="snell://${s_psk}@${SERVER_IP}:${s_port}/?version=5&reuse=true&tfo=true#Snell-v5"
+        fi
+    fi
+
+    # 2. WDTT URI
+    local w_uri=""
+    if is_wdtt_installed; then
+        local w_port=$(get_wdtt_peer_port)
+        local w_pass=$(get_wdtt_password)
+        local w_name=$(get_wdtt_profile_name)
+        if [ -n "$w_port" ] && [ -n "$w_pass" ]; then
+            w_uri=$(python3 -c "
+import urllib.parse, sys
+name, ip, port, password = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+print(f'qwdtt://config?name={urllib.parse.quote_plus(name)}&peer={ip}%3A{port}&hashes=&workers=18&port=9000&pass={urllib.parse.quote_plus(password)}')
+" "$w_name" "$SERVER_IP" "$w_port" "$w_pass" 2>/dev/null || echo "")
+        fi
+    fi
+
+    # 3. Mieru URI
+    local m_uri=""
+    if is_mieru_installed && [ -f "$MIERU_USER_STORE" ]; then
+        local m_first_user=$(jq -r 'keys[0] // empty' "$MIERU_USER_STORE" 2>/dev/null || echo "")
+        if [ -n "$m_first_user" ]; then
+            local m_pass=$(jq -r --arg u "$m_first_user" '.[$u]' "$MIERU_USER_STORE" 2>/dev/null || echo "")
+            local ports_str=$(get_mieru_ports)
+            local p_range=$(echo "$ports_str" | cut -d'/' -f1)
+            local proto=$(echo "$ports_str" | cut -d'/' -f2)
+            local pattern=$(mita export traffic-pattern 2>/dev/null || echo "")
+            m_uri="mierus://${m_first_user}:${m_pass}@${SERVER_IP}/?profile=Mieru-Home&port=${p_range}&protocol=${proto}&multiplexing=MULTIPLEXING_HIGH&traffic-pattern=${pattern}&low-entropy-mode=LOW_ENTROPY_MODE_48&low-entropy-mask-rotation=LOW_ENTROPY_MASK_ROTATE_RIGHT_7"
+        fi
+    fi
+
+    # 4. CSQTT URI
+    local c_uri=""
+    if is_csqtt_installed; then
+        local c_port=$(get_csqtt_peer_port)
+        local c_pass=$(get_csqtt_tunnel_pass)
+        if [ -n "$c_port" ] && [ -n "$c_pass" ] && [ "$c_pass" != "N/A" ]; then
+            c_uri="csqtt://${c_pass}@${SERVER_IP}:${c_port}#CSQTT"
+        fi
+    fi
+
+    # 5. MasterDnsVPN URI
+    local d_uri=""
+    if is_dns_installed; then
+        d_uri=$(get_stormdns_link 1 2>/dev/null || echo "")
+    fi
+
+    python3 -c "
+import json, sys
+data = {
+    'nickname': sys.argv[1],
+    'snell_uri': sys.argv[2],
+    'qwdtt_uri': sys.argv[3],
+    'mieru_uri': sys.argv[4],
+    'csqtt_uri': sys.argv[5],
+    'masterdnsvpn_uri': sys.argv[6]
+}
+print(json.dumps(data))
+" "$nick" "$s_uri" "$w_uri" "$m_uri" "$c_uri" "$d_uri"
+}
+
+menu_subscriptions() {
+    local SUB_API="http://127.0.0.1:22217"
+
+    while true; do
+        clear
+        local s_stat=$(get_sub_server_status)
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${BOLD}          УПРАВЛЕНИЕ СЕРВЕРОМ ПОДПИСОК TUNA (TUNA-SUBSCRIPTIONS)       ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  Статус службы: ${s_stat}"
+        echo -e "${CYAN}║${NC}  API: ${CYAN}${SUB_API}${NC} (Localhost) | База: ${BOLD}/var/lib/tuna-subscriptions/subscriptions.db${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  ${YELLOW}[1]${NC} 👥 ${BOLD}Список профилей и ссылки подписок${NC}"
+        echo -e "  ${YELLOW}[2]${NC} 🚀 ${BOLD}Создать подписку из текущих ссылок сервера${NC} (Snell, Mieru, WDTT, DNS...)"
+        echo -e "  ${YELLOW}[3]${NC} ➕ ${BOLD}Создать пользователя с произвольными ссылками вручную${NC}"
+        echo -e "  ${YELLOW}[4]${NC} 🔄 ${BOLD}Ротация токена подписки${NC} (мгновенно отзывает старую ссылку)"
+        echo -e "  ${YELLOW}[5]${NC} ✏️  ${BOLD}Включить / отключить подписку пользователя${NC}"
+        echo -e "  ${YELLOW}[6]${NC} 🗑️  ${BOLD}Удалить пользователя из сервера подписок${NC}"
+        echo -e "  ${YELLOW}[7]${NC} 🔄 ${BOLD}Перезапустить службу tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[8]${NC} 📜 ${BOLD}Логи службы tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[9]${NC} 📥 ${BOLD}Установить / Обновить службу tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
+        echo ""
+        read -p "Выберите действие [0-9]: " sub_act
+        case "$sub_act" in
+            1)
+                clear
+                echo -e "${CYAN}=== СПИСОК ПОЛЬЗОВАТЕЛЕЙ И ССЫЛОК ПОДПИСКИ ===${NC}\n"
+                local raw_users=$(curl -s "${SUB_API}/api/users" 2>/dev/null || echo "")
+                if [ -z "$raw_users" ] || [ "$raw_users" = "[]" ]; then
+                    echo -e "${YELLOW}Пользователи еще не созданы или служба не запущена.${NC}"
+                else
+                    echo "$raw_users" | jq -r '.[] | "--------------------------------------------------\n👤 Пользователь: \(.nickname)\n🆔 ID:           \(.id)\n🟢 Активен:      \(.enabled)\n🔢 Ревизия:      \(.revision)\n🔗 Ссылка:       \(.subscription_url)\n"' 2>/dev/null || echo "$raw_users"
+                fi
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            2)
+                clear
+                echo -e "${CYAN}=== СОЗДАНИЕ ПОДПИСКИ ИЗ ТЕКУЩИХ СЛУЖБ СЕРВЕРА ===${NC}\n"
+                read -p "Введите ник пользователя (например: alex_travel): " new_nick
+                [ -z "$new_nick" ] && new_nick="user_$(openssl rand -hex 3 2>/dev/null || echo "1")"
+
+                local payload=$(extract_current_server_links "$new_nick")
+                echo -e "${CYAN}[*] Отправка данных в локальный сервер подписок...${NC}"
+                local resp=$(curl -s -X POST "${SUB_API}/api/users" \
+                    -H "Content-Type: application/json" \
+                    -d "$payload" 2>/dev/null || echo "")
+
+                local sub_url=$(echo "$resp" | jq -r '.subscription_url // empty' 2>/dev/null || echo "")
+                if [ -n "$sub_url" ]; then
+                    echo ""
+                    echo -e "${GREEN}${BOLD}✓ Профиль успешно создан!${NC}"
+                    echo -e "  • Никнейм:   ${GREEN}${new_nick}${NC}"
+                    echo -e "  • Ссылка:    ${CYAN}${BOLD}${sub_url}${NC}"
+                    echo ""
+                    echo -e "${BOLD}QR-код персональной ссылки подписки:${NC}"
+                    qrencode -t ANSI256 "$sub_url" 2>/dev/null || qrencode -t UTF8 "$sub_url" 2>/dev/null || true
+                    echo ""
+                    echo -e "${YELLOW}Эту ссылку нужно передать в панель или клиент TUNA как подписку.${NC}"
+                else
+                    echo -e "${RED}Ошибка при создании пользователя:${NC}"
+                    echo "$resp"
+                fi
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            3)
+                clear
+                echo -e "${CYAN}=== РУЧНОЕ СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ ===${NC}\n"
+                read -p "Никнейм: " m_nick
+                [ -z "$m_nick" ] && return
+                read -p "Snell URI [Enter если нет]: " m_snell
+                read -p "WDTT (qwdtt) URI [Enter если нет]: " m_wdtt
+                read -p "Mieru URI [Enter если нет]: " m_mieru
+                read -p "CSQTT URI [Enter если нет]: " m_csqtt
+                read -p "MasterDNS (stormdns) URI [Enter если нет]: " m_dns
+
+                local m_json=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'nickname': sys.argv[1],
+    'snell_uri': sys.argv[2],
+    'qwdtt_uri': sys.argv[3],
+    'mieru_uri': sys.argv[4],
+    'csqtt_uri': sys.argv[5],
+    'masterdnsvpn_uri': sys.argv[6]
+}))" "$m_nick" "$m_snell" "$m_wdtt" "$m_mieru" "$m_csqtt" "$m_dns")
+                local resp=$(curl -s -X POST "${SUB_API}/api/users" -H "Content-Type: application/json" -d "$m_json" 2>/dev/null || echo "")
+                local sub_url=$(echo "$resp" | jq -r '.subscription_url // empty' 2>/dev/null || echo "")
+                if [ -n "$sub_url" ]; then
+                    echo -e "${GREEN}✓ Пользователь создан! URL: ${CYAN}${sub_url}${NC}"
+                    qrencode -t ANSI256 "$sub_url" 2>/dev/null || true
+                else
+                    echo -e "${RED}Ошибка:${NC} $resp"
+                fi
+                echo ""
+                read -p "Нажмите Enter..."
+                ;;
+            4)
+                clear
+                echo -e "${CYAN}=== РОТАЦИЯ ТОКЕНА ПОДПИСКИ ===${NC}\n"
+                read -p "Введите ID пользователя (UUID): " rot_id
+                if [ -n "$rot_id" ]; then
+                    local resp=$(curl -s -X POST "${SUB_API}/api/users/${rot_id}/rotate-token" 2>/dev/null || echo "")
+                    local new_url=$(echo "$resp" | jq -r '.subscription_url // empty' 2>/dev/null || echo "")
+                    if [ -n "$new_url" ]; then
+                        echo -e "${GREEN}✓ Токен успешно обновлен! Старая ссылка более недействительна.${NC}"
+                        echo -e "Новый URL: ${CYAN}${new_url}${NC}"
+                        qrencode -t ANSI256 "$new_url" 2>/dev/null || true
+                    else
+                        echo -e "${RED}Ошибка:${NC} $resp"
+                    fi
+                fi
+                echo ""
+                read -p "Нажмите Enter..."
+                ;;
+            5)
+                clear
+                echo -e "${CYAN}=== ВКЛЮЧЕНИЕ / ОТКЛЮЧЕНИЕ ПОДПИСКИ ===${NC}\n"
+                read -p "Введите ID пользователя: " tog_id
+                if [ -n "$tog_id" ]; then
+                    read -p "Активировать (1) или деактивировать (0)? [1/0]: " tog_val
+                    local en_bool="true"
+                    [ "$tog_val" = "0" ] && en_bool="false"
+                    local resp=$(curl -s -X PUT "${SUB_API}/api/users/${tog_id}" -H "Content-Type: application/json" -d "{\"enabled\": ${en_bool}}" 2>/dev/null || echo "")
+                    echo -e "${GREEN}✓ Статус обновлен:${NC} $resp"
+                fi
+                echo ""
+                read -p "Нажмите Enter..."
+                ;;
+            6)
+                clear
+                echo -e "${CYAN}=== УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ===${NC}\n"
+                read -p "Введите ID пользователя для удаления: " del_id
+                if [ -n "$del_id" ]; then
+                    read -p "Вы уверены, что хотите удалить ${del_id}? [y/N]: " conf
+                    if [ "$conf" = "y" ] || [ "$conf" = "Y" ]; then
+                        local resp=$(curl -s -X DELETE "${SUB_API}/api/users/${del_id}" 2>/dev/null || echo "")
+                        echo -e "${GREEN}✓ Результат:${NC} $resp"
+                    fi
+                fi
+                echo ""
+                read -p "Нажмите Enter..."
+                ;;
+            7)
+                echo -e "${CYAN}[*] Перезапуск службы tuna-subscriptions...${NC}"
+                systemctl restart tuna-subscriptions 2>/dev/null || true
+                sleep 1
+                if systemctl is-active --quiet tuna-subscriptions; then
+                    echo -e "${GREEN}✓ Служба tuna-subscriptions активна и работает!${NC}"
+                else
+                    echo -e "${RED}✗ Служба не смогла запуститься.${NC}"
+                    journalctl -u tuna-subscriptions -n 10 --no-pager
+                fi
+                sleep 2
+                ;;
+            8)
+                journalctl -u tuna-subscriptions -f -n 50
+                ;;
+            9)
+                echo -e "${CYAN}[*] Запуск установки / обновления tuna-subscriptions...${NC}"
+                mkdir -p /tmp/tuna-sub-install
+                curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.py "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/tuna-subscriptions.py?v=$(date +%s)" 2>/dev/null || true
+                curl -fsSL -o /tmp/tuna-sub-install/config.toml.example "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/config.toml.example?v=$(date +%s)" 2>/dev/null || true
+                curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.service "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/tuna-subscriptions.service?v=$(date +%s)" 2>/dev/null || true
+                curl -fsSL -o /tmp/tuna-sub-install/install-sub-server.sh "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/install-sub-server.sh?v=$(date +%s)" 2>/dev/null || true
+                if [ -f /tmp/tuna-sub-install/install-sub-server.sh ]; then
+                    bash /tmp/tuna-sub-install/install-sub-server.sh || true
+                fi
+                rm -rf /tmp/tuna-sub-install
+                sleep 2
+                ;;
+            0) return ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
 # ГЛАВНОЕ МЕНЮ ДИСПЕТЧЕРА
 # ==============================================================================
 main_hub() {
@@ -4502,6 +4783,9 @@ main_hub() {
     elif [ "$invoked" = "x-ssl" ] || [ "$invoked" = "x-cert" ] || [ "$invoked" = "x-acme" ]; then
         menu_ssl
         exit 0
+    elif [ "$invoked" = "x-sub" ] || [ "$invoked" = "x-tuna" ] || [ "$invoked" = "x-subscriptions" ]; then
+        menu_subscriptions
+        exit 0
     fi
 
     while true; do
@@ -4510,7 +4794,7 @@ main_hub() {
         echo -e "${CYAN}║${BOLD}          ЦЕНТР УПРАВЛЕНИЯ ПРОКСИ-СЕРВИСАМИ             ${CYAN}║${NC}"
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
         echo -e "${CYAN}║${NC}  Сервер: ${BOLD}${SERVER_IP}${NC}  |  Шлюзы: TPROXY :12345 [127.0.0.1] | SOCKS5 :10808 [127.0.0.1] 🔒"
-        echo -e "${CYAN}║${NC}  Система: BBR: $(get_bbr_short_status) | Swap: $(get_swap_short_status) | F2B: $(get_f2b_short_status) | SSL: $(get_ssl_short_status)"
+        echo -e "${CYAN}║${NC}  Система: BBR: $(get_bbr_short_status) | Swap: $(get_swap_short_status) | F2B: $(get_f2b_short_status) | SSL: $(get_ssl_short_status) | Sub: $(get_sub_server_short_status)"
         echo -e "${CYAN}║${NC}"
         if is_mieru_installed; then
             echo -e "${CYAN}║${NC}  ${BOLD}[1] 🚀 Mieru (mita v$(get_mieru_version))${NC}   -> $(get_mieru_status)"
@@ -4553,6 +4837,13 @@ main_hub() {
         else
             echo -e "${CYAN}║${NC}  ${BOLD}[5] 🌐 DNS-Туннель (MasterDnsVPN)${NC}  -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
+        echo -e "${CYAN}║${NC}"
+        if is_sub_server_installed; then
+            echo -e "${CYAN}║${NC}  ${BOLD}[6] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
+            echo -e "${CYAN}║${NC}      API: http://127.0.0.1:22217   |  Порт: :22217 [127.0.0.1] 🔒"
+        else
+            echo -e "${CYAN}║${NC}  ${BOLD}[6] 📋 Подписки TUNA${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+        fi
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${GREEN}${BOLD}[1]${NC} 🚀 ${BOLD}Управление Mieru${NC} (Anti-TSPU, Egress, пользователи, порты, фаервол)"
@@ -4567,9 +4858,10 @@ main_hub() {
         echo -e "  ${BOLD}[9]${NC} 🔍 ${BOLD}Пересканировать и подхватить протоколы${NC} (Автоопределение установленных служб)"
         echo -e "  ${GREEN}${BOLD}[10]${NC} ⚙️  ${BOLD}Оптимизация и безопасность${NC} (DNS с пингом, BBR/буферы под RAM, Swap 2/4G, Fail2ban)"
         echo -e "  ${PURPLE}${BOLD}[11]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
+        echo -e "  ${CYAN}${BOLD}[12]${NC} 📋 ${BOLD}Сервер подписок TUNA${NC} (Профили, выдача Base64-ссылок, ротация токенов)"
         echo -e "  ${BOLD}[0]${NC} 🚪 Выход"
         echo ""
-        read -p "Выберите раздел [0-11]: " top_choice
+        read -p "Выберите раздел [0-12]: " top_choice
         case "$top_choice" in
             1) menu_mieru ;;
             2) menu_snell ;;
@@ -4582,6 +4874,7 @@ main_hub() {
             9) rescan_and_adopt_protocols ;;
             10) menu_system_opt ;;
             11) menu_ssl ;;
+            12) menu_subscriptions ;;
             0) clear; exit 0 ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac

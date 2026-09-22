@@ -791,11 +791,24 @@ ln -sf /usr/local/bin/x-manager /usr/local/bin/x-ssl
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-cert
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-fw
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-firewall
+ln -sf /usr/local/bin/x-manager /usr/local/bin/x-sub
+ln -sf /usr/local/bin/x-manager /usr/local/bin/x-tuna
 echo -e "  ✓ Диспетчер x-manager успешно развернут"
 
+echo -e "${CYAN}==> Шаг 9: Развертывание сервера подписок TUNA (tuna-subscriptions)...${NC}"
 if [ -f "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" ]; then
-    echo -e "${CYAN}==> Шаг 9: Развертывание сервера подписок TUNA (tuna-subscriptions)...${NC}"
     bash "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" || true
+else
+    echo -e "  -> Загрузка компонентов сервера подписок с GitHub..."
+    mkdir -p /tmp/tuna-sub-install
+    curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.py "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/tuna-subscriptions.py?v=$(date +%s)" 2>/dev/null || true
+    curl -fsSL -o /tmp/tuna-sub-install/config.toml.example "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/config.toml.example?v=$(date +%s)" 2>/dev/null || true
+    curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.service "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/tuna-subscriptions.service?v=$(date +%s)" 2>/dev/null || true
+    curl -fsSL -o /tmp/tuna-sub-install/install-sub-server.sh "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/install-sub-server.sh?v=$(date +%s)" 2>/dev/null || true
+    if [ -f /tmp/tuna-sub-install/install-sub-server.sh ]; then
+        bash /tmp/tuna-sub-install/install-sub-server.sh || true
+    fi
+    rm -rf /tmp/tuna-sub-install
 fi
 
 echo ""
@@ -805,6 +818,7 @@ echo -e "${GREEN}${BOLD}══════════════════�
 echo ""
 echo -e "${BOLD}Для входа в интерактивное меню запустите:${NC}"
 echo -e "  ${CYAN}${BOLD}x-manager${NC}   - Главный центр управления всеми службами"
+echo -e "  ${PURPLE}${BOLD}x-sub${NC}       - Раздел управления сервером подписок TUNA (tuna-subscriptions)"
 echo -e "  ${YELLOW}x-snell${NC}     - Раздел управления Snell v5"
 echo -e "  ${YELLOW}x-mieru${NC}     - Раздел управления Mieru"
 echo -e "  ${YELLOW}x-wdtt${NC}      - Раздел управления WDTT (qwdtt)"
