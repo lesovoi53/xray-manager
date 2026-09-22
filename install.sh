@@ -774,7 +774,7 @@ if [ -f "$SCRIPT_DIR/bin/x-manager" ]; then
     cp -f "$SCRIPT_DIR/bin/x-manager" /usr/local/bin/x-manager
 else
     echo -e "  -> Загрузка диспетчера x-manager с GitHub..."
-    curl -fL --progress-bar -o /usr/local/bin/x-manager https://raw.githubusercontent.com/534188-create/x-manager/main/bin/x-manager || curl -fsSL -o /usr/local/bin/x-manager https://raw.githubusercontent.com/534188-create/x-manager/main/bin/x-manager 2>/dev/null || true
+    curl -fL --progress-bar -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/534188-create/x-manager/main/bin/x-manager?v=$(date +%s)" || curl -fsSL -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/534188-create/x-manager/main/bin/x-manager?v=$(date +%s)" 2>/dev/null || true
 fi
 chmod +x /usr/local/bin/x-manager
 
