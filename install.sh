@@ -168,6 +168,39 @@ try:
     except Exception:
         pass
 
+    # 1.1 Обеспечиваем наличие записей шлюзов в таблице inbounds базы 3X-UI
+    try:
+        if not c.execute("SELECT id FROM inbounds WHERE port=10808").fetchone():
+            c.execute("""
+                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+                VALUES (1, 0, 0, 0, 'Mieru SOCKS5 Gateway', 1, 0, '127.0.0.1', 10808, 'socks', ?, '{}', 'in-mieru-socks', '{}')
+            """, (json.dumps({"auth": "noauth", "udp": True, "ip": "127.0.0.1"}),))
+            conn.commit()
+            print("INSERTED_INBOUNDS_SOCKS=10808")
+        if not c.execute("SELECT id FROM inbounds WHERE port=12345").fetchone():
+            c.execute("""
+                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+                VALUES (1, 0, 0, 0, 'WDTT TPROXY Gateway', 1, 0, '127.0.0.1', 12345, 'dokodemo-door', ?, ?, 'in-wdtt-tproxy', ?)
+            """, (
+                json.dumps({"network": "tcp,udp", "followRedirect": True}),
+                json.dumps({"sockopt": {"tproxy": "tproxy"}}),
+                json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
+            ))
+            conn.commit()
+            print("INSERTED_INBOUNDS_TPROXY=12345")
+        if not c.execute("SELECT id FROM inbounds WHERE port=12346").fetchone():
+            c.execute("""
+                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+                VALUES (1, 0, 0, 0, 'Snell REDIRECT Gateway', 1, 0, '127.0.0.1', 12346, 'dokodemo-door', ?, '{}', 'in-snell-redirect', ?)
+            """, (
+                json.dumps({"network": "tcp", "followRedirect": True}),
+                json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
+            ))
+            conn.commit()
+            print("INSERTED_INBOUNDS_REDIRECT=12346")
+    except Exception as e_ib:
+        pass
+
     # 2. Проверяем xrayTemplateConfig в таблице settings
     c.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig'")
     row = c.fetchone()
@@ -368,18 +401,19 @@ EOF
 #!/usr/bin/env bash
 MODE_FILE="/etc/snell/routing.mode"
 MODE="xray"
-[ -f "\$MODE_FILE" ] && MODE=\$(cat "\$MODE_FILE" | tr -d ' ')
+[ -f "\$MODE_FILE" ] && MODE=\$(cat "\$MODE_FILE" | tr -d ' \r\n')
 
-iptables -t nat -D OUTPUT -m owner --uid-owner snell -j SNELL_OUT 2>/dev/null || true
-iptables -t nat -F SNELL_OUT 2>/dev/null || true
-iptables -t nat -X SNELL_OUT 2>/dev/null || true
+iptables -w 5 -t nat -D OUTPUT -m owner --uid-owner snell -j SNELL_OUT 2>/dev/null || true
+iptables -w 5 -t nat -F SNELL_OUT 2>/dev/null || true
+iptables -w 5 -t nat -X SNELL_OUT 2>/dev/null || true
 
 if [ "\$MODE" = "xray" ]; then
-    iptables -t nat -N SNELL_OUT
-    iptables -t nat -A SNELL_OUT -d 127.0.0.0/8 -j RETURN
-    iptables -t nat -A SNELL_OUT -d ${SERVER_IP} -j RETURN 2>/dev/null || true
-    iptables -t nat -A SNELL_OUT -p tcp -j REDIRECT --to-ports ${XRAY_REDIRECT_PORT}
-    iptables -t nat -I OUTPUT 1 -m owner --uid-owner snell -j SNELL_OUT
+    iptables -w 5 -t nat -N SNELL_OUT 2>/dev/null || true
+    iptables -w 5 -t nat -F SNELL_OUT 2>/dev/null || true
+    iptables -w 5 -t nat -A SNELL_OUT -d 127.0.0.0/8 -j RETURN
+    iptables -w 5 -t nat -A SNELL_OUT -d ${SERVER_IP} -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A SNELL_OUT -p tcp -j REDIRECT --to-ports ${XRAY_REDIRECT_PORT}
+    iptables -w 5 -t nat -C OUTPUT -m owner --uid-owner snell -j SNELL_OUT 2>/dev/null || iptables -w 5 -t nat -I OUTPUT 1 -m owner --uid-owner snell -j SNELL_OUT
 fi
 EOF
     chmod +x /usr/local/bin/snell-routing.sh
@@ -610,38 +644,59 @@ cat << EOF > /usr/local/bin/wdtt-tproxy.sh
 set -e
 WAN_IF="${WAN_IF}"
 TPROXY_PORT="${XRAY_TPROXY_PORT}"
+SERVER_IP="${SERVER_IP}"
 
-# 1. Routing table 100
-ip rule show | grep -q "lookup 100" || ip rule add fwmark 1 table 100
-ip route show table 100 | grep -q "local default dev lo" || ip route add local 0.0.0.0/0 dev lo table 100
+MODE_FILE="/etc/wdtt/routing.mode"
+MODE="xray"
+[ -f "\$MODE_FILE" ] && MODE=\$(cat "\$MODE_FILE" | tr -d ' \r\n')
 
-# 2. iptables MANGLE rules
-iptables -t mangle -N WDTT_TPROXY 2>/dev/null || iptables -t mangle -F WDTT_TPROXY
+# Очистка предыдущих хуков
+iptables -w 5 -t mangle -D PREROUTING -i wdtt0 -j WDTT_TPROXY 2>/dev/null || true
+iptables -w 5 -t mangle -D PREROUTING -i wdttraw0 -j WDTT_TPROXY 2>/dev/null || true
+iptables -w 5 -t mangle -F WDTT_TPROXY 2>/dev/null || true
+iptables -w 5 -t mangle -X WDTT_TPROXY 2>/dev/null || true
 
-# Exclude local/internal
-iptables -t mangle -A WDTT_TPROXY -d 10.66.0.0/16 -j RETURN
-iptables -t mangle -A WDTT_TPROXY -d 10.70.0.0/16 -j RETURN
-iptables -t mangle -A WDTT_TPROXY -d 127.0.0.0/8 -j RETURN
+if [ "\$MODE" = "xray" ]; then
+    # 1. Routing table 100
+    ip rule show | grep -q "lookup 100" || ip rule add fwmark 1 table 100
+    ip route show table 100 | grep -q "local default dev lo" || ip route add local 0.0.0.0/0 dev lo table 100
 
-# TPROXY to 127.0.0.1
-iptables -t mangle -A WDTT_TPROXY -p tcp -j TPROXY --on-port \${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark 1
-iptables -t mangle -A WDTT_TPROXY -p udp -j TPROXY --on-port \${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark 1
+    # 2. iptables MANGLE rules
+    iptables -w 5 -t mangle -N WDTT_TPROXY 2>/dev/null || true
+    iptables -w 5 -t mangle -F WDTT_TPROXY 2>/dev/null || true
 
-# Hook to PREROUTING
-iptables -t mangle -C PREROUTING -i wdtt0 -j WDTT_TPROXY 2>/dev/null || iptables -t mangle -I PREROUTING -i wdtt0 -j WDTT_TPROXY
-iptables -t mangle -C PREROUTING -i wdttraw0 -j WDTT_TPROXY 2>/dev/null || iptables -t mangle -I PREROUTING -i wdttraw0 -j WDTT_TPROXY
+    # Exclude local/internal
+    iptables -w 5 -t mangle -A WDTT_TPROXY -d 10.66.0.0/16 -j RETURN
+    iptables -w 5 -t mangle -A WDTT_TPROXY -d 10.70.0.0/16 -j RETURN
+    iptables -w 5 -t mangle -A WDTT_TPROXY -d 127.0.0.0/8 -j RETURN
+    [ -n "\$SERVER_IP" ] && iptables -w 5 -t mangle -A WDTT_TPROXY -d "\$SERVER_IP" -j RETURN 2>/dev/null || true
 
-# 3. Block external access from internet
-iptables -C INPUT -i \${WAN_IF} -p tcp --dport \${TPROXY_PORT} -j DROP 2>/dev/null || iptables -I INPUT -i \${WAN_IF} -p tcp --dport \${TPROXY_PORT} -j DROP
-iptables -C INPUT -i \${WAN_IF} -p udp --dport \${TPROXY_PORT} -j DROP 2>/dev/null || iptables -I INPUT -i \${WAN_IF} -p udp --dport \${TPROXY_PORT} -j DROP
+    # TPROXY to 127.0.0.1
+    iptables -w 5 -t mangle -A WDTT_TPROXY -p tcp -j TPROXY --on-port \${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark 1
+    iptables -w 5 -t mangle -A WDTT_TPROXY -p udp -j TPROXY --on-port \${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark 1
 
-# 4. Remove direct MASQUERADE (Kill Switch for direct leak)
-while iptables -t nat -D POSTROUTING -s 10.66.0.0/16 -j MASQUERADE 2>/dev/null; do :; done
-while iptables -t nat -D POSTROUTING -s 10.66.0.0/16 -o \${WAN_IF} -j MASQUERADE 2>/dev/null; do :; done
-while iptables -t nat -D POSTROUTING -s 10.66.0.0/16 -o \${WAN_IF} -m comment --comment WDTT_MANAGED -j MASQUERADE 2>/dev/null; do :; done
-while iptables -t nat -D POSTROUTING -s 10.70.0.0/16 -j MASQUERADE 2>/dev/null; do :; done
-while iptables -t nat -D POSTROUTING -s 10.70.0.0/16 -o \${WAN_IF} -j MASQUERADE 2>/dev/null; do :; done
-while iptables -t nat -D POSTROUTING -s 10.70.0.0/16 -o \${WAN_IF} -m comment --comment WDTT_RAW_MANAGED -j MASQUERADE 2>/dev/null; do :; done
+    # Hook to PREROUTING
+    iptables -w 5 -t mangle -I PREROUTING 1 -i wdtt0 -j WDTT_TPROXY 2>/dev/null || true
+    iptables -w 5 -t mangle -I PREROUTING 1 -i wdttraw0 -j WDTT_TPROXY 2>/dev/null || true
+
+    # 3. Block external access from internet
+    iptables -w 5 -C INPUT -i "\${WAN_IF}" -p tcp --dport "\${TPROXY_PORT}" -j DROP 2>/dev/null || iptables -w 5 -I INPUT 1 -i "\${WAN_IF}" -p tcp --dport "\${TPROXY_PORT}" -j DROP
+    iptables -w 5 -C INPUT -i "\${WAN_IF}" -p udp --dport "\${TPROXY_PORT}" -j DROP 2>/dev/null || iptables -w 5 -I INPUT 1 -i "\${WAN_IF}" -p udp --dport "\${TPROXY_PORT}" -j DROP
+
+    # 4. Remove direct MASQUERADE (Kill Switch for direct leak)
+    while iptables -w 5 -t nat -D POSTROUTING -s 10.66.0.0/16 -j MASQUERADE 2>/dev/null; do :; done
+    while iptables -w 5 -t nat -D POSTROUTING -s 10.66.0.0/16 -o "\${WAN_IF}" -j MASQUERADE 2>/dev/null; do :; done
+    while iptables -w 5 -t nat -D POSTROUTING -s 10.66.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_MANAGED -j MASQUERADE 2>/dev/null; do :; done
+    while iptables -w 5 -t nat -D POSTROUTING -s 10.70.0.0/16 -j MASQUERADE 2>/dev/null; do :; done
+    while iptables -w 5 -t nat -D POSTROUTING -s 10.70.0.0/16 -o "\${WAN_IF}" -j MASQUERADE 2>/dev/null; do :; done
+    while iptables -w 5 -t nat -D POSTROUTING -s 10.70.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_RAW_MANAGED -j MASQUERADE 2>/dev/null; do :; done
+else
+    # Режим Direct WAN: Включаем прямой MASQUERADE
+    iptables -w 5 -t nat -C POSTROUTING -s 10.66.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_MANAGED -j MASQUERADE 2>/dev/null || \
+        iptables -w 5 -t nat -A POSTROUTING -s 10.66.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_MANAGED -j MASQUERADE
+    iptables -w 5 -t nat -C POSTROUTING -s 10.70.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_RAW_MANAGED -j MASQUERADE 2>/dev/null || \
+        iptables -w 5 -t nat -A POSTROUTING -s 10.70.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_RAW_MANAGED -j MASQUERADE
+fi
 EOF
 chmod +x /usr/local/bin/wdtt-tproxy.sh
 
@@ -696,8 +751,23 @@ if command -v csqtt >/dev/null 2>&1 || [ -f "/etc/systemd/system/csqtt.service" 
     echo -e "  ✓ Порт VPN-туннеля CSQTT (:${csqtt_p}/UDP) открыт в фаерволе"
 fi
 
+# Проверка SSL сертификатов
+echo -e "${CYAN}==> Шаг 7: Автоопределение SSL-сертификатов (3X-UI / /root/cert / Let's Encrypt)...${NC}"
+existing_cert=""
+for c_cand in /etc/x-ui/server.crt /etc/x-ui/cert.pem /root/cert/*/*.pem /root/cert/*/*.cer /root/cert/fullchain.pem /etc/letsencrypt/live/*/fullchain.pem /root/.acme.sh/*_ecc/fullchain.cer; do
+    if [ -f "$c_cand" ]; then
+        existing_cert="$c_cand"
+        break
+    fi
+done
+if [ -n "$existing_cert" ]; then
+    echo -e "  ✓ Обнаружен SSL сертификат: ${GREEN}${existing_cert}${NC}"
+else
+    echo -e "  ℹ️ SSL сертификат не найден локально (выпускается штатно в панели 3X-UI)"
+fi
+
 # Установка диспетчера x-manager
-echo -e "${CYAN}==> Шаг 7: Развертывание диспетчера x-manager...${NC}"
+echo -e "${CYAN}==> Шаг 8: Развертывание диспетчера x-manager...${NC}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [ -f "$SCRIPT_DIR/bin/x-manager" ]; then
     echo -e "  -> Установка x-manager из локального каталога..."
@@ -708,7 +778,7 @@ else
 fi
 chmod +x /usr/local/bin/x-manager
 
-echo -e "  -> Создание системных алиасов (x-snell, x-mieru, x-wdtt, x-csqtt, x-dns, x-fw)..."
+echo -e "  -> Создание системных алиасов (x-snell, x-mieru, x-wdtt, x-csqtt, x-dns, x-ssl, x-fw)..."
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-snell
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-mieru
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-wdtt
@@ -717,9 +787,16 @@ ln -sf /usr/local/bin/x-manager /usr/local/bin/x-csqtt
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-dns
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-cottendns
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-masterdns
+ln -sf /usr/local/bin/x-manager /usr/local/bin/x-ssl
+ln -sf /usr/local/bin/x-manager /usr/local/bin/x-cert
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-fw
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-firewall
 echo -e "  ✓ Диспетчер x-manager успешно развернут"
+
+if [ -f "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" ]; then
+    echo -e "${CYAN}==> Шаг 9: Развертывание сервера подписок TUNA (tuna-subscriptions)...${NC}"
+    bash "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" || true
+fi
 
 echo ""
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════════════${NC}"

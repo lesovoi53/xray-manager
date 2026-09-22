@@ -1729,6 +1729,7 @@ get_ssh_port() {
 get_csqtt_user() {
     if [ -f "$CSQTT_ENV_FILE" ]; then
         local u=$(grep -oP '^CSQTT_WEB_USER="\K[^"]+' "$CSQTT_ENV_FILE" 2>/dev/null || true)
+        [ -z "$u" ] && u=$(grep -oP '^CSQTT_WEB_USERNAME="\K[^"]+' "$CSQTT_ENV_FILE" 2>/dev/null || true)
         [ -n "$u" ] && echo "$u" && return
     fi
     echo "N/A"
@@ -1737,9 +1738,31 @@ get_csqtt_user() {
 get_csqtt_pass() {
     if [ -f "$CSQTT_ENV_FILE" ]; then
         local p=$(grep -oP '^CSQTT_WEB_PASS="\K[^"]+' "$CSQTT_ENV_FILE" 2>/dev/null || true)
+        [ -z "$p" ] && p=$(grep -oP '^CSQTT_WEB_PASSWORD="\K[^"]+' "$CSQTT_ENV_FILE" 2>/dev/null || true)
         [ -n "$p" ] && echo "$p" && return
     fi
     echo "N/A"
+}
+
+update_csqtt_credentials() {
+    local new_u="$1"
+    local new_p="$2"
+    [ -z "$new_u" ] || [ -z "$new_p" ] && return 1
+    mkdir -p "$(dirname "$CSQTT_ENV_FILE")"
+    touch "$CSQTT_ENV_FILE"
+
+    sed -i -E '/^CSQTT_WEB_USER=/d' "$CSQTT_ENV_FILE" 2>/dev/null || true
+    sed -i -E '/^CSQTT_WEB_USERNAME=/d' "$CSQTT_ENV_FILE" 2>/dev/null || true
+    sed -i -E '/^CSQTT_WEB_PASS=/d' "$CSQTT_ENV_FILE" 2>/dev/null || true
+    sed -i -E '/^CSQTT_WEB_PASSWORD=/d' "$CSQTT_ENV_FILE" 2>/dev/null || true
+
+    cat << EOF >> "$CSQTT_ENV_FILE"
+CSQTT_WEB_USER="${new_u}"
+CSQTT_WEB_USERNAME="${new_u}"
+CSQTT_WEB_PASS="${new_p}"
+CSQTT_WEB_PASSWORD="${new_p}"
+EOF
+    chmod 600 "$CSQTT_ENV_FILE"
 }
 
 get_csqtt_tunnel_pass() {
@@ -1977,9 +2000,10 @@ menu_csqtt() {
         echo -e "  ${YELLOW}[6]${NC} 📋 ${BOLD}Показать все реквизиты CSQTT${NC} (Логин, пароль панели и пароль туннеля)"
         echo -e "  ${YELLOW}[7]${NC} 📜 Живые логи службы csqtt (journalctl)"
         echo -e "  ${YELLOW}[8]${NC} 🔄 Перезапустить службу csqtt"
+        echo -e "  ${YELLOW}[9]${NC} 🔑 ${BOLD}Сменить логин и пароль веб-панели CSQTT${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите пункт [0-8]: " c_choice
+        read -p "Выберите пункт [0-9]: " c_choice
         case "$c_choice" in
             1)
                 show_csqtt_header
@@ -2016,6 +2040,22 @@ menu_csqtt() {
                 sleep 2
                 echo -e "${GREEN}✓ Служба csqtt перезапущена${NC}"
                 sleep 1
+                ;;
+            9)
+                echo ""
+                read -p "Введите новый логин веб-панели CSQTT [Enter оставить текущий]: " new_c_u
+                read -s -p "Введите новый пароль веб-панели CSQTT: " new_c_p
+                echo ""
+                [ -z "$new_c_u" ] && new_c_u=$(get_csqtt_user)
+                [ "$new_c_u" = "N/A" ] && new_c_u="admin"
+                if [ -n "$new_c_p" ]; then
+                    update_csqtt_credentials "$new_c_u" "$new_c_p"
+                    systemctl restart csqtt 2>/dev/null || true
+                    echo -e "${GREEN}✓ Реквизиты сохранены в $CSQTT_ENV_FILE и служба перезапущена!${NC}"
+                else
+                    echo -e "${YELLOW}Пароль не может быть пустым.${NC}"
+                fi
+                sleep 2
                 ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
@@ -2068,10 +2108,287 @@ get_dns_status() {
     fi
 }
 
+# ==============================================================================
+# SSL & СЕРТИФИКАТЫ: ACME, CLOUDFLARE WILDCARD, HTTP-01, ДЕТЕКЦИЯ СТАТУСА
+# ==============================================================================
+CF_ENV_FILE="/etc/x-manager/cloudflare.env"
+[ ! -f "$CF_ENV_FILE" ] && [ -f "/etc/tuna-vpn/cloudflare.env" ] && CF_ENV_FILE="/etc/tuna-vpn/cloudflare.env"
+
+# Обнаружение основного активного сертификата по всем стандартным путям:
+# /etc/x-manager/ (cloudflare.env), /root/cert/, /etc/x-ui/, /etc/letsencrypt/, /etc/ssl/, /root/.acme.sh/
+# Возвращает строку: "CERT_PATH|KEY_PATH|DOMAIN|EXPIRY_DATE"
+detect_primary_ssl_cert() {
+    local candidates=()
+
+    # 1. Проверяем cloudflare.env
+    for cf_env in "/etc/x-manager/cloudflare.env" "/etc/tuna-vpn/cloudflare.env"; do
+        if [ -f "$cf_env" ]; then
+            local c_f=$(grep -oP '^CERT_FILE="\K[^"]+' "$cf_env" 2>/dev/null || grep -oP '^CERT_FILE=\K.*' "$cf_env" 2>/dev/null | tr -d '"')
+            local k_f=$(grep -oP '^KEY_FILE="\K[^"]+' "$cf_env" 2>/dev/null || grep -oP '^KEY_FILE=\K.*' "$cf_env" 2>/dev/null | tr -d '"')
+            local d_m=$(grep -oP '^DOMAIN="\K[^"]+' "$cf_env" 2>/dev/null || grep -oP '^DOMAIN=\K.*' "$cf_env" 2>/dev/null | tr -d '"')
+            if [ -f "$c_f" ] && [ -f "$k_f" ]; then
+                candidates+=("${c_f}|${k_f}|${d_m}")
+            fi
+        fi
+    done
+
+    # 2. /root/cert/<domain>/
+    if [ -d "/root/cert" ]; then
+        for dir in /root/cert/*; do
+            [ -d "$dir" ] || continue
+            local d_name=$(basename "$dir")
+            local c="" k=""
+            [ -f "${dir}/fullchain.pem" ] && c="${dir}/fullchain.pem"
+            [ -z "$c" ] && [ -f "${dir}/fullchain.cer" ] && c="${dir}/fullchain.cer"
+            [ -z "$c" ] && [ -f "${dir}/cert.pem" ] && c="${dir}/cert.pem"
+            [ -z "$c" ] && [ -f "${dir}/cert.crt" ] && c="${dir}/cert.crt"
+
+            [ -f "${dir}/privkey.pem" ] && k="${dir}/privkey.pem"
+            [ -z "$k" ] && [ -f "${dir}/privkey.key" ] && k="${dir}/privkey.key"
+            [ -z "$k" ] && [ -f "${dir}/key.pem" ] && k="${dir}/key.pem"
+            [ -z "$k" ] && [ -f "${dir}/private.key" ] && k="${dir}/private.key"
+
+            if [ -n "$c" ] && [ -n "$k" ]; then
+                candidates+=("${c}|${k}|${d_name}")
+            fi
+        done
+        if [ -f "/root/cert/fullchain.pem" ] && [ -f "/root/cert/privkey.pem" ]; then
+            candidates+=("/root/cert/fullchain.pem|/root/cert/privkey.pem|cert")
+        fi
+    fi
+
+    # 3. /etc/x-ui/
+    if [ -f "/etc/x-ui/server.crt" ] && [ -f "/etc/x-ui/server.key" ]; then
+        candidates+=("/etc/x-ui/server.crt|/etc/x-ui/server.key|3x-ui")
+    fi
+    if [ -f "/etc/x-ui/cert.pem" ] && [ -f "/etc/x-ui/key.pem" ]; then
+        candidates+=("/etc/x-ui/cert.pem|/etc/x-ui/key.pem|3x-ui")
+    fi
+
+    # 4. /etc/letsencrypt/live/<domain>/
+    if [ -d "/etc/letsencrypt/live" ]; then
+        for dir in /etc/letsencrypt/live/*; do
+            [ -d "$dir" ] || continue
+            local d_name=$(basename "$dir")
+            [ "$d_name" = "README" ] && continue
+            if [ -f "${dir}/fullchain.pem" ] && [ -f "${dir}/privkey.pem" ]; then
+                candidates+=("${dir}/fullchain.pem|${dir}/privkey.pem|${d_name}")
+            fi
+        done
+    fi
+
+    # 5. /etc/ssl/ (tuna-vpn или вложенные папки)
+    if [ -d "/etc/ssl" ]; then
+        for dir in /etc/ssl/tuna-vpn/* /etc/ssl/*; do
+            [ -d "$dir" ] || continue
+            local d_name=$(basename "$dir")
+            [ "$d_name" = "certs" ] || [ "$d_name" = "private" ] && continue
+            local c="" k=""
+            [ -f "${dir}/fullchain.cer" ] && c="${dir}/fullchain.cer"
+            [ -z "$c" ] && [ -f "${dir}/fullchain.pem" ] && c="${dir}/fullchain.pem"
+            [ -f "${dir}/privkey.key" ] && k="${dir}/privkey.key"
+            [ -z "$k" ] && [ -f "${dir}/privkey.pem" ] && k="${dir}/privkey.pem"
+            if [ -n "$c" ] && [ -n "$k" ]; then
+                candidates+=("${c}|${k}|${d_name}")
+            fi
+        done
+    fi
+
+    # 6. /root/.acme.sh/
+    if [ -d "/root/.acme.sh" ]; then
+        for dir in /root/.acme.sh/*_ecc /root/.acme.sh/*; do
+            [ -d "$dir" ] || continue
+            local bname=$(basename "$dir")
+            local d_clean=$(echo "$bname" | sed 's/_ecc$//')
+            if [ -f "${dir}/fullchain.cer" ] && [ -f "${dir}/${d_clean}.key" ]; then
+                candidates+=("${dir}/fullchain.cer|${dir}/${d_clean}.key|${d_clean}")
+            fi
+        done
+    fi
+
+    # Проверяем кандидатов: сначала ищем действующий (не просроченный)
+    local fallback=""
+    for cand in "${candidates[@]}"; do
+        local c_path=$(echo "$cand" | cut -d'|' -f1)
+        local k_path=$(echo "$cand" | cut -d'|' -f2)
+        local d_label=$(echo "$cand" | cut -d'|' -f3)
+
+        if [ -f "$c_path" ] && [ -f "$k_path" ]; then
+            local exp=$(openssl x509 -enddate -noout -in "$c_path" 2>/dev/null | cut -d= -f2 || true)
+            # Извлекаем реальное имя домена из CN/SAN если метка техническая
+            if [ -z "$d_label" ] || [ "$d_label" = "3x-ui" ] || [ "$d_label" = "cert" ]; then
+                local cn=$(openssl x509 -subject -noout -in "$c_path" 2>/dev/null | grep -oP 'CN\s*=\s*\K[^,\/]+' || true)
+                [ -n "$cn" ] && d_label="$cn"
+            fi
+            # Проверка срока действия
+            if openssl x509 -in "$c_path" -noout -checkend 0 2>/dev/null; then
+                echo "${c_path}|${k_path}|${d_label}|${exp}"
+                return 0
+            else
+                [ -z "$fallback" ] && fallback="${c_path}|${k_path}|${d_label}|${exp} (ИСТЕК)"
+            fi
+        fi
+    done
+
+    if [ -n "$fallback" ]; then
+        echo "$fallback"
+        return 1
+    fi
+
+    return 2
+}
+
+get_ssl_short_status() {
+    local cert_info=$(detect_primary_ssl_cert 2>/dev/null || true)
+    if [ -n "$cert_info" ]; then
+        local d_label=$(echo "$cert_info" | cut -d'|' -f3)
+        local exp=$(echo "$cert_info" | cut -d'|' -f4)
+        if echo "$exp" | grep -qi "ИСТЕК"; then
+            echo -e "${RED}ИСТЕК (${d_label})${NC}"
+        else
+            echo -e "${GREEN}АКТИВЕН (${d_label})${NC}"
+        fi
+    else
+        echo -e "${YELLOW}НЕ НАСТРОЕН${NC}"
+    fi
+}
+
+sync_ssl_to_xui() {
+    local c_file="$1"
+    local k_file="$2"
+    if [ -z "$c_file" ] || [ -z "$k_file" ]; then
+        local primary=$(detect_primary_ssl_cert 2>/dev/null || true)
+        if [ -n "$primary" ]; then
+            c_file=$(echo "$primary" | cut -d'|' -f1)
+            k_file=$(echo "$primary" | cut -d'|' -f2)
+        fi
+    fi
+
+    if [ -n "$c_file" ] && [ -f "$c_file" ] && [ -n "$k_file" ] && [ -f "$k_file" ]; then
+        if [ -d "/etc/x-ui" ]; then
+            cp -f "$c_file" /etc/x-ui/server.crt 2>/dev/null || true
+            cp -f "$k_file" /etc/x-ui/server.key 2>/dev/null || true
+            chmod 600 /etc/x-ui/server.key 2>/dev/null || true
+            systemctl restart x-ui 2>/dev/null || true
+            echo -e "  ${GREEN}✓ Сертификаты синхронизированы в /etc/x-ui/ (server.crt, server.key)${NC}"
+        else
+            echo -e "  ${YELLOW}Директория /etc/x-ui не найдена на сервере.${NC}"
+        fi
+    else
+        echo -e "  ${RED}Файлы сертификата не найдены для синхронизации.${NC}"
+    fi
+}
+
+menu_ssl() {
+    while true; do
+        clear
+        local p_cert=$(detect_primary_ssl_cert 2>/dev/null || true)
+        local c_path="Не обнаружен"
+        local k_path="Не обнаружен"
+        local d_label="—"
+        local exp="—"
+        local is_ok=false
+
+        if [ -n "$p_cert" ]; then
+            c_path=$(echo "$p_cert" | cut -d'|' -f1)
+            k_path=$(echo "$p_cert" | cut -d'|' -f2)
+            d_label=$(echo "$p_cert" | cut -d'|' -f3)
+            exp=$(echo "$p_cert" | cut -d'|' -f4)
+            if ! echo "$exp" | grep -qi "ИСТЕК"; then
+                is_ok=true
+            fi
+        fi
+
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${BOLD}          ЦЕНТР УПРАВЛЕНИЯ И СТАТУСА SSL-СЕРТИФИКАТОВ                 ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  Статус SSL:    $(get_ssl_short_status)"
+        echo -e "${CYAN}║${NC}  Домен:         ${BOLD}${d_label}${NC}"
+        echo -e "${CYAN}║${NC}  Срок действия: ${BOLD}${exp}${NC}"
+        echo -e "${CYAN}║${NC}  Файл fullchain: ${c_path}"
+        echo -e "${CYAN}║${NC}  Файл privkey:   ${k_path}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  ${YELLOW}[1]${NC} 🔍 ${BOLD}Детальный скан всех путей сертификатов${NC} (/etc/x-ui, /root/cert, letsencrypt...)"
+        echo -e "  ${YELLOW}[2]${NC} 📥 ${BOLD}Синхронизировать сертификат в 3X-UI${NC} (/etc/x-ui/server.crt)"
+        echo -e "  ${YELLOW}[3]${NC} 🔄 ${BOLD}Проверить срок годности сертификата через OpenSSL${NC}"
+        echo -e "  ${YELLOW}[4]${NC} 💡 ${BOLD}Памятка по управлению SSL через веб-панель 3X-UI${NC}"
+        echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
+        echo ""
+        read -p "Выберите действие [0-4]: " ssl_act
+        case "$ssl_act" in
+            1)
+                clear
+                echo -e "${CYAN}=== СКАНИРОВАНИЕ СЕРТИФИКАТОВ НА СЕРВЕРЕ ===${NC}\n"
+                for path in "/etc/x-ui" "/root/cert" "/etc/letsencrypt/live" "/etc/ssl" "/root/.acme.sh" "/etc/x-manager/cloudflare.env"; do
+                    echo -e "${BOLD}Проверка пути:${NC} ${CYAN}${path}${NC}"
+                    if [ -e "$path" ]; then
+                        echo -e "  ${GREEN}[✓] Путь существует${NC}"
+                    else
+                        echo -e "  ${YELLOW}[-] Не найден${NC}"
+                    fi
+                done
+                echo ""
+                echo -e "${BOLD}Обнаруженный рабочий сертификат:${NC}"
+                if [ -n "$p_cert" ]; then
+                    echo -e "  • Домен:   ${GREEN}${d_label}${NC}"
+                    echo -e "  • Cert:    ${CYAN}${c_path}${NC}"
+                    echo -e "  • Key:     ${CYAN}${k_path}${NC}"
+                    echo -e "  • Истекает: ${YELLOW}${exp}${NC}"
+                else
+                    echo -e "  ${RED}Действующие сертификаты не обнаружены.${NC}"
+                fi
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            2)
+                echo ""
+                sync_ssl_to_xui
+                sleep 2
+                ;;
+            3)
+                clear
+                echo -e "${CYAN}=== ПРОВЕРКА СЕРТИФИКАТА ЧЕРЕЗ OPENSSL ===${NC}\n"
+                if [ -f "$c_path" ]; then
+                    openssl x509 -in "$c_path" -text -noout | grep -E "(Issuer:|Subject:|Not Before|Not After|DNS:)" || openssl x509 -in "$c_path" -noout -subject -dates
+                else
+                    echo -e "${YELLOW}Сертификат не найден.${NC}"
+                fi
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            4)
+                clear
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${CYAN}║${BOLD}          УПРАВЛЕНИЕ SSL ЧЕРЕЗ ВЕБ-ПАНЕЛЬ 3X-UI                       ${CYAN}║${NC}"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                echo ""
+                echo -e "Выпуск и продление SSL сертификатов (Cloudflare DNS-01 API / HTTP-01)"
+                echo -e "штатно выполняются в веб-интерфейсе 3X-UI:"
+                echo ""
+                echo -e "  1. Откройте веб-панель 3X-UI в браузере."
+                echo -e "  2. Перейдите в раздел ${BOLD}«Настройки панели»${NC} -> ${BOLD}«Сертификат SSL»${NC}."
+                echo -e "  3. Выберите выпуск через Cloudflare DNS API (введите токен) или Let's Encrypt."
+                echo -e "  4. Панель автоматически сохранит сертификат в ${CYAN}/etc/x-ui/server.crt${NC}."
+                echo -e "  5. ${BOLD}x-manager${NC} моментально подхватывает этот сертификат для DNS-туннелей и служб."
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            0) return ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
+}
+
 detect_base_domain() {
     local d=""
+    # 0. Check detected primary SSL certificate
+    local primary_cert=$(detect_primary_ssl_cert 2>/dev/null || true)
+    if [ -n "$primary_cert" ]; then
+        d=$(echo "$primary_cert" | cut -d'|' -f3)
+    fi
     # 1. Check cert dirs in /root/cert
-    if [ -d "/root/cert" ]; then
+    if [ -z "$d" ] && [ -d "/root/cert" ]; then
         d=$(find /root/cert -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -v '^\.' | head -n 1)
     fi
     # 2. Check acme.sh ecc dirs
@@ -4182,6 +4499,9 @@ main_hub() {
     elif [ "$invoked" = "x-opt" ] || [ "$invoked" = "x-sys" ] || [ "$invoked" = "x-bbr" ] || [ "$invoked" = "x-swap" ] || [ "$invoked" = "x-f2b" ]; then
         menu_system_opt
         exit 0
+    elif [ "$invoked" = "x-ssl" ] || [ "$invoked" = "x-cert" ] || [ "$invoked" = "x-acme" ]; then
+        menu_ssl
+        exit 0
     fi
 
     while true; do
@@ -4190,7 +4510,7 @@ main_hub() {
         echo -e "${CYAN}║${BOLD}          ЦЕНТР УПРАВЛЕНИЯ ПРОКСИ-СЕРВИСАМИ             ${CYAN}║${NC}"
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
         echo -e "${CYAN}║${NC}  Сервер: ${BOLD}${SERVER_IP}${NC}  |  Шлюзы: TPROXY :12345 [127.0.0.1] | SOCKS5 :10808 [127.0.0.1] 🔒"
-        echo -e "${CYAN}║${NC}  Система: BBR: $(get_bbr_short_status)  |  Swap: $(get_swap_short_status)  |  F2B: $(get_f2b_short_status)"
+        echo -e "${CYAN}║${NC}  Система: BBR: $(get_bbr_short_status) | Swap: $(get_swap_short_status) | F2B: $(get_f2b_short_status) | SSL: $(get_ssl_short_status)"
         echo -e "${CYAN}║${NC}"
         if is_mieru_installed; then
             echo -e "${CYAN}║${NC}  ${BOLD}[1] 🚀 Mieru (mita v$(get_mieru_version))${NC}   -> $(get_mieru_status)"
@@ -4246,9 +4566,10 @@ main_hub() {
         echo -e "  ${BOLD}[8]${NC} 🔄 Перезапустить все сервисы (Mieru + Snell + WDTT + CSQTT + DNS)"
         echo -e "  ${BOLD}[9]${NC} 🔍 ${BOLD}Пересканировать и подхватить протоколы${NC} (Автоопределение установленных служб)"
         echo -e "  ${GREEN}${BOLD}[10]${NC} ⚙️  ${BOLD}Оптимизация и безопасность${NC} (DNS с пингом, BBR/буферы под RAM, Swap 2/4G, Fail2ban)"
+        echo -e "  ${PURPLE}${BOLD}[11]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
         echo -e "  ${BOLD}[0]${NC} 🚪 Выход"
         echo ""
-        read -p "Выберите раздел [0-10]: " top_choice
+        read -p "Выберите раздел [0-11]: " top_choice
         case "$top_choice" in
             1) menu_mieru ;;
             2) menu_snell ;;
@@ -4260,6 +4581,7 @@ main_hub() {
             8) restart_all_services ;;
             9) rescan_and_adopt_protocols ;;
             10) menu_system_opt ;;
+            11) menu_ssl ;;
             0) clear; exit 0 ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac
