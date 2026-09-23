@@ -111,6 +111,7 @@ def init_database(db_path):
             snell_uri TEXT DEFAULT '',
             mieru_uri TEXT DEFAULT '',
             masterdnsvpn_uri TEXT DEFAULT '',
+            custom_uri TEXT DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
             subscription_token_hash TEXT NOT NULL,
             revision INTEGER NOT NULL DEFAULT 1,
@@ -118,6 +119,12 @@ def init_database(db_path):
             updated_at TEXT NOT NULL
         );
     """)
+    # Миграция схемы: добавление custom_uri если таблица создана старой версией
+    c.execute("PRAGMA table_info(users);")
+    existing_cols = [col[1] for col in c.fetchall()]
+    if "custom_uri" not in existing_cols:
+        c.execute("ALTER TABLE users ADD COLUMN custom_uri TEXT DEFAULT '';")
+
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_users_token_hash ON users(subscription_token_hash);")
     conn.commit()
@@ -127,11 +134,12 @@ def hash_token(token: str) -> str:
     """Криптографический SHA-256 хеш токена подписки."""
     return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
 
-def validate_uri(val: str, max_len: int = 4096) -> tuple[bool, str]:
+def validate_single_uri(val: str, max_len: int = 4096) -> tuple[bool, str]:
     """
-    Валидация URI без декодирования и изменения символов:
+    Валидация одиночного URI:
     - Запрещены управляющие символы, CR, LF.
     - Проверка базовой длины.
+    - Обязательное наличие схемы (://).
     - Разрешены пустые значения.
     """
     if not val:
@@ -140,11 +148,54 @@ def validate_uri(val: str, max_len: int = 4096) -> tuple[bool, str]:
         return False, f"URI exceeds max length of {max_len}"
     if "\r" in val or "\n" in val:
         return False, "URI contains newline or carriage return"
+    if "://" not in val:
+        return False, "URI must contain scheme (://)"
     # Проверка на управляющие символы ASCII (0x00-0x1F, 0x7F)
     for ch in val:
         if ord(ch) < 32 or ord(ch) == 127:
             return False, "URI contains invalid control characters"
     return True, ""
+
+def normalize_and_validate_uris(raw_val, max_len: int = 4096) -> tuple[bool, str, str]:
+    """
+    Нормализует входящие URI (одиночная строка, многострочный текст или массив/список строк)
+    в единую строку с разделителем '\n'. Валидирует каждую ссылку.
+    Возвращает: (is_valid, error_message, normalized_string)
+    """
+    if raw_val is None:
+        return True, "", ""
+
+    items = []
+    if isinstance(raw_val, (list, tuple)):
+        for el in raw_val:
+            if not isinstance(el, str):
+                return False, "Each URI in array must be a string", ""
+            for line in el.splitlines():
+                s = line.strip()
+                if s:
+                    items.append(s)
+    elif isinstance(raw_val, str):
+        for line in raw_val.splitlines():
+            s = line.strip()
+            if s:
+                items.append(s)
+    else:
+        return False, "URI field must be a string or array of strings", ""
+
+    if not items:
+        return True, "", ""
+
+    for item in items:
+        ok, err = validate_single_uri(item, max_len)
+        if not ok:
+            return False, err, ""
+
+    return True, "", "\n".join(items)
+
+def validate_uri(val, max_len: int = 4096) -> tuple[bool, str]:
+    """Обратная совместимость: валидация одного или нескольких URI."""
+    ok, err, _ = normalize_and_validate_uris(val, max_len)
+    return ok, err
 
 def validate_nickname(nick: str, max_len: int = 64) -> tuple[bool, str]:
     """Валидация никнейма: UTF-8, длина, отсутствие переносов строк."""
@@ -169,22 +220,39 @@ class SubscriptionApp:
         self.max_users = config["limits"]["max_users"]
 
     def create_user(self, data: dict) -> tuple[int, dict]:
-        nickname = data.get("nickname", "").strip()
+        nickname = str(data.get("nickname") or "").strip()
         ok, err = validate_nickname(nickname, self.max_nick_len)
         if not ok:
             return 400, {"error": err}
 
-        # 5 поддерживаемых полей (принимаем как с суффиксом _uri, так и краткие)
-        csqtt = str(data.get("csqtt_uri") or data.get("csqtt") or "").strip()
-        qwdtt = str(data.get("qwdtt_uri") or data.get("qwdtt") or "").strip()
-        snell = str(data.get("snell_uri") or data.get("snell") or "").strip()
-        mieru = str(data.get("mieru_uri") or data.get("mieru") or "").strip()
-        dns = str(data.get("masterdnsvpn_uri") or data.get("masterdnsvpn") or "").strip()
+        # Поддерживаемые поля ссылок (строка или массив, с суффиксами и без)
+        field_specs = [
+            ("csqtt", ["csqtt_uri", "csqtt_uris", "csqtt"]),
+            ("qwdtt", ["qwdtt_uri", "qwdtt_uris", "qwdtt"]),
+            ("snell", ["snell_uri", "snell_uris", "snell"]),
+            ("mieru", ["mieru_uri", "mieru_uris", "mieru"]),
+            ("masterdnsvpn", ["masterdnsvpn_uri", "masterdnsvpn_uris", "masterdnsvpn", "dns_uri", "stormdns_uri", "dns"]),
+            ("custom", ["custom_uri", "custom_uris", "custom"])
+        ]
 
-        for name, val in [("csqtt", csqtt), ("qwdtt", qwdtt), ("snell", snell), ("mieru", mieru), ("masterdnsvpn", dns)]:
-            valid, v_err = validate_uri(val, self.max_uri_len)
+        normalized_fields = {}
+        for name, keys in field_specs:
+            val = None
+            for k in keys:
+                if k in data and data[k] is not None:
+                    val = data[k]
+                    break
+            valid, v_err, norm_val = normalize_and_validate_uris(val, self.max_uri_len)
             if not valid:
                 return 400, {"error": f"Invalid {name}: {v_err}"}
+            normalized_fields[name] = norm_val
+
+        csqtt = normalized_fields["csqtt"]
+        qwdtt = normalized_fields["qwdtt"]
+        snell = normalized_fields["snell"]
+        mieru = normalized_fields["mieru"]
+        dns   = normalized_fields["masterdnsvpn"]
+        custom = normalized_fields["custom"]
 
         # Генерация криптографически стойкого токена
         raw_token = secrets.token_urlsafe(32)
@@ -201,15 +269,16 @@ class SubscriptionApp:
                     return 403, {"error": f"Maximum user capacity reached ({self.max_users})"}
 
                 c.execute("""
-                    INSERT INTO users (id, nickname, csqtt_uri, qwdtt_uri, snell_uri, mieru_uri, masterdnsvpn_uri,
+                    INSERT INTO users (id, nickname, csqtt_uri, qwdtt_uri, snell_uri, mieru_uri, masterdnsvpn_uri, custom_uri,
                                        enabled, subscription_token_hash, revision, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?);
-                """, (u_id, nickname, csqtt, qwdtt, snell, mieru, dns, tok_hash, now, now))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?);
+                """, (u_id, nickname, csqtt, qwdtt, snell, mieru, dns, custom, tok_hash, now, now))
         except sqlite3.IntegrityError:
             return 409, {"error": f"User with nickname '{nickname}' already exists"}
         except Exception as e:
             return 500, {"error": "Internal database error"}
 
+        total_uris = sum(len(v.splitlines()) for v in normalized_fields.values() if v)
         sub_url = f"http://{self.bind_addr}:{self.bind_port}/sub/{raw_token}"
         return 201, {
             "id": u_id,
@@ -218,36 +287,48 @@ class SubscriptionApp:
             "token": raw_token,
             "revision": 1,
             "enabled": True,
+            "total_uris": total_uris,
             "created_at": now,
             "updated_at": now
         }
 
     def list_users(self) -> tuple[int, list]:
         c = self.conn.cursor()
-        c.execute("""
-            SELECT id, nickname, enabled, revision, created_at, updated_at,
-                   (csqtt_uri != '') AS has_csqtt,
-                   (qwdtt_uri != '') AS has_qwdtt,
-                   (snell_uri != '') AS has_snell,
-                   (mieru_uri != '') AS has_mieru,
-                   (masterdnsvpn_uri != '') AS has_masterdnsvpn
-            FROM users ORDER BY created_at DESC;
-        """)
+        c.execute("SELECT * FROM users ORDER BY created_at DESC;")
         users = []
         for r in c.fetchall():
+            csqtt_list = [u for u in (r["csqtt_uri"] or "").splitlines() if u.strip()]
+            qwdtt_list = [u for u in (r["qwdtt_uri"] or "").splitlines() if u.strip()]
+            snell_list = [u for u in (r["snell_uri"] or "").splitlines() if u.strip()]
+            mieru_list = [u for u in (r["mieru_uri"] or "").splitlines() if u.strip()]
+            dns_list   = [u for u in (r["masterdnsvpn_uri"] or "").splitlines() if u.strip()]
+            custom_val = r["custom_uri"] if "custom_uri" in r.keys() else ""
+            custom_list = [u for u in (custom_val or "").splitlines() if u.strip()]
+            total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list)
+
             users.append({
                 "id": r["id"],
                 "nickname": r["nickname"],
                 "enabled": bool(r["enabled"]),
                 "revision": r["revision"],
+                "total_uris": total_uris,
                 "created_at": r["created_at"],
                 "updated_at": r["updated_at"],
                 "protocols": {
-                    "csqtt": bool(r["has_csqtt"]),
-                    "qwdtt": bool(r["has_qwdtt"]),
-                    "snell": bool(r["has_snell"]),
-                    "mieru": bool(r["has_mieru"]),
-                    "masterdnsvpn": bool(r["has_masterdnsvpn"]),
+                    "csqtt": len(csqtt_list) > 0,
+                    "qwdtt": len(qwdtt_list) > 0,
+                    "snell": len(snell_list) > 0,
+                    "mieru": len(mieru_list) > 0,
+                    "masterdnsvpn": len(dns_list) > 0,
+                    "custom": len(custom_list) > 0,
+                },
+                "counts": {
+                    "csqtt": len(csqtt_list),
+                    "qwdtt": len(qwdtt_list),
+                    "snell": len(snell_list),
+                    "mieru": len(mieru_list),
+                    "masterdnsvpn": len(dns_list),
+                    "custom": len(custom_list),
                 }
             })
         return 200, users
@@ -258,6 +339,16 @@ class SubscriptionApp:
         r = c.fetchone()
         if not r:
             return 404, {"error": "User not found"}
+
+        csqtt_list = [u for u in (r["csqtt_uri"] or "").splitlines() if u.strip()]
+        qwdtt_list = [u for u in (r["qwdtt_uri"] or "").splitlines() if u.strip()]
+        snell_list = [u for u in (r["snell_uri"] or "").splitlines() if u.strip()]
+        mieru_list = [u for u in (r["mieru_uri"] or "").splitlines() if u.strip()]
+        dns_list   = [u for u in (r["masterdnsvpn_uri"] or "").splitlines() if u.strip()]
+        custom_val = r["custom_uri"] if "custom_uri" in r.keys() else ""
+        custom_list = [u for u in (custom_val or "").splitlines() if u.strip()]
+        total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list)
+
         return 200, {
             "id": r["id"],
             "nickname": r["nickname"],
@@ -266,6 +357,14 @@ class SubscriptionApp:
             "snell": r["snell_uri"],
             "mieru": r["mieru_uri"],
             "masterdnsvpn": r["masterdnsvpn_uri"],
+            "custom": custom_val,
+            "csqtt_uris": csqtt_list,
+            "qwdtt_uris": qwdtt_list,
+            "snell_uris": snell_list,
+            "mieru_uris": mieru_list,
+            "masterdnsvpn_uris": dns_list,
+            "custom_uris": custom_list,
+            "total_uris": total_uris,
             "enabled": bool(r["enabled"]),
             "revision": r["revision"],
             "created_at": r["created_at"],
@@ -287,41 +386,31 @@ class SubscriptionApp:
                 return 400, {"error": err}
             new_nick = candidate_nick
 
-        # Проверяем ссылки при передаче
-        new_csqtt = cur["csqtt_uri"]
-        if "csqtt_uri" in data or "csqtt" in data:
-            val = str(data.get("csqtt_uri") or data.get("csqtt") or "").strip()
-            ok, err = validate_uri(val, self.max_uri_len)
-            if not ok: return 400, {"error": f"Invalid csqtt: {err}"}
-            new_csqtt = val
+        field_specs = [
+            ("csqtt", ["csqtt_uri", "csqtt_uris", "csqtt"], cur["csqtt_uri"]),
+            ("qwdtt", ["qwdtt_uri", "qwdtt_uris", "qwdtt"], cur["qwdtt_uri"]),
+            ("snell", ["snell_uri", "snell_uris", "snell"], cur["snell_uri"]),
+            ("mieru", ["mieru_uri", "mieru_uris", "mieru"], cur["mieru_uri"]),
+            ("masterdnsvpn", ["masterdnsvpn_uri", "masterdnsvpn_uris", "masterdnsvpn", "dns_uri", "stormdns_uri", "dns"], cur["masterdnsvpn_uri"]),
+            ("custom", ["custom_uri", "custom_uris", "custom"], cur["custom_uri"] if "custom_uri" in cur.keys() else ""),
+        ]
 
-        new_qwdtt = cur["qwdtt_uri"]
-        if "qwdtt_uri" in data or "qwdtt" in data:
-            val = str(data.get("qwdtt_uri") or data.get("qwdtt") or "").strip()
-            ok, err = validate_uri(val, self.max_uri_len)
-            if not ok: return 400, {"error": f"Invalid qwdtt: {err}"}
-            new_qwdtt = val
-
-        new_snell = cur["snell_uri"]
-        if "snell_uri" in data or "snell" in data:
-            val = str(data.get("snell_uri") or data.get("snell") or "").strip()
-            ok, err = validate_uri(val, self.max_uri_len)
-            if not ok: return 400, {"error": f"Invalid snell: {err}"}
-            new_snell = val
-
-        new_mieru = cur["mieru_uri"]
-        if "mieru_uri" in data or "mieru" in data:
-            val = str(data.get("mieru_uri") or data.get("mieru") or "").strip()
-            ok, err = validate_uri(val, self.max_uri_len)
-            if not ok: return 400, {"error": f"Invalid mieru: {err}"}
-            new_mieru = val
-
-        new_dns = cur["masterdnsvpn_uri"]
-        if "masterdnsvpn_uri" in data or "masterdnsvpn" in data:
-            val = str(data.get("masterdnsvpn_uri") or data.get("masterdnsvpn") or "").strip()
-            ok, err = validate_uri(val, self.max_uri_len)
-            if not ok: return 400, {"error": f"Invalid masterdnsvpn: {err}"}
-            new_dns = val
+        updated_fields = {}
+        for name, keys, current_val in field_specs:
+            found = False
+            raw_val = None
+            for k in keys:
+                if k in data:
+                    found = True
+                    raw_val = data[k]
+                    break
+            if found:
+                ok, err, norm_val = normalize_and_validate_uris(raw_val, self.max_uri_len)
+                if not ok:
+                    return 400, {"error": f"Invalid {name}: {err}"}
+                updated_fields[name] = norm_val
+            else:
+                updated_fields[name] = current_val
 
         new_enabled = cur["enabled"]
         if "enabled" in data:
@@ -335,22 +424,34 @@ class SubscriptionApp:
                 c.execute("""
                     UPDATE users
                     SET nickname = ?, csqtt_uri = ?, qwdtt_uri = ?, snell_uri = ?, mieru_uri = ?,
-                        masterdnsvpn_uri = ?, enabled = ?, revision = ?, updated_at = ?
+                        masterdnsvpn_uri = ?, custom_uri = ?, enabled = ?, revision = ?, updated_at = ?
                     WHERE id = ?;
-                """, (new_nick, new_csqtt, new_qwdtt, new_snell, new_mieru, new_dns, new_enabled, new_revision, now, user_id))
+                """, (new_nick, updated_fields["csqtt"], updated_fields["qwdtt"], updated_fields["snell"],
+                      updated_fields["mieru"], updated_fields["masterdnsvpn"], updated_fields["custom"],
+                      new_enabled, new_revision, now, user_id))
         except sqlite3.IntegrityError:
             return 409, {"error": f"User with nickname '{new_nick}' already exists"}
         except Exception:
             return 500, {"error": "Internal database error"}
 
+        total_uris = sum(len(v.splitlines()) for v in updated_fields.values() if v)
+
         return 200, {
             "id": user_id,
             "nickname": new_nick,
-            "csqtt": new_csqtt,
-            "qwdtt": new_qwdtt,
-            "snell": new_snell,
-            "mieru": new_mieru,
-            "masterdnsvpn": new_dns,
+            "csqtt": updated_fields["csqtt"],
+            "qwdtt": updated_fields["qwdtt"],
+            "snell": updated_fields["snell"],
+            "mieru": updated_fields["mieru"],
+            "masterdnsvpn": updated_fields["masterdnsvpn"],
+            "custom": updated_fields["custom"],
+            "csqtt_uris": [u for u in updated_fields["csqtt"].splitlines() if u.strip()],
+            "qwdtt_uris": [u for u in updated_fields["qwdtt"].splitlines() if u.strip()],
+            "snell_uris": [u for u in updated_fields["snell"].splitlines() if u.strip()],
+            "mieru_uris": [u for u in updated_fields["mieru"].splitlines() if u.strip()],
+            "masterdnsvpn_uris": [u for u in updated_fields["masterdnsvpn"].splitlines() if u.strip()],
+            "custom_uris": [u for u in updated_fields["custom"].splitlines() if u.strip()],
+            "total_uris": total_uris,
             "enabled": bool(new_enabled),
             "revision": new_revision,
             "updated_at": now
@@ -396,7 +497,8 @@ class SubscriptionApp:
         """
         Выдача подписки по токену:
         - Поиск по SHA256(token).
-        - 5 ссылок в жестком порядке.
+        - Все протоколы в строгом порядке: CSQTT -> WDTT -> Snell -> Mieru -> MasterDNS -> Custom.
+        - Все ссылки каждого протокола разбиваются построчно.
         - Фильтрация пустых.
         - Если все пусты -> 204 No Content.
         - ETag и 304 Not Modified.
@@ -405,28 +507,29 @@ class SubscriptionApp:
         tok_hash = hash_token(token)
         c = self.conn.cursor()
         c.execute("""
-            SELECT id, nickname, csqtt_uri, qwdtt_uri, snell_uri, mieru_uri, masterdnsvpn_uri, enabled, revision
-            FROM users WHERE subscription_token_hash = ?;
+            SELECT * FROM users WHERE subscription_token_hash = ?;
         """, (tok_hash,))
         user = c.fetchone()
 
         if not user or not user["enabled"]:
             return 404, {"error": "Subscription not found or disabled"}, b""
 
-        # Порядок выдачи фиксирован ТЗ:
-        # 1. csqtt_uri
-        # 2. qwdtt_uri
-        # 3. snell_uri
-        # 4. mieru_uri
-        # 5. masterdnsvpn_uri
-        candidates = [
+        candidate_fields = [
             user["csqtt_uri"],
             user["qwdtt_uri"],
             user["snell_uri"],
             user["mieru_uri"],
-            user["masterdnsvpn_uri"]
+            user["masterdnsvpn_uri"],
+            user["custom_uri"] if "custom_uri" in user.keys() else ""
         ]
-        non_empty = [u for u in candidates if u and u.strip()]
+
+        non_empty = []
+        for field_val in candidate_fields:
+            if field_val and str(field_val).strip():
+                for line in str(field_val).splitlines():
+                    clean = line.strip()
+                    if clean:
+                        non_empty.append(clean)
 
         if not non_empty:
             return 204, {}, b""

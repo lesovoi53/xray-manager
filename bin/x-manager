@@ -4572,6 +4572,48 @@ print(json.dumps(data))
 " "$nick" "$s_uri" "$w_uri" "$m_uri" "$c_uri" "$d_uri"
 }
 
+collect_multi_uris() {
+    local proto_title="$1"
+    local proto_example="$2"
+    local uris_collected=()
+
+    echo -e "\n${BOLD}${CYAN}► Ссылки протокола: ${YELLOW}${proto_title}${NC}" >&2
+    if [ -n "$proto_example" ]; then
+        echo -e "  ${GRAY}Формат/Пример: ${proto_example}${NC}" >&2
+    fi
+    echo -e "  ${GRAY}(Вводите ссылки по одной или вставьте сразу блок строк. Пустой Enter — завершить)${NC}" >&2
+
+    local count=1
+    while true; do
+        read -r -p "  [#${count}] Ссылка (или Enter для перехода): " single_u
+        single_u=$(echo "$single_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [ -z "$single_u" ]; then
+            break
+        fi
+        while IFS= read -r line; do
+            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ -n "$line" ]; then
+                uris_collected+=("$line")
+                local preview="${line:0:55}"
+                [ "${#line}" -gt 55 ] && preview="${preview}..."
+                echo -e "     ${GREEN}✓ Добавлен узел #${#uris_collected[@]}:${NC} ${preview}" >&2
+            fi
+        done <<< "$single_u"
+        count=$((${#uris_collected[@]} + 1))
+    done
+
+    local result=""
+    for u in "${uris_collected[@]}"; do
+        if [ -z "$result" ]; then
+            result="$u"
+        else
+            result="${result}
+${u}"
+        fi
+    done
+    printf "%s" "$result"
+}
+
 menu_subscriptions() {
     local SUB_API="http://127.0.0.1:22217"
 
@@ -4587,7 +4629,7 @@ menu_subscriptions() {
         echo ""
         echo -e "  ${YELLOW}[1]${NC} 👥 ${BOLD}Список профилей и ссылки подписок${NC}"
         echo -e "  ${YELLOW}[2]${NC} 🚀 ${BOLD}Создать подписку из текущих ссылок сервера${NC} (Snell, Mieru, WDTT, DNS...)"
-        echo -e "  ${YELLOW}[3]${NC} ➕ ${BOLD}Создать пользователя с произвольными ссылками вручную${NC}"
+        echo -e "  ${YELLOW}[3]${NC} ➕ ${BOLD}Создать пользователя с произвольными ссылками вручную${NC} (мульти-ноды)"
         echo -e "  ${YELLOW}[4]${NC} 🔄 ${BOLD}Ротация токена подписки${NC} (мгновенно отзывает старую ссылку)"
         echo -e "  ${YELLOW}[5]${NC} ✏️  ${BOLD}Включить / отключить подписку пользователя${NC}"
         echo -e "  ${YELLOW}[6]${NC} 🗑️  ${BOLD}Удалить пользователя из сервера подписок${NC}"
@@ -4605,7 +4647,40 @@ menu_subscriptions() {
                 if [ -z "$raw_users" ] || [ "$raw_users" = "[]" ]; then
                     echo -e "${YELLOW}Пользователи еще не созданы или служба не запущена.${NC}"
                 else
-                    echo "$raw_users" | jq -r '.[] | "--------------------------------------------------\n👤 Пользователь: \(.nickname)\n🆔 ID:           \(.id)\n🟢 Активен:      \(.enabled)\n🔢 Ревизия:      \(.revision)\n🔗 Ссылка:       \(.subscription_url)\n"' 2>/dev/null || echo "$raw_users"
+                    python3 -c '
+import json, sys
+try:
+    users = json.loads(sys.argv[1])
+    if not users:
+        print("Пользователи не найдены.")
+        sys.exit(0)
+    for u in users:
+        nick = u.get("nickname", "N/A")
+        uid = u.get("id", "N/A")
+        en = "🟢 Активен" if u.get("enabled") else "🔴 Отключен"
+        rev = u.get("revision", 1)
+        tot = u.get("total_uris", 0)
+        counts = u.get("counts", {})
+        details = []
+        for k, label in [("snell", "Snell"), ("mieru", "Mieru"), ("qwdtt", "WDTT"),
+                         ("csqtt", "CSQTT"), ("masterdnsvpn", "DNS"), ("custom", "Extra")]:
+            v = counts.get(k, 0)
+            if v > 0:
+                details.append(f"{label}: {v}")
+        j_details = ", ".join(details)
+        detail_str = f" ({j_details})" if details else ""
+        sub_url = u.get("subscription_url", "")
+        print("──────────────────────────────────────────────────────────────────────")
+        print(f"👤 Пользователь: \033[1;32m{nick}\033[0m")
+        print(f"🆔 ID:           {uid}")
+        print(f"⚡ Статус:       {en}  |  Ревизия: {rev}")
+        print(f"🌐 Всего узлов:  \033[1;33m{tot}\033[0m{detail_str}")
+        if sub_url:
+            print(f"🔗 Ссылка:       \033[1;36m{sub_url}\033[0m")
+    print("──────────────────────────────────────────────────────────────────────")
+except Exception:
+    print(sys.argv[1])
+' "$raw_users"
                 fi
                 echo ""
                 read -p "Нажмите Enter для возврата..."
@@ -4642,32 +4717,78 @@ menu_subscriptions() {
                 ;;
             3)
                 clear
-                echo -e "${CYAN}=== РУЧНОЕ СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ ===${NC}\n"
-                read -p "Никнейм: " m_nick
-                [ -z "$m_nick" ] && return
-                read -p "Snell URI [Enter если нет]: " m_snell
-                read -p "WDTT (qwdtt) URI [Enter если нет]: " m_wdtt
-                read -p "Mieru URI [Enter если нет]: " m_mieru
-                read -p "CSQTT URI [Enter если нет]: " m_csqtt
-                read -p "MasterDNS (stormdns) URI [Enter если нет]: " m_dns
+                echo -e "${CYAN}=== РУЧНОЕ СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ (МУЛЬТИ-ССЫЛКИ) ===${NC}\n"
+                read -p "Никнейм пользователя: " m_nick
+                m_nick=$(echo "$m_nick" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                [ -z "$m_nick" ] && continue
+
+                local m_snell=$(collect_multi_uris "Snell v5" "snell://psk@ip:port/?version=5&reuse=true#Node")
+                local m_wdtt=$(collect_multi_uris "WDTT (qwdtt)" "qwdtt://config?name=...&peer=ip%3Aport...")
+                local m_mieru=$(collect_multi_uris "Mieru (mita)" "mierus://user:pass@ip/?profile=...&port=...")
+                local m_csqtt=$(collect_multi_uris "CSQTT" "csqtt://pass@ip:port#CSQTT")
+                local m_dns=$(collect_multi_uris "MasterDNS / StormDNS" "stormdns://domain?key=...#DNS")
+                local m_custom=$(collect_multi_uris "Дополнительные узлы (VLESS / Trojan / Shadowsocks / TUIC)" "vless://... или ss://...")
+
+                local count_snell=$(python3 -c "import sys; print(len([l for l in sys.argv[1].splitlines() if l.strip()]))" "$m_snell" 2>/dev/null || echo 0)
+                local count_wdtt=$(python3 -c "import sys; print(len([l for l in sys.argv[1].splitlines() if l.strip()]))" "$m_wdtt" 2>/dev/null || echo 0)
+                local count_mieru=$(python3 -c "import sys; print(len([l for l in sys.argv[1].splitlines() if l.strip()]))" "$m_mieru" 2>/dev/null || echo 0)
+                local count_csqtt=$(python3 -c "import sys; print(len([l for l in sys.argv[1].splitlines() if l.strip()]))" "$m_csqtt" 2>/dev/null || echo 0)
+                local count_dns=$(python3 -c "import sys; print(len([l for l in sys.argv[1].splitlines() if l.strip()]))" "$m_dns" 2>/dev/null || echo 0)
+                local count_custom=$(python3 -c "import sys; print(len([l for l in sys.argv[1].splitlines() if l.strip()]))" "$m_custom" 2>/dev/null || echo 0)
+                local total_nodes=$((count_snell + count_wdtt + count_mieru + count_csqtt + count_dns + count_custom))
+
+                clear
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${CYAN}║${BOLD}          СВОДКА СОЗДАВАЕМОГО ПРОФИЛЯ ПОДПИСКИ TUNA             ${CYAN}║${NC}"
+                echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+                echo -e "${CYAN}║${NC}  Пользователь: ${GREEN}${BOLD}${m_nick}${NC}"
+                echo -e "${CYAN}║${NC}  Всего узлов в подписке: ${YELLOW}${BOLD}${total_nodes}${NC}"
+                echo -e "${CYAN}╟──────────────────────────────────────────────────────────────────────╢${NC}"
+                echo -e "${CYAN}║${NC}  • Snell v5:      ${BOLD}${count_snell}${NC} ссылок"
+                echo -e "${CYAN}║${NC}  • WDTT (qwdtt):  ${BOLD}${count_wdtt}${NC} ссылок"
+                echo -e "${CYAN}║${NC}  • Mieru (mita):  ${BOLD}${count_mieru}${NC} ссылок"
+                echo -e "${CYAN}║${NC}  • CSQTT:         ${BOLD}${count_csqtt}${NC} ссылок"
+                echo -e "${CYAN}║${NC}  • MasterDNS:     ${BOLD}${count_dns}${NC} ссылок"
+                echo -e "${CYAN}║${NC}  • Дополнительно: ${BOLD}${count_custom}${NC} ссылок (VLESS/Trojan/SS...)"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                echo ""
+                read -p "Создать профиль с указанными узлами? [Y/n]: " conf_create
+                conf_create=${conf_create:-Y}
+                if [[ ! "$conf_create" =~ ^[YyДд]$ ]]; then
+                    echo -e "${YELLOW}Создание отменено.${NC}"
+                    sleep 1
+                    continue
+                fi
 
                 local m_json=$(python3 -c "
 import json, sys
-print(json.dumps({
+data = {
     'nickname': sys.argv[1],
     'snell_uri': sys.argv[2],
     'qwdtt_uri': sys.argv[3],
     'mieru_uri': sys.argv[4],
     'csqtt_uri': sys.argv[5],
-    'masterdnsvpn_uri': sys.argv[6]
-}))" "$m_nick" "$m_snell" "$m_wdtt" "$m_mieru" "$m_csqtt" "$m_dns")
+    'masterdnsvpn_uri': sys.argv[6],
+    'custom_uri': sys.argv[7]
+}
+print(json.dumps(data))
+" "$m_nick" "$m_snell" "$m_wdtt" "$m_mieru" "$m_csqtt" "$m_dns" "$m_custom")
+
                 local resp=$(curl -s -X POST "${SUB_API}/api/users" -H "Content-Type: application/json" -d "$m_json" 2>/dev/null || echo "")
                 local sub_url=$(echo "$resp" | jq -r '.subscription_url // empty' 2>/dev/null || echo "")
                 if [ -n "$sub_url" ]; then
-                    echo -e "${GREEN}✓ Пользователь создан! URL: ${CYAN}${sub_url}${NC}"
-                    qrencode -t ANSI256 "$sub_url" 2>/dev/null || true
+                    echo ""
+                    echo -e "${GREEN}${BOLD}✓ Профиль успешно создан!${NC}"
+                    echo -e "  • Никнейм:    ${GREEN}${m_nick}${NC}"
+                    echo -e "  • Всего узлов: ${YELLOW}${BOLD}${total_nodes}${NC}"
+                    echo -e "  • Ссылка:     ${CYAN}${BOLD}${sub_url}${NC}"
+                    echo ""
+                    echo -e "${BOLD}QR-код персональной ссылки подписки:${NC}"
+                    qrencode -t ANSI256 "$sub_url" 2>/dev/null || qrencode -t UTF8 "$sub_url" 2>/dev/null || true
+                    echo ""
+                    echo -e "${YELLOW}Эту ссылку нужно передать в панель или клиент TUNA как подписку.${NC}"
                 else
-                    echo -e "${RED}Ошибка:${NC} $resp"
+                    echo -e "${RED}Ошибка при создании пользователя:${NC} $resp"
                 fi
                 echo ""
                 read -p "Нажмите Enter..."

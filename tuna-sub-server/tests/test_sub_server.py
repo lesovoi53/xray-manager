@@ -431,6 +431,132 @@ class TunaSubscriptionTests(unittest.TestCase):
         self.assertNotIn("settings", tables)
         self.assertIn("users", tables)
 
+    # --------------------------------------------------------------------------
+    # ТЕСТ 17: Поддержка нескольких ссылок (2, 3, 4 и более) на протокол
+    # --------------------------------------------------------------------------
+    def test_17_multi_links_per_protocol(self):
+        snell_nodes = [
+            "snell://psk_de@1.1.1.1:1488/?version=5&reuse=true#Snell-Frankfurt",
+            "snell://psk_nl@2.2.2.2:1488/?version=5&reuse=true#Snell-Amsterdam",
+            "snell://psk_us@3.3.3.3:1488/?version=5&reuse=true#Snell-NewYork",
+        ]
+        mieru_nodes = [
+            "mierus://user1:pass1@4.4.4.4/?profile=Mieru-DE&port=2020-2030",
+            "mierus://user2:pass2@5.5.5.5/?profile=Mieru-FI&port=3030-3040",
+        ]
+        qwdtt_node = "qwdtt://config?name=WDTT-Main&peer=6.6.6.6%3A56000&hashes=#"
+
+        payload = {
+            "nickname": "multi_node_user",
+            "snell": "\n".join(snell_nodes),
+            "mieru": "\n".join(mieru_nodes),
+            "qwdtt": qwdtt_node
+        }
+
+        status, _, body = self.api_request("POST", "/api/users", payload)
+        self.assertEqual(status, 201)
+        res = json.loads(body.decode("utf-8"))
+        self.assertEqual(res["total_uris"], 6)
+        token = res["token"]
+
+        # Получаем подписку и проверяем все 6 ссылок в теле
+        sub_status, _, sub_body = self.api_request("GET", f"/sub/{token}")
+        self.assertEqual(sub_status, 200)
+        decoded_lines = [l for l in base64.b64decode(sub_body).decode("utf-8").splitlines() if l]
+
+        self.assertEqual(len(decoded_lines), 6)
+        # Порядок выдачи ТЗ: QWDTT -> Snell (все 3) -> Mieru (все 2)
+        self.assertEqual(decoded_lines[0], qwdtt_node)
+        self.assertEqual(decoded_lines[1], snell_nodes[0])
+        self.assertEqual(decoded_lines[2], snell_nodes[1])
+        self.assertEqual(decoded_lines[3], snell_nodes[2])
+        self.assertEqual(decoded_lines[4], mieru_nodes[0])
+        self.assertEqual(decoded_lines[5], mieru_nodes[1])
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 18: Передача мульти-ссылок в виде JSON-массивов и custom-протоколы
+    # --------------------------------------------------------------------------
+    def test_18_multi_links_as_json_arrays(self):
+        csqtt_arr = [
+            "csqtt://pass1@1.2.3.4:37000#CSQTT-1",
+            "csqtt://pass2@1.2.3.5:37000#CSQTT-2"
+        ]
+        custom_arr = [
+            "vless://uuid1@1.2.3.6:443?security=reality&sni=example.com#VLESS-Node",
+            "ss://YWVzLTEyOC1nY206cGFzczE@1.2.3.7:8388#Shadowsocks-Node"
+        ]
+
+        payload = {
+            "nickname": "json_array_user",
+            "csqtt_uris": csqtt_arr,
+            "custom": custom_arr
+        }
+
+        status, _, body = self.api_request("POST", "/api/users", payload)
+        self.assertEqual(status, 201)
+        res = json.loads(body.decode("utf-8"))
+        u_id = res["id"]
+        token = res["token"]
+        self.assertEqual(res["total_uris"], 4)
+
+        # GET /api/users/<id>
+        g_status, _, g_body = self.api_request("GET", f"/api/users/{u_id}")
+        self.assertEqual(g_status, 200)
+        g_res = json.loads(g_body.decode("utf-8"))
+        self.assertEqual(len(g_res["csqtt_uris"]), 2)
+        self.assertEqual(len(g_res["custom_uris"]), 2)
+        self.assertEqual(g_res["total_uris"], 4)
+
+        # Подписка
+        _, _, sub_body = self.api_request("GET", f"/sub/{token}")
+        lines = [l for l in base64.b64decode(sub_body).decode("utf-8").splitlines() if l]
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(lines[0], csqtt_arr[0])
+        self.assertEqual(lines[1], csqtt_arr[1])
+        self.assertEqual(lines[2], custom_arr[0])
+        self.assertEqual(lines[3], custom_arr[1])
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 19: Обновление пользователя новыми мульти-ссылками и валидация
+    # --------------------------------------------------------------------------
+    def test_19_update_user_multi_links(self):
+        # Создаем пользователя с 1 Snell ссылкой
+        status, _, body = self.api_request("POST", "/api/users", {
+            "nickname": "update_multi_user",
+            "snell": "snell://init@1.1.1.1:1488"
+        })
+        user = json.loads(body.decode("utf-8"))
+        u_id = user["id"]
+        token = user["token"]
+
+        # Обновляем на 3 Snell ссылки через PUT
+        new_snell_list = [
+            "snell://node_a@1.1.1.1:1488",
+            "snell://node_b@1.1.1.2:1488",
+            "snell://node_c@1.1.1.3:1488"
+        ]
+        u_status, _, u_body = self.api_request("PUT", f"/api/users/{u_id}", {
+            "snell_uris": new_snell_list
+        })
+        self.assertEqual(u_status, 200)
+        u_res = json.loads(u_body.decode("utf-8"))
+        self.assertEqual(u_res["total_uris"], 3)
+        self.assertEqual(len(u_res["snell_uris"]), 3)
+
+        # Подписка обновлена
+        _, _, sub_body = self.api_request("GET", f"/sub/{token}")
+        lines = [l for l in base64.b64decode(sub_body).decode("utf-8").splitlines() if l]
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0], new_snell_list[0])
+        self.assertEqual(lines[2], new_snell_list[2])
+
+        # Ошибка при попытке передать массив с невалидным элементом
+        err_status, _, err_body = self.api_request("PUT", f"/api/users/{u_id}", {
+            "snell_uris": ["snell://valid@1.1.1.1:1488", "broken_without_scheme"]
+        })
+        self.assertEqual(err_status, 400)
+
 
 if __name__ == "__main__":
     unittest.main()
+
