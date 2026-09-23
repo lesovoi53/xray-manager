@@ -17,7 +17,7 @@ import sqlite3
 import datetime
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 # Поддержка tomllib (Python 3.11+) с fallback-парсером для более старых версий
 try:
@@ -335,7 +335,7 @@ class SubscriptionApp:
 
     def get_user(self, user_id: str) -> tuple[int, dict]:
         c = self.conn.cursor()
-        c.execute("SELECT * FROM users WHERE id = ?;", (user_id,))
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id, user_id))
         r = c.fetchone()
         if not r:
             return 404, {"error": "User not found"}
@@ -373,11 +373,12 @@ class SubscriptionApp:
 
     def update_user(self, user_id: str, data: dict) -> tuple[int, dict]:
         c = self.conn.cursor()
-        c.execute("SELECT * FROM users WHERE id = ?;", (user_id,))
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id, user_id))
         cur = c.fetchone()
         if not cur:
             return 404, {"error": "User not found"}
 
+        resolved_id = cur["id"]
         new_nick = cur["nickname"]
         if "nickname" in data:
             candidate_nick = str(data["nickname"]).strip()
@@ -428,7 +429,7 @@ class SubscriptionApp:
                     WHERE id = ?;
                 """, (new_nick, updated_fields["csqtt"], updated_fields["qwdtt"], updated_fields["snell"],
                       updated_fields["mieru"], updated_fields["masterdnsvpn"], updated_fields["custom"],
-                      new_enabled, new_revision, now, user_id))
+                      new_enabled, new_revision, now, resolved_id))
         except sqlite3.IntegrityError:
             return 409, {"error": f"User with nickname '{new_nick}' already exists"}
         except Exception:
@@ -437,7 +438,7 @@ class SubscriptionApp:
         total_uris = sum(len(v.splitlines()) for v in updated_fields.values() if v)
 
         return 200, {
-            "id": user_id,
+            "id": resolved_id,
             "nickname": new_nick,
             "csqtt": updated_fields["csqtt"],
             "qwdtt": updated_fields["qwdtt"],
@@ -460,18 +461,19 @@ class SubscriptionApp:
     def delete_user(self, user_id: str) -> tuple[int, dict]:
         with self.conn:
             c = self.conn.cursor()
-            c.execute("DELETE FROM users WHERE id = ?;", (user_id,))
+            c.execute("DELETE FROM users WHERE id = ? OR nickname = ?;", (user_id, user_id))
             if c.rowcount == 0:
                 return 404, {"error": "User not found"}
         return 200, {"success": True, "message": "User deleted successfully"}
 
     def rotate_token(self, user_id: str) -> tuple[int, dict]:
         c = self.conn.cursor()
-        c.execute("SELECT id, revision FROM users WHERE id = ?;", (user_id,))
+        c.execute("SELECT id, revision FROM users WHERE id = ? OR nickname = ?;", (user_id, user_id))
         cur = c.fetchone()
         if not cur:
             return 404, {"error": "User not found"}
 
+        resolved_id = cur["id"]
         new_raw_token = secrets.token_urlsafe(32)
         new_tok_hash = hash_token(new_raw_token)
         new_rev = cur["revision"] + 1
@@ -482,11 +484,11 @@ class SubscriptionApp:
                 UPDATE users
                 SET subscription_token_hash = ?, revision = ?, updated_at = ?
                 WHERE id = ?;
-            """, (new_tok_hash, new_rev, now, user_id))
+            """, (new_tok_hash, new_rev, now, resolved_id))
 
         sub_url = f"http://{self.bind_addr}:{self.bind_port}/sub/{new_raw_token}"
         return 200, {
-            "id": user_id,
+            "id": resolved_id,
             "subscription_url": sub_url,
             "token": new_raw_token,
             "revision": new_rev,
@@ -656,24 +658,24 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             self.send_json(status, res)
             return
 
-        # GET /api/users/<id>
-        m_user = re.match(r"^/api/users/([a-zA-Z0-9_\-]+)$", path)
+        # GET /api/users/<id_or_nickname>
+        m_user = re.match(r"^/api/users/([^/]+)$", path)
         if m_user:
-            user_id = m_user.group(1)
+            user_id = unquote(m_user.group(1))
             status, res = self.app.get_user(user_id)
             self.send_json(status, res)
             return
 
-        # GET /api/users/<id>/subscription-url
-        m_sub_url = re.match(r"^/api/users/([a-zA-Z0-9_\-]+)/subscription-url$", path)
+        # GET /api/users/<id_or_nickname>/subscription-url
+        m_sub_url = re.match(r"^/api/users/([^/]+)/subscription-url$", path)
         if m_sub_url:
-            user_id = m_sub_url.group(1)
+            user_id = unquote(m_sub_url.group(1))
             status, res = self.app.get_user(user_id)
             if status != 200:
                 self.send_json(status, res)
                 return
             self.send_json(200, {
-                "id": user_id,
+                "id": res["id"],
                 "nickname": res["nickname"],
                 "subscription_url_template": f"http://{self.app.bind_addr}:{self.app.bind_port}/sub/<token>",
                 "note": "Full token is only shown upon user creation or rotation (/api/users/<id>/rotate-token)"
@@ -702,10 +704,10 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             self.send_json(status, res)
             return
 
-        # POST /api/users/<id>/rotate-token
-        m_rotate = re.match(r"^/api/users/([a-zA-Z0-9_\-]+)/rotate-token$", path)
+        # POST /api/users/<id_or_nickname>/rotate-token
+        m_rotate = re.match(r"^/api/users/([^/]+)/rotate-token$", path)
         if m_rotate:
-            user_id = m_rotate.group(1)
+            user_id = unquote(m_rotate.group(1))
             status, res = self.app.rotate_token(user_id)
             self.send_json(status, res)
             return
@@ -716,10 +718,10 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        # PUT /api/users/<id>
-        m_user = re.match(r"^/api/users/([a-zA-Z0-9_\-]+)$", path)
+        # PUT /api/users/<id_or_nickname>
+        m_user = re.match(r"^/api/users/([^/]+)$", path)
         if m_user:
-            user_id = m_user.group(1)
+            user_id = unquote(m_user.group(1))
             try:
                 data = self.read_json_body()
             except ValueError as e:
@@ -735,10 +737,10 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        # DELETE /api/users/<id>
-        m_user = re.match(r"^/api/users/([a-zA-Z0-9_\-]+)$", path)
+        # DELETE /api/users/<id_or_nickname>
+        m_user = re.match(r"^/api/users/([^/]+)$", path)
         if m_user:
-            user_id = m_user.group(1)
+            user_id = unquote(m_user.group(1))
             status, res = self.app.delete_user(user_id)
             self.send_json(status, res)
             return

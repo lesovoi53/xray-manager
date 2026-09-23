@@ -556,7 +556,39 @@ class TunaSubscriptionTests(unittest.TestCase):
         })
         self.assertEqual(err_status, 400)
 
+    # --------------------------------------------------------------------------
+    # ТЕСТ 20: Доступ, обновление и удаление пользователя напрямую по никнейму
+    # --------------------------------------------------------------------------
+    def test_20_access_and_modify_by_nickname(self):
+        nick = "nick_tester"
+        status, _, body = self.api_request("POST", "/api/users", {
+            "nickname": nick,
+            "snell": "snell://init@1.1.1.1:1488"
+        })
+        self.assertEqual(status, 201)
+
+        # GET по никнейму
+        g_status, _, g_body = self.api_request("GET", f"/api/users/{nick}")
+        self.assertEqual(g_status, 200)
+        u_info = json.loads(g_body.decode("utf-8"))
+        self.assertEqual(u_info["nickname"], nick)
+
+        # PUT по никнейму (обновление ссылок)
+        p_status, _, p_body = self.api_request("PUT", f"/api/users/{nick}", {
+            "csqtt": "csqtt://pass@1.1.1.1:37000#MyCSQTT"
+        })
+        self.assertEqual(p_status, 200)
+
+        # DELETE по никнейму
+        d_status, _, _ = self.api_request("DELETE", f"/api/users/{nick}")
+        self.assertEqual(d_status, 200)
+
+        # Проверка удаления
+        chk_status, _, _ = self.api_request("GET", f"/api/users/{nick}")
+        self.assertEqual(chk_status, 404)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

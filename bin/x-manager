@@ -41,6 +41,7 @@ CSQTT_ENV_FILE="/etc/csqtt/csqtt.env"
 CSQTT_LOCK_FILE="/etc/csqtt/ssh_only.lock"
 CSQTT_NET_UP="/usr/local/lib/csqtt/network-up.sh"
 CSQTT_SERVICE_FILE="/etc/systemd/system/csqtt.service"
+CSQTT_PROFILE_FILE="/etc/csqtt/connection_name.txt"
 # Пути к файлам DNS-туннелей (CottenDNS / MasterDnsVPN)
 COTTEN_DIR="/etc/cottendns"
 COTTEN_BIN="/usr/local/bin/cottendns-server"
@@ -1774,6 +1775,67 @@ get_csqtt_tunnel_pass() {
     echo "N/A"
 }
 
+get_csqtt_connection_name() {
+    if [ -f "$CSQTT_PROFILE_FILE" ]; then
+        cat "$CSQTT_PROFILE_FILE" | tr -d '\r\n'
+    else
+        echo "CSQTT-${SERVER_IP}"
+    fi
+}
+
+set_csqtt_connection_name() {
+    local new_name="$1"
+    mkdir -p "$CSQTT_DIR"
+    echo -n "$new_name" > "$CSQTT_PROFILE_FILE"
+}
+
+csqtt_change_connection_name() {
+    show_csqtt_header
+    local cur_name=$(get_csqtt_connection_name)
+    echo -e "${BOLD}--- Смена имени подключения CSQTT ---${NC}"
+    echo -e "Текущее имя подключения: ${CYAN}${cur_name}${NC}"
+    echo ""
+    read -p "Введите новое имя подключения CSQTT (например: CSQTT-Home, MyCSQTT): " new_n
+    new_n=$(echo "$new_n" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -n "$new_n" ]; then
+        set_csqtt_connection_name "$new_n"
+        echo -e "${GREEN}✓ Имя подключения CSQTT успешно изменено на: ${BOLD}${new_n}${NC}"
+    else
+        echo -e "${YELLOW}Изменения отменены (пустое имя).${NC}"
+    fi
+    sleep 2
+}
+
+get_csqtt_link() {
+    local port=$(get_csqtt_peer_port)
+    local pass=$(get_csqtt_tunnel_pass)
+    local name=$(get_csqtt_connection_name)
+    if [ -n "$port" ] && [ -n "$pass" ] && [ "$pass" != "N/A" ]; then
+        echo "csqtt://${pass}@${SERVER_IP}:${port}#${name}"
+    fi
+}
+
+show_csqtt_client_link() {
+    clear
+    local link=$(get_csqtt_link)
+    local name=$(get_csqtt_connection_name)
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          КЛИЕНТСКАЯ ССЫЛКА И QR-КОД CSQTT VPN                       ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  • Имя подключения: ${GREEN}${BOLD}${name}${NC}"
+    if [ -n "$link" ]; then
+        echo -e "  • Ссылка CSQTT:    ${CYAN}${BOLD}${link}${NC}"
+        echo ""
+        echo -e "${BOLD}QR-код для импорта в клиент CSQTT / TUNA:${NC}"
+        qrencode -t ANSI256 "$link" 2>/dev/null || qrencode -t UTF8 "$link" 2>/dev/null || true
+    else
+        echo -e "${RED}Не удалось сформировать ссылку: проверьте пароль и порт CSQTT.${NC}"
+    fi
+    echo ""
+    read -p "Нажмите Enter для возврата..."
+}
+
 is_csqtt_web_protected() {
     local port=$(get_csqtt_web_port)
     if [ -f "$CSQTT_LOCK_FILE" ]; then
@@ -1930,6 +1992,8 @@ show_csqtt_credentials() {
     local u=$(get_csqtt_user)
     local p=$(get_csqtt_pass)
     local tp=$(get_csqtt_tunnel_pass)
+    local c_name=$(get_csqtt_connection_name)
+    local c_link=$(get_csqtt_link)
 
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${BOLD}              РЕКВИЗИТЫ ДОСТУПА И ПАРОЛИ CSQTT                       ${CYAN}║${NC}"
@@ -1944,7 +2008,11 @@ show_csqtt_credentials() {
     echo -e "${BOLD}🛡️ Параметры VPN Туннеля:${NC}"
     echo -e "  • IP сервера:            ${CYAN}${SERVER_IP}${NC}"
     echo -e "  • Порт туннеля (UDP):    ${CYAN}${peer_p}/UDP${NC}"
+    echo -e "  • Имя подключения:       ${GREEN}${BOLD}${c_name}${NC}"
     echo -e "  • Пароль туннеля:        ${GREEN}${BOLD}${tp}${NC}"
+    if [ -n "$c_link" ]; then
+        echo -e "  • Клиентская ссылка:     ${CYAN}${BOLD}${c_link}${NC}"
+    fi
     echo ""
     echo -e "${BOLD}ℹ️  Защита веб-панели:${NC} $(get_csqtt_protect_status)"
     echo ""
@@ -1963,11 +2031,13 @@ show_csqtt_header() {
     local u=$(get_csqtt_user)
     local p=$(get_csqtt_pass)
     local tp=$(get_csqtt_tunnel_pass)
+    local c_name=$(get_csqtt_connection_name)
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${BOLD}          УПРАВЛЕНИЕ СЛУЖБОЙ CSQTT И ЗАЩИТОЙ ВЕБ-ПАНЕЛИ             ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  Сервер:     ${BOLD}${SERVER_IP}${NC}  |  Статус: $(get_csqtt_status)"
     echo -e "${CYAN}║${NC}  VPN туннель: :${peer_p}/UDP  |  Фаервол: $(get_csqtt_tunnel_status)"
+    echo -e "${CYAN}║${NC}  Имя подключения: ${GREEN}${BOLD}${c_name}${NC}"
     echo -e "${CYAN}║${NC}  Веб-панель:  :${port}/TCP    |  Защита: $(get_csqtt_protect_status)"
     echo -e "${CYAN}║${NC}  Вход в панель: Логин: ${GREEN}${u}${NC}  |  Пароль: ${GREEN}${p}${NC}  |  Пароль VPN: ${GREEN}${tp}${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
@@ -2001,9 +2071,11 @@ menu_csqtt() {
         echo -e "  ${YELLOW}[7]${NC} 📜 Живые логи службы csqtt (journalctl)"
         echo -e "  ${YELLOW}[8]${NC} 🔄 Перезапустить службу csqtt"
         echo -e "  ${YELLOW}[9]${NC} 🔑 ${BOLD}Сменить логин и пароль веб-панели CSQTT${NC}"
+        echo -e "  ${YELLOW}[10]${NC} 🏷️  ${BOLD}Задать / изменить имя подключения CSQTT${NC} (сейчас: $(get_csqtt_connection_name))"
+        echo -e "  ${YELLOW}[11]${NC} 🔗 ${BOLD}Показать клиентскую ссылку (csqtt://) и QR-код${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите пункт [0-9]: " c_choice
+        read -p "Выберите пункт [0-11]: " c_choice
         case "$c_choice" in
             1)
                 show_csqtt_header
@@ -2056,6 +2128,12 @@ menu_csqtt() {
                     echo -e "${YELLOW}Пароль не может быть пустым.${NC}"
                 fi
                 sleep 2
+                ;;
+            10)
+                csqtt_change_connection_name
+                ;;
+            11)
+                show_csqtt_client_link
                 ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
@@ -4545,11 +4623,7 @@ print(f'qwdtt://config?name={urllib.parse.quote_plus(name)}&peer={ip}%3A{port}&h
     # 4. CSQTT URI
     local c_uri=""
     if is_csqtt_installed; then
-        local c_port=$(get_csqtt_peer_port)
-        local c_pass=$(get_csqtt_tunnel_pass)
-        if [ -n "$c_port" ] && [ -n "$c_pass" ] && [ "$c_pass" != "N/A" ]; then
-            c_uri="csqtt://${c_pass}@${SERVER_IP}:${c_port}#CSQTT"
-        fi
+        c_uri=$(get_csqtt_link 2>/dev/null || echo "")
     fi
 
     # 5. MasterDnsVPN URI
@@ -4614,6 +4688,248 @@ ${u}"
     printf "%s" "$result"
 }
 
+select_sub_user() {
+    local SUB_API="http://127.0.0.1:22217"
+    local raw_users=$(curl -s "${SUB_API}/api/users" 2>/dev/null || echo "")
+    if [ -z "$raw_users" ] || [ "$raw_users" = "[]" ]; then
+        echo -e "${YELLOW}Пользователи еще не созданы или служба tuna-subscriptions не запущена.${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}" >&2
+    echo -e "${CYAN}║${BOLD}                  ВЫБОР ПОЛЬЗОВАТЕЛЯ ПОДПИСКИ                         ${CYAN}║${NC}" >&2
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}" >&2
+
+    local py_res
+    py_res=$(python3 -c '
+import json, sys
+try:
+    users = json.loads(sys.argv[1])
+    for idx, u in enumerate(users, 1):
+        nick = u.get("nickname", "N/A")
+        uid = u.get("id", "")
+        en = "🟢" if u.get("enabled") else "🔴"
+        tot = u.get("total_uris", 0)
+        print(f"{idx}\t{uid}\t{nick}\t{en}\t{tot}")
+except Exception:
+    pass
+' "$raw_users" 2>/dev/null)
+
+    if [ -z "$py_res" ]; then
+        echo -e "${RED}Не удалось разобрать список пользователей.${NC}" >&2
+        return 1
+    fi
+
+    local lines=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && lines+=("$line")
+    done <<< "$py_res"
+
+    local total="${#lines[@]}"
+    for item in "${lines[@]}"; do
+        local num=$(echo "$item" | cut -f1)
+        local uid=$(echo "$item" | cut -f2)
+        local nick=$(echo "$item" | cut -f3)
+        local en=$(echo "$item" | cut -f4)
+        local tot=$(echo "$item" | cut -f5)
+        local short_id="${uid:0:8}..."
+        printf "  \033[1;33m[%2s]\033[0m %b \033[1;32m%-16s\033[0m (Узлов: \033[1;33m%2s\033[0m, ID: \033[0;36m%s\033[0m)\n" "$num" "$en" "$nick" "$tot" "$short_id" >&2
+    done
+    echo -e "  ${YELLOW}[ 0]${NC} ⬅️  Отмена" >&2
+    echo "" >&2
+
+    echo -ne "  ${BOLD}Выберите номер [1-${total}] или введите никнейм/ID: ${NC}" >&2
+    read -r user_choice
+    user_choice=$(echo "$user_choice" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    if [ -z "$user_choice" ] || [ "$user_choice" = "0" ]; then
+        return 1
+    fi
+
+    if [[ "$user_choice" =~ ^[0-9]+$ ]] && [ "$user_choice" -ge 1 ] && [ "$user_choice" -le "$total" ]; then
+        local chosen_line="${lines[$((user_choice - 1))]}"
+        local chosen_id=$(echo "$chosen_line" | cut -f2)
+        echo "$chosen_id"
+        return 0
+    fi
+
+    for item in "${lines[@]}"; do
+        local uid=$(echo "$item" | cut -f2)
+        local nick=$(echo "$item" | cut -f3)
+        if [ "$user_choice" = "$nick" ] || [ "$user_choice" = "$uid" ]; then
+            echo "$uid"
+            return 0
+        fi
+    done
+
+    echo "$user_choice"
+    return 0
+}
+
+edit_sub_user() {
+    local SUB_API="http://127.0.0.1:22217"
+    local sel_id="$1"
+    if [ -z "$sel_id" ]; then
+        sel_id=$(select_sub_user)
+        [ -z "$sel_id" ] && return
+    fi
+
+    while true; do
+        clear
+        local user_json=$(curl -s "${SUB_API}/api/users/${sel_id}" 2>/dev/null || echo "")
+        local uid=$(echo "$user_json" | jq -r '.id // empty' 2>/dev/null || echo "")
+        if [ -z "$uid" ]; then
+            echo -e "${RED}Ошибка: пользователь '${sel_id}' не найден на сервере подписок.${NC}"
+            sleep 2
+            return
+        fi
+
+        local u_nick=$(echo "$user_json" | jq -r '.nickname // "N/A"')
+        local u_en=$(echo "$user_json" | jq -r '.enabled')
+        local u_rev=$(echo "$user_json" | jq -r '.revision // 1')
+        local u_tot=$(echo "$user_json" | jq -r '.total_uris // 0')
+
+        local u_snell=$(echo "$user_json" | jq -r '.snell // empty')
+        local u_wdtt=$(echo "$user_json" | jq -r '.qwdtt // empty')
+        local u_mieru=$(echo "$user_json" | jq -r '.mieru // empty')
+        local u_csqtt=$(echo "$user_json" | jq -r '.csqtt // empty')
+        local u_dns=$(echo "$user_json" | jq -r '.masterdnsvpn // empty')
+        local u_custom=$(echo "$user_json" | jq -r '.custom // empty')
+
+        local c_snell=$(echo "$user_json" | jq -r '(.snell_uris // []) | length')
+        local c_wdtt=$(echo "$user_json" | jq -r '(.qwdtt_uris // []) | length')
+        local c_mieru=$(echo "$user_json" | jq -r '(.mieru_uris // []) | length')
+        local c_csqtt=$(echo "$user_json" | jq -r '(.csqtt_uris // []) | length')
+        local c_dns=$(echo "$user_json" | jq -r '(.masterdnsvpn_uris // []) | length')
+        local c_custom=$(echo "$user_json" | jq -r '(.custom_uris // []) | length')
+
+        local status_str="🟢 Активен"
+        [ "$u_en" != "true" ] && status_str="🔴 Отключен"
+
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${BOLD}          РЕДАКТИРОВАНИЕ ПОЛЬЗОВАТЕЛЯ ПОДПИСКИ TUNA                   ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  Пользователь: ${GREEN}${BOLD}${u_nick}${NC} (Статус: ${status_str} | Ревизия: ${u_rev})"
+        echo -e "${CYAN}║${NC}  ID:           ${GRAY}${uid}${NC}"
+        echo -e "${CYAN}║${NC}  Всего узлов:  ${YELLOW}${BOLD}${u_tot}${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  ${YELLOW}[1]${NC} 👤 ${BOLD}Изменить никнейм${NC} (сейчас: ${GREEN}${u_nick}${NC})"
+        echo -e "  ${YELLOW}[2]${NC} ⚡ ${BOLD}Snell v5${NC} (узлов: ${BOLD}${c_snell}${NC})"
+        echo -e "  ${YELLOW}[3]${NC} 🏎️  ${BOLD}WDTT (qwdtt)${NC} (узлов: ${BOLD}${c_wdtt}${NC})"
+        echo -e "  ${YELLOW}[4]${NC} 🌊 ${BOLD}Mieru (mita)${NC} (узлов: ${BOLD}${c_mieru}${NC})"
+        echo -e "  ${YELLOW}[5]${NC} 🛡️  ${BOLD}CSQTT${NC} (узлов: ${BOLD}${c_csqtt}${NC})"
+        echo -e "  ${YELLOW}[6]${NC} 🌐 ${BOLD}MasterDNS / StormDNS${NC} (узлов: ${BOLD}${c_dns}${NC})"
+        echo -e "  ${YELLOW}[7]${NC} 📦 ${BOLD}Дополнительные узлы (VLESS / Trojan / Shadowsocks / TUIC)${NC} (узлов: ${BOLD}${c_custom}${NC})"
+        echo -e "  ${YELLOW}[8]${NC} 🔄 ${BOLD}Пересобрать профиль из активных служб сервера${NC}"
+        echo -e "  ${YELLOW}[0]${NC} ⬅️  Завершить редактирование"
+        echo ""
+        read -p "Выберите действие [0-8]: " e_act
+        case "$e_act" in
+            1)
+                echo ""
+                read -p "Введите новый никнейм (Enter для отмены): " new_n
+                new_n=$(echo "$new_n" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                if [ -n "$new_n" ]; then
+                    local p_json=$(python3 -c "import json, sys; print(json.dumps({'nickname': sys.argv[1]}))" "$new_n")
+                    local resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$p_json" 2>/dev/null || echo "")
+                    local err_msg=$(echo "$resp" | jq -r '.error // empty' 2>/dev/null || echo "")
+                    if [ -n "$err_msg" ]; then
+                        echo -e "${RED}Ошибка: ${err_msg}${NC}"
+                    else
+                        echo -e "${GREEN}✓ Никнейм успешно изменен на: ${BOLD}${new_n}${NC}"
+                    fi
+                    sleep 1.5
+                fi
+                ;;
+            2|3|4|5|6|7)
+                local proto_field=""
+                local proto_label=""
+                local proto_ex=""
+                local cur_links=""
+                case "$e_act" in
+                    2) proto_field="snell_uri"; proto_label="Snell v5"; proto_ex="snell://psk@ip:port/?version=5#Node"; cur_links="$u_snell" ;;
+                    3) proto_field="qwdtt_uri"; proto_label="WDTT (qwdtt)"; proto_ex="qwdtt://config?name=...&peer=ip%3Aport..."; cur_links="$u_wdtt" ;;
+                    4) proto_field="mieru_uri"; proto_label="Mieru (mita)"; proto_ex="mierus://user:pass@ip/?profile=...&port=..."; cur_links="$u_mieru" ;;
+                    5) proto_field="csqtt_uri"; proto_label="CSQTT"; proto_ex="csqtt://pass@ip:port#CSQTT"; cur_links="$u_csqtt" ;;
+                    6) proto_field="masterdnsvpn_uri"; proto_label="MasterDNS / StormDNS"; proto_ex="stormdns://domain?key=...#DNS"; cur_links="$u_dns" ;;
+                    7) proto_field="custom_uri"; proto_label="Дополнительные узлы"; proto_ex="vless://... или ss://..."; cur_links="$u_custom" ;;
+                esac
+
+                echo -e "\n${BOLD}--- Текущие ссылки ${proto_label}: ---${NC}"
+                if [ -z "$cur_links" ]; then
+                    echo -e "${GRAY}(нет сохраненных ссылок)${NC}"
+                else
+                    echo -e "${CYAN}${cur_links}${NC}"
+                fi
+                echo ""
+                echo -e "  [1] ✏️  Заменить новыми ссылками"
+                echo -e "  [2] ➕ Добавить новые ссылки к существующим"
+                echo -e "  [3] 🗑️  Очистить (удалить все ссылки ${proto_label})"
+                echo -e "  [0] Отмена"
+                read -p "Выберите вариант [0-3]: " sub_opt
+                case "$sub_opt" in
+                    1)
+                        local new_u=$(collect_multi_uris "$proto_label" "$proto_ex")
+                        local p_json=$(python3 -c "import json, sys; print(json.dumps({sys.argv[1]: sys.argv[2]}))" "$proto_field" "$new_u")
+                        local resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$p_json" 2>/dev/null || echo "")
+                        local err_msg=$(echo "$resp" | jq -r '.error // empty' 2>/dev/null || echo "")
+                        if [ -n "$err_msg" ]; then
+                            echo -e "${RED}Ошибка: ${err_msg}${NC}"
+                        else
+                            echo -e "${GREEN}✓ Ссылки ${proto_label} успешно обновлены!${NC}"
+                        fi
+                        sleep 1.5
+                        ;;
+                    2)
+                        local add_u=$(collect_multi_uris "$proto_label" "$proto_ex")
+                        if [ -n "$add_u" ]; then
+                            local merged_u="$cur_links"
+                            if [ -n "$merged_u" ]; then
+                                merged_u="${merged_u}
+${add_u}"
+                            else
+                                merged_u="$add_u"
+                            fi
+                            local p_json=$(python3 -c "import json, sys; print(json.dumps({sys.argv[1]: sys.argv[2]}))" "$proto_field" "$merged_u")
+                            local resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$p_json" 2>/dev/null || echo "")
+                            local err_msg=$(echo "$resp" | jq -r '.error // empty' 2>/dev/null || echo "")
+                            if [ -n "$err_msg" ]; then
+                                echo -e "${RED}Ошибка: ${err_msg}${NC}"
+                            else
+                                echo -e "${GREEN}✓ Новые ссылки ${proto_label} добавлены к профилю!${NC}"
+                            fi
+                            sleep 1.5
+                        fi
+                        ;;
+                    3)
+                        read -p "Точно удалить все ссылки ${proto_label}? [y/N]: " conf_clr
+                        if [[ "$conf_clr" =~ ^[YyДд]$ ]]; then
+                            local p_json=$(python3 -c "import json, sys; print(json.dumps({sys.argv[1]: ''}))" "$proto_field")
+                            local resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$p_json" 2>/dev/null || echo "")
+                            echo -e "${GREEN}✓ Ссылки ${proto_label} очищены!${NC}"
+                            sleep 1.5
+                        fi
+                        ;;
+                    *) ;;
+                esac
+                ;;
+            8)
+                echo ""
+                read -p "Перезаписать профиль ссылками текущих служб сервера? [y/N]: " conf_rebuild
+                if [[ "$conf_rebuild" =~ ^[YyДд]$ ]]; then
+                    local s_payload=$(extract_current_server_links "$u_nick")
+                    local resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$s_payload" 2>/dev/null || echo "")
+                    echo -e "${GREEN}✓ Профиль синхронизирован с активными службами сервера!${NC}"
+                    sleep 2
+                fi
+                ;;
+            0) return ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
+}
+
 menu_subscriptions() {
     local SUB_API="http://127.0.0.1:22217"
 
@@ -4628,17 +4944,18 @@ menu_subscriptions() {
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${YELLOW}[1]${NC} 👥 ${BOLD}Список профилей и ссылки подписок${NC}"
-        echo -e "  ${YELLOW}[2]${NC} 🚀 ${BOLD}Создать подписку из текущих ссылок сервера${NC} (Snell, Mieru, WDTT, DNS...)"
+        echo -e "  ${YELLOW}[2]${NC} 🚀 ${BOLD}Создать подписку из текущих ссылок сервера${NC} (Snell, Mieru, WDTT, CSQTT, DNS...)"
         echo -e "  ${YELLOW}[3]${NC} ➕ ${BOLD}Создать пользователя с произвольными ссылками вручную${NC} (мульти-ноды)"
-        echo -e "  ${YELLOW}[4]${NC} 🔄 ${BOLD}Ротация токена подписки${NC} (мгновенно отзывает старую ссылку)"
-        echo -e "  ${YELLOW}[5]${NC} ✏️  ${BOLD}Включить / отключить подписку пользователя${NC}"
-        echo -e "  ${YELLOW}[6]${NC} 🗑️  ${BOLD}Удалить пользователя из сервера подписок${NC}"
-        echo -e "  ${YELLOW}[7]${NC} 🔄 ${BOLD}Перезапустить службу tuna-subscriptions${NC}"
-        echo -e "  ${YELLOW}[8]${NC} 📜 ${BOLD}Логи службы tuna-subscriptions${NC}"
-        echo -e "  ${YELLOW}[9]${NC} 📥 ${BOLD}Установить / Обновить службу tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[4]${NC} ✏️  ${BOLD}Редактировать пользователя${NC} (ссылки протоколов и никнейм)"
+        echo -e "  ${YELLOW}[5]${NC} 🗑️  ${BOLD}Удалить пользователя из сервера подписок${NC}"
+        echo -e "  ${YELLOW}[6]${NC} 🔄 ${BOLD}Ротация токена подписки${NC} (мгновенно отзывает старую ссылку)"
+        echo -e "  ${YELLOW}[7]${NC} ⚡ ${BOLD}Включить / отключить подписку пользователя${NC}"
+        echo -e "  ${YELLOW}[8]${NC} 🔄 ${BOLD}Перезапустить службу tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[9]${NC} 📜 ${BOLD}Логи службы tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[10]${NC} 📥 ${BOLD}Установить / Обновить службу tuna-subscriptions${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-9]: " sub_act
+        read -p "Выберите действие [0-10]: " sub_act
         case "$sub_act" in
             1)
                 clear
@@ -4794,52 +5111,82 @@ print(json.dumps(data))
                 read -p "Нажмите Enter..."
                 ;;
             4)
+                edit_sub_user
+                ;;
+            5)
+                clear
+                echo -e "${CYAN}=== УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ИЗ СЕРВЕРА ПОДПИСОК ===${NC}\n"
+                local del_id=$(select_sub_user)
+                if [ -n "$del_id" ]; then
+                    local u_info=$(curl -s "${SUB_API}/api/users/${del_id}" 2>/dev/null || echo "")
+                    local del_nick=$(echo "$u_info" | jq -r '.nickname // empty' 2>/dev/null || echo "$del_id")
+                    echo ""
+                    read -p "Вы действительно хотите безвозвратно удалить пользователя '${del_nick}'? [y/N]: " conf
+                    if [[ "$conf" =~ ^[YyДд]$ ]]; then
+                        local resp=$(curl -s -X DELETE "${SUB_API}/api/users/${del_id}" 2>/dev/null || echo "")
+                        echo -e "${GREEN}✓ Пользователь '${del_nick}' успешно удален!${NC}"
+                    else
+                        echo -e "${YELLOW}Удаление отменено.${NC}"
+                    fi
+                fi
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            6)
                 clear
                 echo -e "${CYAN}=== РОТАЦИЯ ТОКЕНА ПОДПИСКИ ===${NC}\n"
-                read -p "Введите ID пользователя (UUID): " rot_id
+                local rot_id=$(select_sub_user)
                 if [ -n "$rot_id" ]; then
                     local resp=$(curl -s -X POST "${SUB_API}/api/users/${rot_id}/rotate-token" 2>/dev/null || echo "")
                     local new_url=$(echo "$resp" | jq -r '.subscription_url // empty' 2>/dev/null || echo "")
                     if [ -n "$new_url" ]; then
+                        echo ""
                         echo -e "${GREEN}✓ Токен успешно обновлен! Старая ссылка более недействительна.${NC}"
-                        echo -e "Новый URL: ${CYAN}${new_url}${NC}"
-                        qrencode -t ANSI256 "$new_url" 2>/dev/null || true
+                        echo -e "Новый URL: ${CYAN}${BOLD}${new_url}${NC}"
+                        echo ""
+                        echo -e "${BOLD}Новый QR-код ссылки подписки:${NC}"
+                        qrencode -t ANSI256 "$new_url" 2>/dev/null || qrencode -t UTF8 "$new_url" 2>/dev/null || true
                     else
-                        echo -e "${RED}Ошибка:${NC} $resp"
+                        echo -e "${RED}Ошибка ротации токена:${NC} $resp"
                     fi
                 fi
                 echo ""
-                read -p "Нажмите Enter..."
-                ;;
-            5)
-                clear
-                echo -e "${CYAN}=== ВКЛЮЧЕНИЕ / ОТКЛЮЧЕНИЕ ПОДПИСКИ ===${NC}\n"
-                read -p "Введите ID пользователя: " tog_id
-                if [ -n "$tog_id" ]; then
-                    read -p "Активировать (1) или деактивировать (0)? [1/0]: " tog_val
-                    local en_bool="true"
-                    [ "$tog_val" = "0" ] && en_bool="false"
-                    local resp=$(curl -s -X PUT "${SUB_API}/api/users/${tog_id}" -H "Content-Type: application/json" -d "{\"enabled\": ${en_bool}}" 2>/dev/null || echo "")
-                    echo -e "${GREEN}✓ Статус обновлен:${NC} $resp"
-                fi
-                echo ""
-                read -p "Нажмите Enter..."
-                ;;
-            6)
-                clear
-                echo -e "${CYAN}=== УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ===${NC}\n"
-                read -p "Введите ID пользователя для удаления: " del_id
-                if [ -n "$del_id" ]; then
-                    read -p "Вы уверены, что хотите удалить ${del_id}? [y/N]: " conf
-                    if [ "$conf" = "y" ] || [ "$conf" = "Y" ]; then
-                        local resp=$(curl -s -X DELETE "${SUB_API}/api/users/${del_id}" 2>/dev/null || echo "")
-                        echo -e "${GREEN}✓ Результат:${NC} $resp"
-                    fi
-                fi
-                echo ""
-                read -p "Нажмите Enter..."
+                read -p "Нажмите Enter для возврата..."
                 ;;
             7)
+                clear
+                echo -e "${CYAN}=== ВКЛЮЧЕНИЕ / ОТКЛЮЧЕНИЕ ПОДПИСКИ ПОЛЬЗОВАТЕЛЯ ===${NC}\n"
+                local tog_id=$(select_sub_user)
+                if [ -n "$tog_id" ]; then
+                    local u_info=$(curl -s "${SUB_API}/api/users/${tog_id}" 2>/dev/null || echo "")
+                    local cur_en=$(echo "$u_info" | jq -r '.enabled // "true"')
+                    local cur_nick=$(echo "$u_info" | jq -r '.nickname // empty' 2>/dev/null || echo "$tog_id")
+
+                    echo ""
+                    if [ "$cur_en" = "true" ]; then
+                        echo -e "Текущий статус пользователя ${GREEN}${cur_nick}${NC}: ${GREEN}🟢 Активен${NC}"
+                        read -p "Отключить подписку? [y/N]: " conf_tog
+                        if [[ "$conf_tog" =~ ^[YyДд]$ ]]; then
+                            curl -s -X PUT "${SUB_API}/api/users/${tog_id}" -H "Content-Type: application/json" -d '{"enabled": false}' >/dev/null 2>&1
+                            echo -e "${YELLOW}✓ Подписка пользователя '${cur_nick}' ОТКЛЮЧЕНА (клиенты будут получать 403 Forbidden).${NC}"
+                        else
+                            echo -e "${GRAY}Действие отменено.${NC}"
+                        fi
+                    else
+                        echo -e "Текущий статус пользователя ${GREEN}${cur_nick}${NC}: ${RED}🔴 Отключен${NC}"
+                        read -p "Включить (активировать) подписку? [y/N]: " conf_tog
+                        if [[ "$conf_tog" =~ ^[YyДд]$ ]]; then
+                            curl -s -X PUT "${SUB_API}/api/users/${tog_id}" -H "Content-Type: application/json" -d '{"enabled": true}' >/dev/null 2>&1
+                            echo -e "${GREEN}✓ Подписка пользователя '${cur_nick}' ВКЛЮЧЕНА и активна.${NC}"
+                        else
+                            echo -e "${GRAY}Действие отменено.${NC}"
+                        fi
+                    fi
+                fi
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            8)
                 echo -e "${CYAN}[*] Перезапуск службы tuna-subscriptions...${NC}"
                 systemctl restart tuna-subscriptions 2>/dev/null || true
                 sleep 1
@@ -4851,10 +5198,10 @@ print(json.dumps(data))
                 fi
                 sleep 2
                 ;;
-            8)
+            9)
                 journalctl -u tuna-subscriptions -f -n 50
                 ;;
-            9)
+            10)
                 echo -e "${CYAN}[*] Запуск установки / обновления tuna-subscriptions...${NC}"
                 mkdir -p /tmp/tuna-sub-install
                 curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.py "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/tuna-subscriptions.py?v=$(date +%s)" 2>/dev/null || true
