@@ -28,8 +28,9 @@ except ImportError:
 # Конфигурация по умолчанию
 DEFAULT_CONFIG = {
     "server": {
-        "bind_address": "127.0.0.1",
+        "bind_address": "0.0.0.0",
         "port": 22217,
+        "public_host": "",
         "max_request_body_size": 65536,
     },
     "database": {
@@ -113,17 +114,27 @@ def init_database(db_path):
             masterdnsvpn_uri TEXT DEFAULT '',
             custom_uri TEXT DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
+            subscription_token TEXT DEFAULT '',
             subscription_token_hash TEXT NOT NULL,
             revision INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
     """)
-    # Миграция схемы: добавление custom_uri если таблица создана старой версией
+    # Миграция схемы: добавление колонок если таблица создана старой версией
     c.execute("PRAGMA table_info(users);")
     existing_cols = [col[1] for col in c.fetchall()]
     if "custom_uri" not in existing_cols:
         c.execute("ALTER TABLE users ADD COLUMN custom_uri TEXT DEFAULT '';")
+    if "subscription_token" not in existing_cols:
+        c.execute("ALTER TABLE users ADD COLUMN subscription_token TEXT DEFAULT '';")
+
+    # Автоматическое восстановление токенов для пользователей без токена
+    c.execute("SELECT id FROM users WHERE subscription_token IS NULL OR subscription_token = '';")
+    for missing in c.fetchall():
+        gen_tok = secrets.token_urlsafe(32)
+        gen_hash = hash_token(gen_tok)
+        c.execute("UPDATE users SET subscription_token = ?, subscription_token_hash = ? WHERE id = ?;", (gen_tok, gen_hash, missing["id"]))
 
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_users_token_hash ON users(subscription_token_hash);")
@@ -215,9 +226,21 @@ class SubscriptionApp:
         self.conn = init_database(self.db_path)
         self.bind_addr = config["server"]["bind_address"]
         self.bind_port = config["server"]["port"]
+        self.public_host = str(config["server"].get("public_host") or "").strip()
         self.max_nick_len = config["limits"]["max_nickname_length"]
         self.max_uri_len = config["limits"]["max_uri_length"]
         self.max_users = config["limits"]["max_users"]
+
+    def get_sub_url(self, raw_token: str) -> str:
+        if not raw_token:
+            return ""
+        if self.public_host:
+            host = self.public_host
+        elif self.bind_addr not in ("0.0.0.0", "", "::"):
+            host = self.bind_addr
+        else:
+            host = "127.0.0.1"
+        return f"http://{host}:{self.bind_port}/sub/{raw_token}"
 
     def create_user(self, data: dict) -> tuple[int, dict]:
         nickname = str(data.get("nickname") or "").strip()
@@ -270,16 +293,16 @@ class SubscriptionApp:
 
                 c.execute("""
                     INSERT INTO users (id, nickname, csqtt_uri, qwdtt_uri, snell_uri, mieru_uri, masterdnsvpn_uri, custom_uri,
-                                       enabled, subscription_token_hash, revision, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?);
-                """, (u_id, nickname, csqtt, qwdtt, snell, mieru, dns, custom, tok_hash, now, now))
+                                       enabled, subscription_token, subscription_token_hash, revision, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?);
+                """, (u_id, nickname, csqtt, qwdtt, snell, mieru, dns, custom, raw_token, tok_hash, now, now))
         except sqlite3.IntegrityError:
             return 409, {"error": f"User with nickname '{nickname}' already exists"}
         except Exception as e:
             return 500, {"error": "Internal database error"}
 
         total_uris = sum(len(v.splitlines()) for v in normalized_fields.values() if v)
-        sub_url = f"http://{self.bind_addr}:{self.bind_port}/sub/{raw_token}"
+        sub_url = self.get_sub_url(raw_token)
         return 201, {
             "id": u_id,
             "nickname": nickname,
@@ -305,6 +328,8 @@ class SubscriptionApp:
             custom_val = r["custom_uri"] if "custom_uri" in r.keys() else ""
             custom_list = [u for u in (custom_val or "").splitlines() if u.strip()]
             total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list)
+            raw_token = r["subscription_token"] if "subscription_token" in r.keys() and r["subscription_token"] else ""
+            sub_url = self.get_sub_url(raw_token)
 
             users.append({
                 "id": r["id"],
@@ -312,6 +337,8 @@ class SubscriptionApp:
                 "enabled": bool(r["enabled"]),
                 "revision": r["revision"],
                 "total_uris": total_uris,
+                "subscription_url": sub_url,
+                "token": raw_token,
                 "created_at": r["created_at"],
                 "updated_at": r["updated_at"],
                 "protocols": {
@@ -349,9 +376,15 @@ class SubscriptionApp:
         custom_list = [u for u in (custom_val or "").splitlines() if u.strip()]
         total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list)
 
+        raw_token = r["subscription_token"] if "subscription_token" in r.keys() and r["subscription_token"] else ""
+        sub_url = self.get_sub_url(raw_token)
+
         return 200, {
             "id": r["id"],
             "nickname": r["nickname"],
+            "subscription_url": sub_url,
+            "token": raw_token,
+            "subscription_token": raw_token,
             "csqtt": r["csqtt_uri"],
             "qwdtt": r["qwdtt_uri"],
             "snell": r["snell_uri"],
@@ -486,15 +519,16 @@ class SubscriptionApp:
         with self.conn:
             c.execute("""
                 UPDATE users
-                SET subscription_token_hash = ?, revision = ?, updated_at = ?
+                SET subscription_token = ?, subscription_token_hash = ?, revision = ?, updated_at = ?
                 WHERE id = ?;
-            """, (new_tok_hash, new_rev, now, resolved_id))
+            """, (new_raw_token, new_tok_hash, new_rev, now, resolved_id))
 
-        sub_url = f"http://{self.bind_addr}:{self.bind_port}/sub/{new_raw_token}"
+        sub_url = self.get_sub_url(new_raw_token)
         return 200, {
             "id": resolved_id,
             "subscription_url": sub_url,
             "token": new_raw_token,
+            "subscription_token": new_raw_token,
             "revision": new_rev,
             "updated_at": now
         }
@@ -681,8 +715,8 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "id": res["id"],
                 "nickname": res["nickname"],
-                "subscription_url_template": f"http://{self.app.bind_addr}:{self.app.bind_port}/sub/<token>",
-                "note": "Full token is only shown upon user creation or rotation (/api/users/<id>/rotate-token)"
+                "token": res.get("token", ""),
+                "subscription_url": res.get("subscription_url", ""),
             })
             return
 

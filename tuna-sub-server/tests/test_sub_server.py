@@ -639,6 +639,36 @@ class TunaSubscriptionTests(unittest.TestCase):
         self.assertEqual(decoded[1], "csqtt://pass2@5.6.7.8:37000#CSQTT-Frankfurt")
         self.assertEqual(decoded[2], "csqtt://pass3@9.10.11.12:37000#CSQTT-Home")
 
+    # --------------------------------------------------------------------------
+    # ТЕСТ 23: Наличие subscription_url и token в list_users и get_user
+    # --------------------------------------------------------------------------
+    def test_23_subscription_url_in_list_and_get(self):
+        nick = "sub_url_user"
+        status, _, body = self.api_request("POST", "/api/users", {
+            "nickname": nick,
+            "snell": "snell://pass@1.1.1.1:1488#Node"
+        })
+        self.assertEqual(status, 201)
+        created = json.loads(body.decode("utf-8"))
+        tok = created["token"]
+        expected_sub_url = created["subscription_url"]
+
+        # 1. Проверяем в GET /api/users
+        status_list, _, body_list = self.api_request("GET", "/api/users")
+        self.assertEqual(status_list, 200)
+        users = json.loads(body_list.decode("utf-8"))
+        target = [u for u in users if u["nickname"] == nick]
+        self.assertEqual(len(target), 1)
+        self.assertEqual(target[0]["subscription_url"], expected_sub_url)
+        self.assertEqual(target[0]["token"], tok)
+
+        # 2. Проверяем в GET /api/users/<id>
+        status_get, _, body_get = self.api_request("GET", f"/api/users/{target[0]['id']}")
+        self.assertEqual(status_get, 200)
+        u_get = json.loads(body_get.decode("utf-8"))
+        self.assertEqual(u_get["subscription_url"], expected_sub_url)
+        self.assertEqual(u_get["token"], tok)
+
 
 if __name__ == "__main__":
     unittest.main()
