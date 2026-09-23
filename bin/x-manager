@@ -4659,7 +4659,7 @@ collect_multi_uris() {
 
     local count=1
     while true; do
-        read -r -p "  [#${count}] Ссылка (или Enter для перехода): " single_u
+        read -r -p "  [#${count}] Ссылка (или Enter для перехода): " single_u < /dev/tty 2>/dev/null || read -r -p "  [#${count}] Ссылка (или Enter для перехода): " single_u
         single_u=$(echo "$single_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         if [ -z "$single_u" ]; then
             break
@@ -4667,6 +4667,24 @@ collect_multi_uris() {
         while IFS= read -r line; do
             line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -n "$line" ]; then
+                # Возможность индивидуально задать имя сервера/подключения для ссылки CSQTT
+                if [[ "$proto_title" =~ CSQTT ]] || [[ "$line" =~ ^csqtt:// ]]; then
+                    local cur_tag=""
+                    if [[ "$line" =~ \#(.*)$ ]]; then
+                        cur_tag="${BASH_REMATCH[1]}"
+                    fi
+                    local prompt_lbl="     🏷️  Имя подключения/сервера CSQTT"
+                    if [ -n "$cur_tag" ]; then
+                        prompt_lbl="${prompt_lbl} (сейчас: '${cur_tag}')"
+                    fi
+                    prompt_lbl="${prompt_lbl} [Enter - оставить]: "
+                    local node_name=""
+                    read -r -p "$prompt_lbl" node_name < /dev/tty 2>/dev/null || read -r -p "$prompt_lbl" node_name
+                    node_name=$(echo "$node_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                    if [ -n "$node_name" ]; then
+                        line="$(echo "$line" | sed 's/#.*$//')#${node_name}"
+                    fi
+                fi
                 uris_collected+=("$line")
                 local preview="${line:0:55}"
                 [ "${#line}" -gt 55 ] && preview="${preview}..."
@@ -4691,6 +4709,21 @@ ${u}"
 select_sub_user() {
     local SUB_API="http://127.0.0.1:22217"
     local raw_users=$(curl -s "${SUB_API}/api/users" 2>/dev/null || echo "")
+    if [ -z "$raw_users" ] || [ "$raw_users" = "[]" ]; then
+        if [ -f "/var/lib/tuna-subscriptions/subscriptions.db" ]; then
+            raw_users=$(python3 -c "
+import sqlite3, json
+try:
+    with sqlite3.connect('/var/lib/tuna-subscriptions/subscriptions.db') as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('SELECT id, nickname, enabled FROM users').fetchall()
+        print(json.dumps([{'id': r['id'], 'nickname': r['nickname'], 'enabled': bool(r['enabled']), 'total_uris': 0} for r in rows]))
+except Exception:
+    print('[]')
+" 2>/dev/null || echo "[]")
+        fi
+    fi
+
     if [ -z "$raw_users" ] || [ "$raw_users" = "[]" ]; then
         echo -e "${YELLOW}Пользователи еще не созданы или служба tuna-subscriptions не запущена.${NC}" >&2
         return 1
@@ -4739,7 +4772,7 @@ except Exception:
     echo "" >&2
 
     echo -ne "  ${BOLD}Выберите номер [1-${total}] или введите никнейм/ID: ${NC}" >&2
-    read -r user_choice
+    read -r user_choice < /dev/tty 2>/dev/null || read -r user_choice
     user_choice=$(echo "$user_choice" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
     if [ -z "$user_choice" ] || [ "$user_choice" = "0" ]; then
@@ -4748,22 +4781,136 @@ except Exception:
 
     if [[ "$user_choice" =~ ^[0-9]+$ ]] && [ "$user_choice" -ge 1 ] && [ "$user_choice" -le "$total" ]; then
         local chosen_line="${lines[$((user_choice - 1))]}"
-        local chosen_id=$(echo "$chosen_line" | cut -f2)
+        local chosen_id=$(echo "$chosen_line" | cut -f2 | tr -d ' \r\n')
         echo "$chosen_id"
         return 0
     fi
 
     for item in "${lines[@]}"; do
-        local uid=$(echo "$item" | cut -f2)
-        local nick=$(echo "$item" | cut -f3)
+        local uid=$(echo "$item" | cut -f2 | tr -d ' \r\n')
+        local nick=$(echo "$item" | cut -f3 | tr -d ' \r\n')
         if [ "$user_choice" = "$nick" ] || [ "$user_choice" = "$uid" ]; then
             echo "$uid"
             return 0
         fi
     done
 
-    echo "$user_choice"
+    # Дополнительная проверка напрямую в базе данных SQLite
+    if [ -f "/var/lib/tuna-subscriptions/subscriptions.db" ]; then
+        local direct_id=$(python3 -c "
+import sqlite3, sys
+db = '/var/lib/tuna-subscriptions/subscriptions.db'
+q = sys.argv[1].strip()
+try:
+    with sqlite3.connect(db) as conn:
+        row = conn.execute('SELECT id FROM users WHERE id = ? OR nickname = ?', (q, q)).fetchone()
+        if row:
+            print(row[0])
+except Exception:
+    pass
+" "$user_choice" 2>/dev/null || true)
+        if [ -n "$direct_id" ]; then
+            echo "$direct_id" | tr -d ' \r\n'
+            return 0
+        fi
+    fi
+
+    echo "$user_choice" | tr -d ' \r\n'
     return 0
+}
+
+delete_sub_user_safe() {
+    local SUB_API="http://127.0.0.1:22217"
+    local target="$1"
+    if [ -z "$target" ]; then
+        target=$(select_sub_user)
+        [ -z "$target" ] && return 1
+    fi
+
+    local u_id=""
+    local u_nick=""
+
+    # 1. Попытка получить информацию через API
+    local u_info=$(curl -s "${SUB_API}/api/users/${target}" 2>/dev/null || echo "")
+    u_id=$(echo "$u_info" | jq -r '.id // empty' 2>/dev/null || echo "")
+    u_nick=$(echo "$u_info" | jq -r '.nickname // empty' 2>/dev/null || echo "")
+
+    # 2. Если API не ответил, получаем напрямую из SQLite базы данных
+    local db_file="/var/lib/tuna-subscriptions/subscriptions.db"
+    if [ -z "$u_id" ] && [ -f "$db_file" ]; then
+        local db_lookup
+        db_lookup=$(python3 -c "
+import sqlite3, sys
+db = sys.argv[1]
+t = sys.argv[2]
+try:
+    with sqlite3.connect(db) as conn:
+        r = conn.execute('SELECT id, nickname FROM users WHERE id = ? OR nickname = ?', (t, t)).fetchone()
+        if r:
+            print(f'{r[0]}\t{r[1]}')
+except Exception:
+    pass
+" "$db_file" "$target" 2>/dev/null || echo "")
+        if [ -n "$db_lookup" ]; then
+            u_id=$(echo "$db_lookup" | cut -f1 | tr -d ' \r\n')
+            u_nick=$(echo "$db_lookup" | cut -f2 | tr -d ' \r\n')
+        fi
+    fi
+
+    [ -z "$u_id" ] && u_id="$target"
+    [ -z "$u_nick" ] && u_nick="$target"
+
+    echo ""
+    echo -e "  Вы действительно хотите ${RED}${BOLD}безвозвратно удалить${NC} пользователя '${BOLD}${u_nick}${NC}' (ID: ${CYAN}${u_id}${NC})?"
+    local conf=""
+    read -p "  Подтвердите удаление [y/N]: " conf < /dev/tty 2>/dev/null || read -p "  Подтвердите удаление [y/N]: " conf
+    if [[ ! "$conf" =~ ^[YyДд]$ ]]; then
+        echo -e "  ${YELLOW}Удаление отменено пользователем.${NC}"
+        return 2
+    fi
+
+    echo -e "  ${GRAY}Выполняется удаление пользователя '${u_nick}'...${NC}"
+    local deleted=false
+
+    # 1. Запрос удаления через REST API
+    local http_code
+    http_code=$(curl -s -o /tmp/tuna_sub_del.json -w "%{http_code}" -X DELETE "${SUB_API}/api/users/${u_id}" 2>/dev/null || echo "000")
+    if [ "$http_code" = "200" ]; then
+        deleted=true
+    fi
+
+    # 2. Прямое удаление из SQLite базы данных (гарантированный fallback)
+    if [ -f "$db_file" ]; then
+        local db_del
+        db_del=$(python3 -c "
+import sqlite3, sys
+db = sys.argv[1]
+uid = sys.argv[2]
+nick = sys.argv[3]
+try:
+    with sqlite3.connect(db) as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM users WHERE id = ? OR nickname = ? OR id = ? OR nickname = ?', (uid, uid, nick, nick))
+        conn.commit()
+        if c.rowcount > 0:
+            print('DELETED')
+        else:
+            print('NO_ROWS')
+except Exception as e:
+    print('ERR:' + str(e))
+" "$db_file" "$u_id" "$u_nick" 2>/dev/null || echo "")
+        if [ "$db_del" = "DELETED" ]; then
+            deleted=true
+        fi
+    fi
+
+    if [ "$deleted" = true ]; then
+        echo -e "  ${GREEN}${BOLD}✓ Пользователь '${u_nick}' успешно и безвозвратно удален!${NC}"
+        return 0
+    else
+        echo -e "  ${RED}${BOLD}✗ Ошибка: не удалось удалить пользователя '${u_nick}' (HTTP ${http_code}).${NC}"
+        return 1
+    fi
 }
 
 edit_sub_user() {
@@ -4822,9 +4969,10 @@ edit_sub_user() {
         echo -e "  ${YELLOW}[6]${NC} 🌐 ${BOLD}MasterDNS / StormDNS${NC} (узлов: ${BOLD}${c_dns}${NC})"
         echo -e "  ${YELLOW}[7]${NC} 📦 ${BOLD}Дополнительные узлы (VLESS / Trojan / Shadowsocks / TUIC)${NC} (узлов: ${BOLD}${c_custom}${NC})"
         echo -e "  ${YELLOW}[8]${NC} 🔄 ${BOLD}Пересобрать профиль из активных служб сервера${NC}"
+        echo -e "  ${RED}[9]${NC} 🗑️  ${BOLD}Удалить этого пользователя безвозвратно${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Завершить редактирование"
         echo ""
-        read -p "Выберите действие [0-8]: " e_act
+        read -p "Выберите действие [0-9]: " e_act
         case "$e_act" in
             1)
                 echo ""
@@ -4866,8 +5014,11 @@ edit_sub_user() {
                 echo -e "  [1] ✏️  Заменить новыми ссылками"
                 echo -e "  [2] ➕ Добавить новые ссылки к существующим"
                 echo -e "  [3] 🗑️  Очистить (удалить все ссылки ${proto_label})"
+                if [ "$proto_field" = "csqtt_uri" ] && [ -n "$cur_links" ]; then
+                    echo -e "  ${YELLOW}[4]${NC} 🏷️  ${BOLD}Изменить имя подключения/сервера для сохраненных ссылок CSQTT${NC}"
+                fi
                 echo -e "  [0] Отмена"
-                read -p "Выберите вариант [0-3]: " sub_opt
+                read -p "Выберите вариант: " sub_opt
                 case "$sub_opt" in
                     1)
                         local new_u=$(collect_multi_uris "$proto_label" "$proto_ex")
@@ -4911,6 +5062,45 @@ ${add_u}"
                             sleep 1.5
                         fi
                         ;;
+                    4)
+                        if [ "$proto_field" = "csqtt_uri" ] && [ -n "$cur_links" ]; then
+                            local updated_lines=()
+                            local idx=1
+                            while IFS= read -r c_link; do
+                                c_link=$(echo "$c_link" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                                [ -z "$c_link" ] && continue
+                                local cur_tag=""
+                                if [[ "$c_link" =~ \#(.*)$ ]]; then
+                                    cur_tag="${BASH_REMATCH[1]}"
+                                fi
+                                echo ""
+                                echo -e "  Узел #${idx}: ${CYAN}${c_link}${NC}"
+                                local new_t=""
+                                read -p "  Новое имя сервера для узла #${idx} (сейчас: '${cur_tag}') [Enter - без изменений]: " new_t < /dev/tty 2>/dev/null || read -p "  Новое имя сервера для узла #${idx} (сейчас: '${cur_tag}') [Enter - без изменений]: " new_t
+                                new_t=$(echo "$new_t" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                                if [ -n "$new_t" ]; then
+                                    c_link="$(echo "$c_link" | sed 's/#.*$//')#${new_t}"
+                                    echo -e "  ${GREEN}✓ Обновлено:${NC} ${c_link}"
+                                fi
+                                updated_lines+=("$c_link")
+                                idx=$((idx + 1))
+                            done <<< "$cur_links"
+
+                            local new_csqtt_val=""
+                            for ul in "${updated_lines[@]}"; do
+                                if [ -z "$new_csqtt_val" ]; then
+                                    new_csqtt_val="$ul"
+                                else
+                                    new_csqtt_val="${new_csqtt_val}
+${ul}"
+                                fi
+                            done
+                            local p_json=$(python3 -c "import json, sys; print(json.dumps({'csqtt_uri': sys.argv[1]}))" "$new_csqtt_val")
+                            local resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$p_json" 2>/dev/null || echo "")
+                            echo -e "${GREEN}✓ Имена серверов CSQTT успешно обновлены!${NC}"
+                            sleep 1.5
+                        fi
+                        ;;
                     *) ;;
                 esac
                 ;;
@@ -4924,14 +5114,44 @@ ${add_u}"
                     sleep 2
                 fi
                 ;;
+            9)
+                delete_sub_user_safe "$uid"
+                local ret=$?
+                if [ $ret -eq 0 ]; then
+                    sleep 1.5
+                    return
+                fi
+                sleep 1.5
+                ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac
     done
 }
 
+sync_tuna_sub_daemon() {
+    local daemon_src=""
+    local cur_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    if [ -f "${cur_script_dir}/../tuna-sub-server/tuna-subscriptions.py" ]; then
+        daemon_src="${cur_script_dir}/../tuna-sub-server/tuna-subscriptions.py"
+    elif [ -f "${cur_script_dir}/tuna-sub-server/tuna-subscriptions.py" ]; then
+        daemon_src="${cur_script_dir}/tuna-sub-server/tuna-subscriptions.py"
+    elif [ -f "/root/x-manager/tuna-sub-server/tuna-subscriptions.py" ]; then
+        daemon_src="/root/x-manager/tuna-sub-server/tuna-subscriptions.py"
+    fi
+
+    if [ -n "$daemon_src" ] && [ -f "$daemon_src" ] && [ -f "/usr/local/bin/tuna-subscriptions" ]; then
+        if ! cmp -s "$daemon_src" "/usr/local/bin/tuna-subscriptions" 2>/dev/null; then
+            cp -f "$daemon_src" /usr/local/bin/tuna-subscriptions
+            chmod 0755 /usr/local/bin/tuna-subscriptions
+            systemctl restart tuna-subscriptions 2>/dev/null || true
+        fi
+    fi
+}
+
 menu_subscriptions() {
     local SUB_API="http://127.0.0.1:22217"
+    sync_tuna_sub_daemon
 
     while true; do
         clear
@@ -5116,21 +5336,9 @@ print(json.dumps(data))
             5)
                 clear
                 echo -e "${CYAN}=== УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ИЗ СЕРВЕРА ПОДПИСОК ===${NC}\n"
-                local del_id=$(select_sub_user)
-                if [ -n "$del_id" ]; then
-                    local u_info=$(curl -s "${SUB_API}/api/users/${del_id}" 2>/dev/null || echo "")
-                    local del_nick=$(echo "$u_info" | jq -r '.nickname // empty' 2>/dev/null || echo "$del_id")
-                    echo ""
-                    read -p "Вы действительно хотите безвозвратно удалить пользователя '${del_nick}'? [y/N]: " conf
-                    if [[ "$conf" =~ ^[YyДд]$ ]]; then
-                        local resp=$(curl -s -X DELETE "${SUB_API}/api/users/${del_id}" 2>/dev/null || echo "")
-                        echo -e "${GREEN}✓ Пользователь '${del_nick}' успешно удален!${NC}"
-                    else
-                        echo -e "${YELLOW}Удаление отменено.${NC}"
-                    fi
-                fi
+                delete_sub_user_safe
                 echo ""
-                read -p "Нажмите Enter для возврата..."
+                read -p "Нажмите Enter для возврата..." < /dev/tty 2>/dev/null || read -p "Нажмите Enter для возврата..."
                 ;;
             6)
                 clear

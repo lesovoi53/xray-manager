@@ -459,12 +459,16 @@ class SubscriptionApp:
         }
 
     def delete_user(self, user_id: str) -> tuple[int, dict]:
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return 400, {"error": "User ID or nickname cannot be empty"}
         with self.conn:
             c = self.conn.cursor()
             c.execute("DELETE FROM users WHERE id = ? OR nickname = ?;", (user_id, user_id))
+            self.conn.commit()
             if c.rowcount == 0:
                 return 404, {"error": "User not found"}
-        return 200, {"success": True, "message": "User deleted successfully"}
+        return 200, {"success": True, "message": f"User '{user_id}' deleted successfully"}
 
     def rotate_token(self, user_id: str) -> tuple[int, dict]:
         c = self.conn.cursor()
@@ -740,7 +744,7 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         # DELETE /api/users/<id_or_nickname>
         m_user = re.match(r"^/api/users/([^/]+)$", path)
         if m_user:
-            user_id = unquote(m_user.group(1))
+            user_id = unquote(m_user.group(1)).strip()
             status, res = self.app.delete_user(user_id)
             self.send_json(status, res)
             return

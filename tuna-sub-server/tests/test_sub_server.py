@@ -587,6 +587,58 @@ class TunaSubscriptionTests(unittest.TestCase):
         chk_status, _, _ = self.api_request("GET", f"/api/users/{nick}")
         self.assertEqual(chk_status, 404)
 
+    # --------------------------------------------------------------------------
+    # ТЕСТ 21: Удаление пользователя с кириллическим никнеймом (например: тесовой3)
+    # --------------------------------------------------------------------------
+    def test_21_cyrillic_user_delete(self):
+        nick = "тесовой_делете_тест"
+        encoded_nick = urllib.parse.quote(nick)
+        status, _, body = self.api_request("POST", "/api/users", {
+            "nickname": nick,
+            "snell": "snell://init@1.1.1.1:1488#Node"
+        })
+        self.assertEqual(status, 201)
+
+        # GET по закодированному никнейму
+        g_status, _, g_body = self.api_request("GET", f"/api/users/{encoded_nick}")
+        self.assertEqual(g_status, 200)
+
+        # DELETE по закодированному никнейму
+        d_status, _, d_body = self.api_request("DELETE", f"/api/users/{encoded_nick}")
+        self.assertEqual(d_status, 200)
+
+        # Проверка, что пользователя больше нет
+        chk_status, _, _ = self.api_request("GET", f"/api/users/{encoded_nick}")
+        self.assertEqual(chk_status, 404)
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 22: Сохранение индивидуальных имен серверов CSQTT в подписке
+    # --------------------------------------------------------------------------
+    def test_22_csqtt_server_names_preservation(self):
+        nick = "csqtt_named_user"
+        csqtt_nodes = [
+            "csqtt://pass1@1.2.3.4:37000#CSQTT-SPB",
+            "csqtt://pass2@5.6.7.8:37000#CSQTT-Frankfurt",
+            "csqtt://pass3@9.10.11.12:37000#CSQTT-Home"
+        ]
+        status, _, body = self.api_request("POST", "/api/users", {
+            "nickname": nick,
+            "csqtt_uris": csqtt_nodes
+        })
+        self.assertEqual(status, 201)
+        resp = json.loads(body.decode("utf-8"))
+        token = resp["token"]
+
+        # Получаем подписку
+        sub_status, _, sub_body = self.api_request("GET", f"/sub/{token}")
+        self.assertEqual(sub_status, 200)
+        decoded = base64.b64decode(sub_body).decode("utf-8").strip().splitlines()
+
+        self.assertEqual(len(decoded), 3)
+        self.assertEqual(decoded[0], "csqtt://pass1@1.2.3.4:37000#CSQTT-SPB")
+        self.assertEqual(decoded[1], "csqtt://pass2@5.6.7.8:37000#CSQTT-Frankfurt")
+        self.assertEqual(decoded[2], "csqtt://pass3@9.10.11.12:37000#CSQTT-Home")
+
 
 if __name__ == "__main__":
     unittest.main()
