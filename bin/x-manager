@@ -3526,7 +3526,15 @@ view_global_status() {
     else
         printf "  %-22s %-25b\n" "DNS-Туннель:" "$(get_dns_status)"
     fi
-    printf "  %-22s %s\n" "Xray Core (3X-UI):" "$(systemctl is-active x-ui 2>/dev/null || echo 'inactive')"
+    local xray_st="inactive"
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        xray_st="${GREEN}active (xray.service)${NC}"
+    elif pgrep -x xray >/dev/null 2>&1; then
+        xray_st="${GREEN}active (process: xray)${NC}"
+    elif systemctl is-active --quiet x-ui 2>/dev/null; then
+        xray_st="${GREEN}active${NC}"
+    fi
+    printf "  %-22s %b\n" "Xray Core:" "$xray_st"
     echo ""
     echo -e "${BOLD}--- Системные оптимизации и безопасность ---${NC}"
     printf "  %-22s %-25b\n" "Системный DNS:" "$(get_sys_dns_short)"

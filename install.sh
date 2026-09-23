@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # X-MANAGER: Универсальный инсталлятор шлюзов и прокси-служб
-# Поддерживает: Snell v5 (Hybrid TCP+UDP/QUIC), Mieru (mita), WDTT (qwdtt) + 3X-UI
+# Поддерживает: Snell v5 (Hybrid TCP+UDP/QUIC), Mieru (mita), WDTT (qwdtt) + Xray-core
 # Репозиторий: https://github.com/534188-create/x-manager
 # ==============================================================================
 
@@ -36,7 +36,7 @@ fi
 clear
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║${BOLD}          X-MANAGER: УНИВЕРСАЛЬНЫЙ СЕТЕВОЙ ИНСТАЛЛЯТОР         ${CYAN}║${NC}"
-echo -e "${CYAN}║${NC}     Snell v5 (Hybrid) | Mieru Anti-TSPU | WDTT (qwdtt) | 3X-UI      ${CYAN}║${NC}"
+echo -e "${CYAN}║${NC}     Snell v5 (Hybrid) | Mieru Anti-TSPU | WDTT (qwdtt) | Xray-core  ${CYAN}║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -310,22 +310,22 @@ EOF
                 echo -e "  ${GREEN}✓ REDIRECT шлюз:${NC} :${XRAY_REDIRECT_PORT} (REDIRECT Gateway)"
                 ;;
             UPDATED_INBOUNDS_MIXED=*)
-                echo -e "  ${GREEN}✓ Mixed Gateway (:10808) синхронизирован в панели (mixed, UDP вкл, NoAuth)${NC}"
+                echo -e "  ${GREEN}✓ Mixed Gateway (:10808) синхронизирован для Xray (mixed, UDP вкл, NoAuth)${NC}"
                 ;;
             INSERTED_INBOUNDS_MIXED=*)
-                echo -e "  ${GREEN}✓ Mixed Gateway (:10808) добавлен в таблицу inbounds панели (mixed)${NC}"
+                echo -e "  ${GREEN}✓ Mixed Gateway (:10808) добавлен в шлюзы Xray (mixed)${NC}"
                 ;;
             UPDATED_INBOUNDS_TPROXY=*)
-                echo -e "  ${GREEN}✓ TPROXY Gateway (:12345) синхронизирован в таблице inbounds панели${NC}"
+                echo -e "  ${GREEN}✓ TPROXY Gateway (:12345) синхронизирован в шлюзах Xray${NC}"
                 ;;
             INSERTED_INBOUNDS_TPROXY=*)
-                echo -e "  ${GREEN}✓ TPROXY Gateway (:12345) добавлен в таблицу inbounds панели${NC}"
+                echo -e "  ${GREEN}✓ TPROXY Gateway (:12345) добавлен в шлюзы Xray${NC}"
                 ;;
             UPDATED_INBOUNDS_REDIRECT=*)
-                echo -e "  ${GREEN}✓ REDIRECT Gateway (:12346) синхронизирован в таблице inbounds панели${NC}"
+                echo -e "  ${GREEN}✓ REDIRECT Gateway (:12346) синхронизирован в шлюзах Xray${NC}"
                 ;;
             INSERTED_INBOUNDS_REDIRECT=*)
-                echo -e "  ${GREEN}✓ REDIRECT Gateway (:12346) добавлен в таблицу inbounds панели${NC}"
+                echo -e "  ${GREEN}✓ REDIRECT Gateway (:12346) добавлен в шлюзах Xray${NC}"
                 ;;
             REMOVED_GATEWAYS_FROM_TEMPLATE=1)
                 echo -e "  ${GREEN}✓ Дубликаты шлюзов удалены из шаблона ядра (предотвращение конфликта портов)${NC}"
@@ -344,7 +344,7 @@ EOF
         esac
     done
 else
-    echo -e "${YELLOW}  ! 3X-UI не обнаружен (/etc/x-ui/x-ui.db не найден). Используем стандартные порты.${NC}"
+    echo -e "${YELLOW}  ! Локальная база Xray не обнаружена. Используем стандартные порты шлюзов ядра.${NC}"
 fi
 
 # Сохраняем переменные окружения шлюзов
