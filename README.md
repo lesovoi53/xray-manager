@@ -127,7 +127,7 @@ X-Manager организует взаимодействие всех прокс�
 ### Вариант 1: Быстрый старт (Автоматическая установка «под ключ»)
 Автоматическая установка со всеми оптимальными настройками по умолчанию, автоподхватом шлюзов Xray и оптимизацией ядра:
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/534188-create/x-manager/main/install.sh) --quick
+bash <(curl -fsSL https://raw.githubusercontent.com/lesovoi53/xray-manager/main/install.sh) --quick
 ```
 
 ---
@@ -135,7 +135,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/534188-create/x-manager/main
 ### Вариант 2: Интерактивная установка
 Позволяет вручную выбрать компоненты, настроить кастомные порты, пароли и параметры:
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/534188-create/x-manager/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/lesovoi53/xray-manager/main/install.sh)
 ```
 
 ---

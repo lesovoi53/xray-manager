@@ -2,7 +2,7 @@
 # ==============================================================================
 # X-MANAGER: Универсальный инсталлятор шлюзов и прокси-служб
 # Поддерживает: Snell v5 (Hybrid TCP+UDP/QUIC), Mieru (mita), WDTT (qwdtt) + Xray-core
-# Репозиторий: https://github.com/534188-create/x-manager
+# Репозиторий: https://github.com/lesovoi53/xray-manager
 # ==============================================================================
 
 set -e
@@ -779,7 +779,7 @@ if [ -f "$SCRIPT_DIR/bin/x-manager" ]; then
     cp -f "$SCRIPT_DIR/bin/x-manager" /usr/local/bin/x-manager
 else
     echo -e "  -> Загрузка диспетчера x-manager с GitHub..."
-    curl -fL --progress-bar -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/534188-create/x-manager/main/bin/x-manager?v=$(date +%s)" || curl -fsSL -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/534188-create/x-manager/main/bin/x-manager?v=$(date +%s)" 2>/dev/null || true
+    curl -fL --progress-bar -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/bin/x-manager?v=$(date +%s)" || curl -fsSL -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/bin/x-manager?v=$(date +%s)" 2>/dev/null || true
 fi
 chmod +x /usr/local/bin/x-manager
 
@@ -806,10 +806,10 @@ if [ -f "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" ]; then
 else
     echo -e "  -> Загрузка компонентов сервера подписок с GitHub..."
     mkdir -p /tmp/tuna-sub-install
-    curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.py "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/tuna-subscriptions.py?v=$(date +%s)" 2>/dev/null || true
-    curl -fsSL -o /tmp/tuna-sub-install/config.toml.example "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/config.toml.example?v=$(date +%s)" 2>/dev/null || true
-    curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.service "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/tuna-subscriptions.service?v=$(date +%s)" 2>/dev/null || true
-    curl -fsSL -o /tmp/tuna-sub-install/install-sub-server.sh "https://raw.githubusercontent.com/534188-create/x-manager/main/tuna-sub-server/install-sub-server.sh?v=$(date +%s)" 2>/dev/null || true
+    curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.py "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/tuna-subscriptions.py?v=$(date +%s)" 2>/dev/null || true
+    curl -fsSL -o /tmp/tuna-sub-install/config.toml.example "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/config.toml.example?v=$(date +%s)" 2>/dev/null || true
+    curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.service "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/tuna-subscriptions.service?v=$(date +%s)" 2>/dev/null || true
+    curl -fsSL -o /tmp/tuna-sub-install/install-sub-server.sh "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/install-sub-server.sh?v=$(date +%s)" 2>/dev/null || true
     if [ -f /tmp/tuna-sub-install/install-sub-server.sh ]; then
         bash /tmp/tuna-sub-install/install-sub-server.sh || true
     fi
