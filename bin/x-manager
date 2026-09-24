@@ -5474,7 +5474,7 @@ edit_user_openflux_sub() {
         local b_mode=$(echo "$cfg_json" | jq -r '.mode // "classic"')
         local b_bal=$(echo "$cfg_json" | jq -r '.balancer_strategy // "roundRobin"')
         local b_rev=$(echo "$cfg_json" | jq -r '.revision // 1')
-        local sel_ids_len=$(echo "$cfg_json" | jq -r '(.selected_group_ids // []) | length')
+        local sel_ids_len=$(echo "$cfg_json" | jq -r '(.group_ids // .groups // []) | length')
 
         local status_str="🟢 Включен (публикуется в подписке)"
         [ "$u_en" != "true" ] && status_str="🔴 Отключен"
