@@ -35,6 +35,9 @@ if [ -f "$CONFIG_FILE" ]; then
 
     u_val=$(grep -oP '^WEBDAV_URL=\K.*' "$CONFIG_FILE" | tr -d '"' | tr -d "'" | head -n 1 || true)
     [ -n "$u_val" ] && WEBDAV_URL="$u_val"
+
+    cu_val=$(grep -oP '^MULTI_CUSTOM_URL=\K.*' "$CONFIG_FILE" | tr -d '"' | tr -d "'" | head -n 1 || true)
+    [ -n "$cu_val" ] && MULTI_CUSTOM_URL="$cu_val"
 fi
 
 WDAV_UID=$(id -u "$WDAV_USER" 2>/dev/null || echo "")
@@ -86,15 +89,16 @@ add_rules() {
     iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 217.69.139.0/24 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 128.140.168.0/21 -j RETURN 2>/dev/null || true
 
-    # Разрешение доменного имени внешнего WebDAV URL при наличии
-    if [ -n "${WEBDAV_URL:-}" ]; then
-        wdav_host=$(echo "$WEBDAV_URL" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:.*$||')
+    # Разрешение доменных имён внешних WebDAV URL при наличии
+    for custom_u in "${WEBDAV_URL:-}" "${MULTI_CUSTOM_URL:-}"; do
+        [ -z "$custom_u" ] && continue
+        wdav_host=$(echo "$custom_u" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:.*$||')
         if [ -n "$wdav_host" ]; then
             for ip in $(getent ahosts "$wdav_host" 2>/dev/null | awk '{print $1}' | sort -u); do
                 [ -n "$ip" ] && iptables -w 5 -t nat -A "$CHAIN" -d "$ip/32" -j RETURN 2>/dev/null || true
             done
         fi
-    fi
+    done
 
     # Перенаправление в Xray
     iptables -w 5 -t nat -A "$CHAIN" -p tcp -j REDIRECT --to-ports "$XRAY_REDIRECT_PORT"

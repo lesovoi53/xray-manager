@@ -5878,7 +5878,9 @@ get_wdavtunnel_routing() {
 get_wdavtunnel_mode() {
     local mode
     mode=$(get_wdavtunnel_prop "WEBDAV_MODE" "selfhosted")
-    if [ "$mode" = "server" ] || [ "$mode" = "external" ]; then
+    if [ "$mode" = "multi" ]; then
+        echo "multi"
+    elif [ "$mode" = "server" ] || [ "$mode" = "external" ]; then
         echo "server"
     else
         echo "selfhosted"
@@ -5890,15 +5892,238 @@ get_wdavtunnel_listen_port() {
     echo "$listen" | grep -oP ':\K[0-9]+$' || echo "8443"
 }
 
+get_wdavtunnel_provider_label() {
+    local mode
+    mode=$(get_wdavtunnel_mode)
+    if [ "$mode" = "multi" ]; then
+        local count=0
+        local parts=()
+        if [ "$(get_wdavtunnel_prop "MULTI_LOCAL_ENABLED" "true")" = "true" ]; then
+            count=$((count+1))
+            parts+=("VPS :$(get_wdavtunnel_listen_port)")
+        fi
+        if [ "$(get_wdavtunnel_prop "MULTI_MAILRU_ENABLED" "true")" = "true" ]; then
+            count=$((count+1))
+            parts+=("Mail.ru")
+        fi
+        if [ "$(get_wdavtunnel_prop "MULTI_YANDEX_ENABLED" "false")" = "true" ]; then
+            count=$((count+1))
+            parts+=("Яндекс")
+        fi
+        if [ "$(get_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "false")" = "true" ]; then
+            count=$((count+1))
+            parts+=("Кастом")
+        fi
+        local joined
+        joined=$(IFS=" + "; echo "${parts[*]}")
+        echo -e "${PURPLE}🔀 Мульти-бекенд [${count}] (${joined:-пусто})${NC}"
+        return
+    fi
+    if [ "$mode" != "server" ]; then
+        echo -e "${CYAN}Встроенный сервер (Selfhosted :$(get_wdavtunnel_listen_port))${NC}"
+        return
+    fi
+    local url
+    url=$(get_wdavtunnel_prop "WEBDAV_URL" "")
+    if [[ "$url" =~ mail\.ru ]]; then
+        echo -e "${BLUE}Облако Mail.ru (webdav.cloud.mail.ru)${NC}"
+    elif [[ "$url" =~ yandex ]]; then
+        echo -e "${YELLOW}Яндекс.Диск (webdav.yandex.ru)${NC}"
+    else
+        echo -e "${GREEN}Внешний WebDAV ($url)${NC}"
+    fi
+}
+
+generate_wdavtunnel_yaml() {
+    local srv_ip
+    srv_ip=$(get_server_ip)
+    local l_port
+    l_port=$(get_wdavtunnel_listen_port)
+    local l_login
+    l_login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "wdav")
+    local l_pass
+    l_pass=$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "")
+    local enc
+    enc=$(get_wdavtunnel_prop "WEBDAV_ENC" "false")
+
+    local loc_en
+    loc_en=$(get_wdavtunnel_prop "MULTI_LOCAL_ENABLED" "true")
+    local mail_en
+    mail_en=$(get_wdavtunnel_prop "MULTI_MAILRU_ENABLED" "true")
+    local mail_login
+    mail_login=$(get_wdavtunnel_prop "MULTI_MAILRU_LOGIN" "")
+    local mail_pass
+    mail_pass=$(get_wdavtunnel_prop "MULTI_MAILRU_PASSWORD" "")
+
+    local yan_en
+    yan_en=$(get_wdavtunnel_prop "MULTI_YANDEX_ENABLED" "false")
+    local yan_login
+    yan_login=$(get_wdavtunnel_prop "MULTI_YANDEX_LOGIN" "")
+    local yan_pass
+    yan_pass=$(get_wdavtunnel_prop "MULTI_YANDEX_PASSWORD" "")
+
+    local cust_en
+    cust_en=$(get_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "false")
+    local cust_url
+    cust_url=$(get_wdavtunnel_prop "MULTI_CUSTOM_URL" "")
+    local cust_login
+    cust_login=$(get_wdavtunnel_prop "MULTI_CUSTOM_LOGIN" "")
+    local cust_pass
+    cust_pass=$(get_wdavtunnel_prop "MULTI_CUSTOM_PASSWORD" "")
+
+    mkdir -p "$WDAVTUNNEL_DIR" 2>/dev/null || true
+    local yaml_file="$WDAVTUNNEL_DIR/webdav-tunnel.yaml"
+
+    cat > "$yaml_file" <<EOF_YML
+mode: server
+timeout: 60s
+tuning:
+  chunk-size: 131071
+  coalesce: 10ms
+  poll-max: 500ms
+  poll-min: 200ms
+  puts: 8
+  read-max: 8
+  read-min: 3
+backends:
+EOF_YML
+
+    if [ "$loc_en" = "true" ] && [ -n "$l_pass" ]; then
+        cat >> "$yaml_file" <<EOF_YML
+  - url: http://${srv_ip}:${l_port}
+    login: ${l_login}
+    password: ${l_pass}
+EOF_YML
+    fi
+
+    if [ "$mail_en" = "true" ] && [ -n "$mail_login" ] && [ -n "$mail_pass" ]; then
+        cat >> "$yaml_file" <<EOF_YML
+  - url: https://webdav.cloud.mail.ru
+    login: ${mail_login}
+    password: ${mail_pass}
+EOF_YML
+    fi
+
+    if [ "$yan_en" = "true" ] && [ -n "$yan_login" ] && [ -n "$yan_pass" ]; then
+        cat >> "$yaml_file" <<EOF_YML
+  - url: https://webdav.yandex.ru
+    login: ${yan_login}
+    password: ${yan_pass}
+EOF_YML
+    fi
+
+    if [ "$cust_en" = "true" ] && [ -n "$cust_url" ] && [ -n "$cust_login" ] && [ -n "$cust_pass" ]; then
+        cat >> "$yaml_file" <<EOF_YML
+  - url: ${cust_url}
+    login: ${cust_login}
+    password: ${cust_pass}
+EOF_YML
+    fi
+
+    if [ "$enc" = "true" ] || [ "$enc" = "1" ]; then
+        echo "enc: true" >> "$yaml_file"
+    fi
+
+    chmod 660 "$yaml_file" 2>/dev/null || true
+    chown "$WDAVTUNNEL_USER:$WDAVTUNNEL_USER" "$yaml_file" 2>/dev/null || true
+    chown -R "$WDAVTUNNEL_USER:$WDAVTUNNEL_USER" "$WDAVTUNNEL_DIR" 2>/dev/null || true
+    chmod 770 "$WDAVTUNNEL_DIR" 2>/dev/null || true
+}
+
 get_wdavtunnel_client_uri() {
     local mode
     mode=$(get_wdavtunnel_mode)
+    local enc
+    enc=$(get_wdavtunnel_prop "WEBDAV_ENC" "false")
+
+    if [ "$mode" = "multi" ]; then
+        local j_uri=""
+        j_uri=$(journalctl -u "$WDAVTUNNEL_SERVICE" -n 50 --no-pager 2>/dev/null | grep -oP 'server: client -uri\s+\K\S+' | tail -n 1 || true)
+        if [ -n "$j_uri" ] && [[ "$j_uri" =~ ^webdav ]]; then
+            if [[ ! "$j_uri" =~ \# ]]; then
+                j_uri="${j_uri}#Multi-WebDAV"
+            fi
+            echo "$j_uri"
+            return
+        fi
+
+        local srv="${SERVER_IP:-$(get_server_ip)}"
+        local l_port
+        l_port=$(get_wdavtunnel_listen_port)
+        local l_pass
+        l_pass=$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "")
+        local l_login
+        l_login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "wdav")
+
+        local loc_en
+        loc_en=$(get_wdavtunnel_prop "MULTI_LOCAL_ENABLED" "true")
+        local mail_en
+        mail_en=$(get_wdavtunnel_prop "MULTI_MAILRU_ENABLED" "true")
+        local mail_login
+        mail_login=$(get_wdavtunnel_prop "MULTI_MAILRU_LOGIN" "")
+        local mail_pass
+        mail_pass=$(get_wdavtunnel_prop "MULTI_MAILRU_PASSWORD" "")
+        local yan_en
+        yan_en=$(get_wdavtunnel_prop "MULTI_YANDEX_ENABLED" "false")
+        local yan_login
+        yan_login=$(get_wdavtunnel_prop "MULTI_YANDEX_LOGIN" "")
+        local yan_pass
+        yan_pass=$(get_wdavtunnel_prop "MULTI_YANDEX_PASSWORD" "")
+        local cust_en
+        cust_en=$(get_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "false")
+        local cust_url
+        cust_url=$(get_wdavtunnel_prop "MULTI_CUSTOM_URL" "")
+        local cust_login
+        cust_login=$(get_wdavtunnel_prop "MULTI_CUSTOM_LOGIN" "")
+        local cust_pass
+        cust_pass=$(get_wdavtunnel_prop "MULTI_CUSTOM_PASSWORD" "")
+
+        local b_uris=()
+        if [ "$loc_en" = "true" ] && [ -n "$l_pass" ]; then
+            b_uris+=("webdav://${l_login}:${l_pass}@${srv}:${l_port}")
+        fi
+        if [ "$mail_en" = "true" ] && [ -n "$mail_login" ] && [ -n "$mail_pass" ]; then
+            b_uris+=("webdavs://${mail_login}:${mail_pass}@webdav.cloud.mail.ru")
+        fi
+        if [ "$yan_en" = "true" ] && [ -n "$yan_login" ] && [ -n "$yan_pass" ]; then
+            b_uris+=("webdavs://${yan_login}:${yan_pass}@webdav.yandex.ru")
+        fi
+        if [ "$cust_en" = "true" ] && [ -n "$cust_url" ] && [ -n "$cust_login" ] && [ -n "$cust_pass" ]; then
+            local c_scheme="webdavs"
+            [[ "$cust_url" =~ ^http:// ]] && c_scheme="webdav"
+            local c_host
+            c_host=$(echo "$cust_url" | sed -e 's|^https\?://||' -e 's|/$||')
+            b_uris+=("${c_scheme}://${cust_login}:${cust_pass}@${c_host}")
+        fi
+
+        if [ ${#b_uris[@]} -eq 0 ]; then
+            echo "(в пуле нет настроенных хранилищ — добавьте хотя бы одно)"
+            return
+        fi
+
+        local primary="${b_uris[0]}"
+        local res_uri="${primary}?chunk-size=131071&coalesce=10ms&poll-max=500ms&poll-min=200ms&puts=8&read-max=8&read-min=3&timeout=60s"
+        for (( i=1; i<${#b_uris[@]}; i++ )); do
+            local extra="${b_uris[$i]}"
+            local enc_extra
+            enc_extra=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$extra" 2>/dev/null || true)
+            if [ -n "$enc_extra" ]; then
+                res_uri="${res_uri}&backend=${enc_extra}"
+            fi
+        done
+
+        if [ "$enc" = "true" ] || [ "$enc" = "1" ]; then
+            res_uri="${res_uri}&enc=1"
+        fi
+        res_uri="${res_uri}#Multi-WebDAV"
+        echo "$res_uri"
+        return
+    fi
+
     local login
     login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "")
     local pass
     pass=$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "")
-    local enc
-    enc=$(get_wdavtunnel_prop "WEBDAV_ENC" "false")
 
     if [ -z "$login" ] || [ -z "$pass" ]; then
         echo "(не настроен — укажите логин и пароль)"
@@ -5907,23 +6132,29 @@ get_wdavtunnel_client_uri() {
 
     if [ "$mode" = "server" ]; then
         local url
-        url=$(get_wdavtunnel_prop "WEBDAV_URL" "https://webdav.yandex.ru")
+        url=$(get_wdavtunnel_prop "WEBDAV_URL" "https://webdav.cloud.mail.ru")
         local scheme="webdavs"
         if [[ "$url" =~ ^http:// ]]; then
             scheme="webdav"
         fi
         local host_part
         host_part=$(echo "$url" | sed -e 's|^https\?://||' -e 's|/$||')
+        local tag="Cloud-WebDAV"
+        if [[ "$url" =~ mail\.ru ]]; then
+            tag="Mailru-WebDAV"
+        elif [[ "$url" =~ yandex ]]; then
+            tag="Yandex-WebDAV"
+        fi
         local uri="${scheme}://${login}:${pass}@${host_part}?chunk-size=131071&coalesce=10ms&poll-max=500ms&poll-min=200ms&puts=8&read-max=8&read-min=3&timeout=60s"
         if [ "$enc" = "true" ] || [ "$enc" = "1" ]; then
             uri="${uri}&enc=1"
         fi
-        uri="${uri}#Yandex-WebDAV"
+        uri="${uri}#${tag}"
         echo "$uri"
     else
         local port
         port=$(get_wdavtunnel_listen_port)
-        local srv="${SERVER_IP:-YOUR_SERVER_IP}"
+        local srv="${SERVER_IP:-$(get_server_ip)}"
         local uri="webdav://${login}:${pass}@${srv}:${port}?chunk-size=131071&coalesce=5ms&poll-max=200ms&poll-min=50ms&puts=8&read-max=8&read-min=3&timeout=60s"
         if [ "$enc" = "true" ] || [ "$enc" = "1" ]; then
             uri="${uri}&enc=1"
@@ -5931,6 +6162,210 @@ get_wdavtunnel_client_uri() {
         uri="${uri}#WebDAV-Tunnel"
         echo "$uri"
     fi
+}
+
+menu_webdav_tunnel_pool() {
+    while true; do
+        clear
+        local srv_ip
+        srv_ip=$(get_server_ip)
+        local l_port
+        l_port=$(get_wdavtunnel_listen_port)
+        local l_login
+        l_login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "wdav")
+        local l_pass
+        l_pass=$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "")
+
+        local loc_en
+        loc_en=$(get_wdavtunnel_prop "MULTI_LOCAL_ENABLED" "true")
+        local mail_en
+        mail_en=$(get_wdavtunnel_prop "MULTI_MAILRU_ENABLED" "true")
+        local mail_login
+        mail_login=$(get_wdavtunnel_prop "MULTI_MAILRU_LOGIN" "")
+        local mail_pass
+        mail_pass=$(get_wdavtunnel_prop "MULTI_MAILRU_PASSWORD" "")
+
+        local yan_en
+        yan_en=$(get_wdavtunnel_prop "MULTI_YANDEX_ENABLED" "false")
+        local yan_login
+        yan_login=$(get_wdavtunnel_prop "MULTI_YANDEX_LOGIN" "")
+        local yan_pass
+        yan_pass=$(get_wdavtunnel_prop "MULTI_YANDEX_PASSWORD" "")
+
+        local cust_en
+        cust_en=$(get_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "false")
+        local cust_url
+        cust_url=$(get_wdavtunnel_prop "MULTI_CUSTOM_URL" "")
+        local cust_login
+        cust_login=$(get_wdavtunnel_prop "MULTI_CUSTOM_LOGIN" "")
+        local cust_pass
+        cust_pass=$(get_wdavtunnel_prop "MULTI_CUSTOM_PASSWORD" "")
+
+        echo -e "${PURPLE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${PURPLE}║${BOLD}   Настройка пула хранилищ (Мульти-бекенд WebDAV Tunnel)              ${PURPLE}║${NC}"
+        echo -e "${PURPLE}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${PURPLE}║${NC}  WireTurn балансирует сессии между всеми включенными хранилищами    ${PURPLE}║${NC}"
+        echo -e "${PURPLE}║${NC}  и автоматически переключается при сбоях (Failover / Cooldown).       ${PURPLE}║${NC}"
+        echo -e "${PURPLE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+
+        if [ "$loc_en" = "true" ]; then
+            echo -e "  ${BOLD}[1]${NC} 🖥  ${GREEN}[ВКЛЮЧЕН]${NC}  ${BOLD}Встроенный сервер VPS (:8443)${NC}"
+            echo -e "       Логин: ${CYAN}${l_login}${NC} | Пароль: ${GREEN}${l_pass}${NC}"
+        else
+            echo -e "  ${BOLD}[1]${NC} 🖥  ${RED}[ВЫКЛЮЧЕН]${NC} ${BOLD}Встроенный сервер VPS (:8443)${NC}"
+        fi
+        echo ""
+
+        if [ "$mail_en" = "true" ]; then
+            echo -e "  ${BOLD}[2]${NC} ☁️  ${GREEN}[ВКЛЮЧЕН]${NC}  ${BOLD}Облако Mail.ru (webdav.cloud.mail.ru)${NC}"
+            echo -e "       Логин: ${CYAN}${mail_login:-(не задан)}${NC} | Пароль прил.: ${GREEN}${mail_pass:-(не задан)}${NC}"
+        else
+            echo -e "  ${BOLD}[2]${NC} ☁️  ${RED}[ВЫКЛЮЧЕН]${NC} ${BOLD}Облако Mail.ru (webdav.cloud.mail.ru)${NC}"
+        fi
+        echo ""
+
+        if [ "$yan_en" = "true" ]; then
+            echo -e "  ${BOLD}[3]${NC} 🟡  ${GREEN}[ВКЛЮЧЕН]${NC}  ${BOLD}Яндекс.Диск (webdav.yandex.ru)${NC} ${YELLOW}(требует подписку 360)${NC}"
+            echo -e "       Логин: ${CYAN}${yan_login:-(не задан)}${NC} | Пароль прил.: ${GREEN}${yan_pass:-(не задан)}${NC}"
+        else
+            echo -e "  ${BOLD}[3]${NC} 🟡  ${RED}[ВЫКЛЮЧЕН]${NC} ${BOLD}Яндекс.Диск (webdav.yandex.ru)${NC}"
+        fi
+        echo ""
+
+        if [ "$cust_en" = "true" ]; then
+            echo -e "  ${BOLD}[4]${NC} 🌐  ${GREEN}[ВКЛЮЧЕН]${NC}  ${BOLD}Кастомный WebDAV-сервер${NC}"
+            echo -e "       URL: ${CYAN}${cust_url:-(не задан)}${NC} | Логин: ${CYAN}${cust_login:-(не задан)}${NC}"
+        else
+            echo -e "  ${BOLD}[4]${NC} 🌐  ${RED}[ВЫКЛЮЧЕН]${NC} ${BOLD}Кастомный WebDAV-сервер${NC}"
+        fi
+        echo ""
+        echo -e "  ${GREEN}${BOLD}[5]${NC} 💾 ${BOLD}Сохранить пул и применить настройки${NC}"
+        echo -e "  ${BOLD}[0]${NC} ← Назад"
+        echo ""
+        read -p "Выберите действие [0-5]: " p_choice
+
+        case "$p_choice" in
+            1)
+                echo ""
+                echo -e "  [1] Включить / Выключить встроенный сервер VPS в пуле (сейчас: ${loc_en})"
+                echo -e "  [2] Сменить логин и пароль встроенного сервера"
+                read -p "  Действие [1-2, Enter для отмены]: " l_sub
+                if [ "$l_sub" = "1" ]; then
+                    if [ "$loc_en" = "true" ]; then
+                        set_wdavtunnel_prop "MULTI_LOCAL_ENABLED" "false"
+                        echo -e "${YELLOW}Встроенный сервер ВЫКЛЮЧЕН из пула.${NC}"
+                    else
+                        set_wdavtunnel_prop "MULTI_LOCAL_ENABLED" "true"
+                        echo -e "${GREEN}✓ Встроенный сервер ВКЛЮЧЕН в пул.${NC}"
+                    fi
+                    sleep 1
+                elif [ "$l_sub" = "2" ]; then
+                    read -p "  Логин [${l_login}]: " new_ll
+                    [ -n "$new_ll" ] && set_wdavtunnel_prop "WEBDAV_LOGIN" "$new_ll"
+                    read -p "  Пароль [${l_pass}]: " new_lp
+                    [ -n "$new_lp" ] && set_wdavtunnel_prop "WEBDAV_PASSWORD" "$new_lp"
+                    echo -e "${GREEN}✓ Данные обновлены.${NC}"
+                    sleep 1
+                fi
+                ;;
+            2)
+                echo ""
+                echo -e "  [1] Включить / Выключить Mail.ru в пуле (сейчас: ${mail_en})"
+                echo -e "  [2] Настроить логин и пароль приложения Mail.ru"
+                read -p "  Действие [1-2, Enter для отмены]: " m_sub
+                if [ "$m_sub" = "1" ]; then
+                    if [ "$mail_en" = "true" ]; then
+                        set_wdavtunnel_prop "MULTI_MAILRU_ENABLED" "false"
+                        echo -e "${YELLOW}Mail.ru ВЫКЛЮЧЕН из пула.${NC}"
+                    else
+                        set_wdavtunnel_prop "MULTI_MAILRU_ENABLED" "true"
+                        echo -e "${GREEN}✓ Mail.ru ВКЛЮЧЕН в пул.${NC}"
+                    fi
+                    sleep 1
+                elif [ "$m_sub" = "2" ]; then
+                    echo -e "  ${YELLOW}Получите пароль приложения: https://account.mail.ru/user/2-step-auth/passwords${NC}"
+                    read -p "  Логин Mail.ru (email) [${mail_login}]: " new_ml
+                    [ -n "$new_ml" ] && set_wdavtunnel_prop "MULTI_MAILRU_LOGIN" "$new_ml"
+                    read -p "  Пароль для внешних приложений Mail.ru: " new_mp
+                    [ -n "$new_mp" ] && set_wdavtunnel_prop "MULTI_MAILRU_PASSWORD" "$new_mp"
+                    set_wdavtunnel_prop "MULTI_MAILRU_ENABLED" "true"
+                    echo -e "${GREEN}✓ Данные Mail.ru сохранены.${NC}"
+                    sleep 1
+                fi
+                ;;
+            3)
+                echo ""
+                echo -e "  ${RED}! ВНИМАНИЕ: WebDAV у Яндекса требует платную подписку Яндекс 360.${NC}"
+                echo -e "  [1] Включить / Выключить Яндекс.Диск в пуле (сейчас: ${yan_en})"
+                echo -e "  [2] Настроить логин и пароль приложения Яндекс"
+                read -p "  Действие [1-2, Enter для отмены]: " y_sub
+                if [ "$y_sub" = "1" ]; then
+                    if [ "$yan_en" = "true" ]; then
+                        set_wdavtunnel_prop "MULTI_YANDEX_ENABLED" "false"
+                        echo -e "${YELLOW}Яндекс.Диск ВЫКЛЮЧЕН из пула.${NC}"
+                    else
+                        set_wdavtunnel_prop "MULTI_YANDEX_ENABLED" "true"
+                        echo -e "${GREEN}✓ Яндекс.Диск ВКЛЮЧЕН в пул.${NC}"
+                    fi
+                    sleep 1
+                elif [ "$y_sub" = "2" ]; then
+                    echo -e "  ${YELLOW}Получите пароль приложения (тип «Файлы/Диск»): https://id.yandex.ru/security${NC}"
+                    read -p "  Логин Яндекс (email или логин) [${yan_login}]: " new_yl
+                    [ -n "$new_yl" ] && set_wdavtunnel_prop "MULTI_YANDEX_LOGIN" "$new_yl"
+                    read -p "  Пароль приложения Яндекс: " new_yp
+                    [ -n "$new_yp" ] && set_wdavtunnel_prop "MULTI_YANDEX_PASSWORD" "$new_yp"
+                    set_wdavtunnel_prop "MULTI_YANDEX_ENABLED" "true"
+                    echo -e "${GREEN}✓ Данные Яндекс.Диска сохранены.${NC}"
+                    sleep 1
+                fi
+                ;;
+            4)
+                echo ""
+                echo -e "  [1] Включить / Выключить Кастомный WebDAV (сейчас: ${cust_en})"
+                echo -e "  [2] Настроить параметры подключения"
+                read -p "  Действие [1-2, Enter для отмены]: " c_sub
+                if [ "$c_sub" = "1" ]; then
+                    if [ "$cust_en" = "true" ]; then
+                        set_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "false"
+                        echo -e "${YELLOW}Кастомный WebDAV ВЫКЛЮЧЕН из пула.${NC}"
+                    else
+                        set_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "true"
+                        echo -e "${GREEN}✓ Кастомный WebDAV ВКЛЮЧЕН в пул.${NC}"
+                    fi
+                    sleep 1
+                elif [ "$c_sub" = "2" ]; then
+                    read -p "  URL [${cust_url}]: " new_cu
+                    [ -n "$new_cu" ] && set_wdavtunnel_prop "MULTI_CUSTOM_URL" "$new_cu"
+                    read -p "  Логин [${cust_login}]: " new_cl
+                    [ -n "$new_cl" ] && set_wdavtunnel_prop "MULTI_CUSTOM_LOGIN" "$new_cl"
+                    read -p "  Пароль: " new_cp
+                    [ -n "$new_cp" ] && set_wdavtunnel_prop "MULTI_CUSTOM_PASSWORD" "$new_cp"
+                    set_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "true"
+                    echo -e "${GREEN}✓ Данные сохранены.${NC}"
+                    sleep 1
+                fi
+                ;;
+            5)
+                generate_wdavtunnel_yaml
+                chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                if [ "$(get_wdavtunnel_prop "ROUTING_MODE" "xray")" = "xray" ] && [ -x "$WDAVTUNNEL_ROUTING" ]; then
+                    "$WDAVTUNNEL_ROUTING" up 2>/dev/null || true
+                fi
+                if systemctl is-active --quiet "$WDAVTUNNEL_SERVICE" 2>/dev/null; then
+                    systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
+                    echo -e "${GREEN}✓ Конфигурация пула сохранена и служба перезапущена!${NC}"
+                else
+                    echo -e "${GREEN}✓ Конфигурация пула сохранена! Запустите туннель из меню.${NC}"
+                fi
+                sleep 2
+                return
+                ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
 }
 
 # Сборка webdav-tunnel из исходников
@@ -6053,7 +6488,7 @@ EOF_CFG
         local wdt_port
         wdt_port=$(get_wdavtunnel_listen_port)
         local wdt_url
-        wdt_url=$(get_wdavtunnel_prop "WEBDAV_URL" "https://webdav.yandex.ru")
+        wdt_url=$(get_wdavtunnel_prop "WEBDAV_URL" "https://webdav.cloud.mail.ru")
         local wdt_login
         wdt_login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "(не задан)")
         local wdt_pass
@@ -6064,22 +6499,36 @@ EOF_CFG
         wdt_routing=$(get_wdavtunnel_routing)
         local wdt_uri
         wdt_uri=$(get_wdavtunnel_client_uri)
+        local wdt_prov
+        wdt_prov=$(get_wdavtunnel_provider_label)
 
         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-        if [ "$wdt_mode" = "server" ]; then
-            echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — Cloud Relay (Внешний Яндекс.Диск / WebDAV)        ${CYAN}║${NC}"
-        else
-            echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — TCP over WebDAV (Встроенный Selfhosted)            ${CYAN}║${NC}"
-        fi
+        echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — TCP over WebDAV (WireTurn / webdav-tunnel)         ${CYAN}║${NC}"
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
         echo -e "${CYAN}║${NC}  Статус: ${wdt_status}"
-        if [ "$wdt_mode" = "server" ]; then
-            echo -e "${CYAN}║${NC}  Режим: ${GREEN}Внешнее хранилище (External Cloud WebDAV)${NC}"
+        echo -e "${CYAN}║${NC}  Режим: ${wdt_prov}"
+        if [ "$wdt_mode" = "multi" ]; then
+            local loc_st="${RED}[ВЫКЛ]${NC}"
+            [ "$(get_wdavtunnel_prop "MULTI_LOCAL_ENABLED" "true")" = "true" ] && loc_st="${GREEN}[ВКЛ]${NC} (:${wdt_port}, user: ${wdt_login})"
+            local mail_st="${RED}[ВЫКЛ]${NC}"
+            [ "$(get_wdavtunnel_prop "MULTI_MAILRU_ENABLED" "true")" = "true" ] && mail_st="${GREEN}[ВКЛ]${NC} (${BOLD}$(get_wdavtunnel_prop "MULTI_MAILRU_LOGIN" "не задан")${NC})"
+            local yan_st="${RED}[ВЫКЛ]${NC}"
+            [ "$(get_wdavtunnel_prop "MULTI_YANDEX_ENABLED" "false")" = "true" ] && yan_st="${GREEN}[ВКЛ]${NC} (${BOLD}$(get_wdavtunnel_prop "MULTI_YANDEX_LOGIN" "не задан")${NC})"
+            local cust_st="${RED}[ВЫКЛ]${NC}"
+            [ "$(get_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "false")" = "true" ] && cust_st="${GREEN}[ВКЛ]${NC} (${BOLD}$(get_wdavtunnel_prop "MULTI_CUSTOM_URL" "не задан")${NC})"
+
+            echo -e "${CYAN}║${NC}  Хранилища в пуле:"
+            echo -e "${CYAN}║${NC}    • 🖥  Свой сервер: ${loc_st}"
+            echo -e "${CYAN}║${NC}    • ☁️  Облако Mail.ru: ${mail_st}"
+            echo -e "${CYAN}║${NC}    • 🟡  Яндекс.Диск: ${yan_st}"
+            if [ "$(get_wdavtunnel_prop "MULTI_CUSTOM_ENABLED" "false")" = "true" ]; then
+                echo -e "${CYAN}║${NC}    • 🌐  Кастомный WebDAV: ${cust_st}"
+            fi
+        elif [ "$wdt_mode" = "server" ]; then
             echo -e "${CYAN}║${NC}  WebDAV URL: ${BOLD}${wdt_url}${NC}"
-            echo -e "${CYAN}║${NC}  Логин: ${BOLD}${wdt_login}${NC}  |  Пароль приложения: ${GREEN}${wdt_pass}${NC}"
+            echo -e "${CYAN}║${NC}  Логин: ${BOLD}${wdt_login}${NC}  |  Пароль: ${GREEN}${wdt_pass}${NC}"
         else
-            echo -e "${CYAN}║${NC}  Режим: ${CYAN}Встроенный сервер (Selfhosted)${NC}"
-            echo -e "${CYAN}║${NC}  Порт WebDAV: ${BOLD}:${wdt_port}/TCP${NC}"
+            echo -e "${CYAN}║${NC}  Порт WebDAV (встроенный): ${BOLD}:${wdt_port}/TCP${NC}"
             echo -e "${CYAN}║${NC}  Логин: ${BOLD}${wdt_login}${NC}  |  Пароль: ${GREEN}${wdt_pass}${NC}"
         fi
         echo -e "${CYAN}║${NC}  Шифрование чанков (AES-256-GCM): ${BOLD}${wdt_enc}${NC}"
@@ -6092,12 +6541,16 @@ EOF_CFG
         echo -e "  ${GREEN}[1]${NC} ▶  Запустить WebDAV Tunnel"
         echo -e "  ${RED}[2]${NC} ■  Остановить WebDAV Tunnel"
         echo -e "  ${YELLOW}[3]${NC} 🔄 Перезапустить WebDAV Tunnel"
-        echo -e "  ${CYAN}[4]${NC} 🔀 Переключить режим (Selfhosted ⟷ Внешний Яндекс.Диск)"
-        echo -e "  ${CYAN}[5]${NC} 🔑 Сменить логин / пароль (пароль приложения для Яндекс)"
-        if [ "$wdt_mode" = "server" ]; then
-            echo -e "  ${CYAN}[6]${NC} 🌐 Сменить URL WebDAV-хранилища (текущий: ${wdt_url})"
+        echo -e "  ${CYAN}[4]${NC} 🔀 Сменить режим (Мульти-пул / Mail.ru / Selfhosted / Яндекс / Кастом)"
+        if [ "$wdt_mode" = "multi" ]; then
+            echo -e "  ${CYAN}[5]${NC} ⚙️  ${BOLD}Настроить хранилища в пуле${NC} (Вкл/Выкл, логины, пароли)"
         else
-            echo -e "  ${CYAN}[6]${NC} 🔌 Сменить порт WebDAV-сервера (текущий: :${wdt_port})"
+            echo -e "  ${CYAN}[5]${NC} 🔑 Сменить логин / пароль (пароль приложения)"
+            if [ "$wdt_mode" = "server" ]; then
+                echo -e "  ${CYAN}[6]${NC} 🌐 Сменить URL WebDAV-хранилища (текущий: ${wdt_url})"
+            else
+                echo -e "  ${CYAN}[6]${NC} 🔌 Сменить порт WebDAV-сервера (текущий: :${wdt_port})"
+            fi
         fi
         echo -e "  ${CYAN}[7]${NC} 🔒 Включить / выключить AES-256-GCM шифрование чанков"
         echo -e "  ${CYAN}[8]${NC} 🧭 Переключить маршрутизацию (Xray REDIRECT / Прямой WAN)"
@@ -6131,54 +6584,96 @@ EOF_CFG
             4)
                 clear
                 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-                echo -e "${CYAN}║${BOLD}   Выбор режима работы WebDAV Tunnel                                  ${CYAN}║${NC}"
+                echo -e "${CYAN}║${BOLD}   Выбор режима и провайдера WebDAV Tunnel                            ${CYAN}║${NC}"
                 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
                 echo ""
-                echo -e "  ${CYAN}[1]${NC} 🖥  Встроенный сервер (Selfhosted) — туннель слушает порт на VPS (например :8443)."
-                echo -e "       Клиент WireTurn подключается напрямую к вашему VPS по IP:порт."
+                echo -e "  ${PURPLE}[1]${NC} 🔀 ${BOLD}МУЛЬТИ-БЕКЕНД (Гибридный пул)${NC} — одновременная работа нескольких хранилищ"
+                echo -e "       • Объединяет Mail.ru + Свой сервер (:8443) + Яндекс в единый пул."
+                echo -e "       • WireTurn распределяет сессии по кругу и переключается при сбоях (Failover)."
                 echo ""
-                echo -e "  ${CYAN}[2]${NC} ☁️  Внешнее WebDAV-хранилище (Яндекс.Диск и др.)."
-                echo -e "       Трафик передается через файлы на Яндекс.Диске."
-                echo -e "       VPS не открывает входящих портов, работает скрытно через облако."
+                echo -e "  ${CYAN}[2]${NC} ☁️  ${BOLD}Облако Mail.ru (Одиночный)${NC} (https://webdav.cloud.mail.ru)"
+                echo -e "       • Передача данных через WebDAV Mail.ru (нужен пароль для внешних приложений)."
+                echo -e "       • VPS не открывает входящих портов, работает скрытно через облако."
                 echo ""
-                read -p "  Выберите режим [1-2, 0 для отмены]: " new_m_ch
+                echo -e "  ${CYAN}[3]${NC} 🖥  ${BOLD}Встроенный сервер (Selfhosted Одиночный)${NC} — порт на VPS (например :8443)"
+                echo -e "       • Клиент WireTurn подключается напрямую к вашему VPS по IP:порт."
+                echo -e "       • Самая быстрая скорость и минимальный пинг."
+                echo ""
+                echo -e "  ${CYAN}[4]${NC} 🟡  ${BOLD}Яндекс.Диск (Одиночный)${NC} (https://webdav.yandex.ru)"
+                echo -e "       • ${RED}ВНИМАНИЕ: WebDAV у Яндекса требует платную подписку Яндекс 360!${NC}"
+                echo -e "       • На бесплатном тарифе Яндекс возвращает ошибку '402 Payment Required'."
+                echo ""
+                echo -e "  ${CYAN}[5]${NC} 🌐  ${BOLD}Другой кастомный WebDAV-сервер${NC} (Nextcloud, Owncloud и др.)"
+                echo ""
+                read -p "  Выберите вариант [1-5, 0 для отмены]: " new_m_ch
                 case "$new_m_ch" in
                     1)
+                        set_wdavtunnel_prop "WEBDAV_MODE" "multi"
+                        menu_webdav_tunnel_pool
+                        ;;
+                    2)
+                        set_wdavtunnel_prop "WEBDAV_MODE" "server"
+                        set_wdavtunnel_prop "WEBDAV_URL" "https://webdav.cloud.mail.ru"
+                        echo ""
+                        echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                        echo -e "${YELLOW}║${BOLD}  ИНСТРУКЦИЯ ПО НАСТРОЙКЕ ОБЛАКА MAIL.RU:                             ${YELLOW}║${NC}"
+                        echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                        echo -e "  1. Перейдите в браузере: ${BOLD}https://account.mail.ru/user/2-step-auth/passwords${NC}"
+                        echo -e "  2. Нажмите ${CYAN}«Пароли для внешних приложений»${NC} → ${BOLD}«Добавить»${NC}"
+                        echo -e "  3. Введите название (например: ${BOLD}WireTurn${NC}) и нажмите «Создать»"
+                        echo -e "  4. Скопируйте полученный пароль приложения"
+                        echo ""
+                        read -p "  Логин Mail.ru (email, например user@mail.ru) [${wdt_login}]: " in_m_login
+                        [ -n "$in_m_login" ] && set_wdavtunnel_prop "WEBDAV_LOGIN" "$in_m_login"
+                        read -p "  Пароль для внешних приложений Mail.ru: " in_m_pass
+                        [ -n "$in_m_pass" ] && set_wdavtunnel_prop "WEBDAV_PASSWORD" "$in_m_pass"
+
+                        chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                        chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+
+                        if [ "$(get_wdavtunnel_prop "ROUTING_MODE" "xray")" = "xray" ] && [ -x "$WDAVTUNNEL_ROUTING" ]; then
+                            "$WDAVTUNNEL_ROUTING" up 2>/dev/null || true
+                        fi
+
+                        if systemctl is-active --quiet "$WDAVTUNNEL_SERVICE" 2>/dev/null; then
+                            systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
+                            echo -e "${GREEN}✓ Режим переключен на Облако Mail.ru и служба перезапущена.${NC}"
+                        else
+                            echo -e "${GREEN}✓ Режим переключен на Облако Mail.ru.${NC}"
+                        fi
+                        read -p "Нажмите Enter..."
+                        ;;
+                    3)
                         set_wdavtunnel_prop "WEBDAV_MODE" "selfhosted"
-                        echo -e "${GREEN}✓ Режим переключен на Selfhosted (встроенный сервер).${NC}"
+                        echo -e "${GREEN}✓ Режим переключен на Встроенный сервер (Selfhosted).${NC}"
                         if systemctl is-active --quiet "$WDAVTUNNEL_SERVICE" 2>/dev/null; then
                             systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
                             echo -e "${GREEN}✓ Служба перезапущена.${NC}"
                         fi
                         sleep 1
                         ;;
-                    2)
+                    4)
                         set_wdavtunnel_prop "WEBDAV_MODE" "server"
-                        local cur_u
-                        cur_u=$(get_wdavtunnel_prop "WEBDAV_URL" "")
-                        [ -z "$cur_u" ] && set_wdavtunnel_prop "WEBDAV_URL" "https://webdav.yandex.ru"
-
+                        set_wdavtunnel_prop "WEBDAV_URL" "https://webdav.yandex.ru"
                         echo ""
                         echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════════════╗${NC}"
                         echo -e "${YELLOW}║${BOLD}  ИНСТРУКЦИЯ ПО НАСТРОЙКЕ ЯНДЕКС.ДИСКА:                               ${YELLOW}║${NC}"
                         echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                        echo -e "  ${RED}! ВНИМАНИЕ: WebDAV у Яндекса требует платную подписку Яндекс 360.${NC}"
                         echo -e "  1. Перейдите в браузере: ${BOLD}https://id.yandex.ru/security${NC}"
                         echo -e "  2. Прокрутите до блока ${CYAN}«Пароли приложений»${NC} → ${BOLD}«Создать пароль»${NC}"
                         echo -e "  3. Выберите тип приложения: ${BOLD}«Файлы (Диск)»${NC}"
                         echo -e "  4. Задайте имя (например: ${BOLD}wireturn${NC}) и нажмите «Создать»"
-                        echo -e "  5. Скопируйте сгенерированный пароль приложения (16 символов)"
+                        echo -e "  5. Скопируйте сгенерированный пароль приложения"
                         echo ""
                         read -p "  Логин Яндекс (email или логин) [${wdt_login}]: " in_y_login
                         [ -n "$in_y_login" ] && set_wdavtunnel_prop "WEBDAV_LOGIN" "$in_y_login"
                         read -p "  Пароль приложения Яндекс: " in_y_pass
                         [ -n "$in_y_pass" ] && set_wdavtunnel_prop "WEBDAV_PASSWORD" "$in_y_pass"
-                        read -p "  URL WebDAV [${wdt_url:-https://webdav.yandex.ru}]: " in_y_url
-                        [ -n "$in_y_url" ] && set_wdavtunnel_prop "WEBDAV_URL" "$in_y_url"
 
                         chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
                         chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
 
-                        # Обновить iptables маршрутизацию
                         if [ "$(get_wdavtunnel_prop "ROUTING_MODE" "xray")" = "xray" ] && [ -x "$WDAVTUNNEL_ROUTING" ]; then
                             "$WDAVTUNNEL_ROUTING" up 2>/dev/null || true
                         fi
@@ -6191,35 +6686,70 @@ EOF_CFG
                         fi
                         read -p "Нажмите Enter..."
                         ;;
+                    5)
+                        set_wdavtunnel_prop "WEBDAV_MODE" "server"
+                        echo ""
+                        read -p "  URL WebDAV-сервера (например https://my-cloud.com/dav/) [${wdt_url}]: " in_c_url
+                        [ -n "$in_c_url" ] && set_wdavtunnel_prop "WEBDAV_URL" "$in_c_url"
+                        read -p "  Логин WebDAV [${wdt_login}]: " in_c_login
+                        [ -n "$in_c_login" ] && set_wdavtunnel_prop "WEBDAV_LOGIN" "$in_c_login"
+                        read -p "  Пароль WebDAV: " in_c_pass
+                        [ -n "$in_c_pass" ] && set_wdavtunnel_prop "WEBDAV_PASSWORD" "$in_c_pass"
+
+                        chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                        chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+
+                        if [ "$(get_wdavtunnel_prop "ROUTING_MODE" "xray")" = "xray" ] && [ -x "$WDAVTUNNEL_ROUTING" ]; then
+                            "$WDAVTUNNEL_ROUTING" up 2>/dev/null || true
+                        fi
+
+                        if systemctl is-active --quiet "$WDAVTUNNEL_SERVICE" 2>/dev/null; then
+                            systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
+                            echo -e "${GREEN}✓ Настройки сохранены и служба перезапущена.${NC}"
+                        else
+                            echo -e "${GREEN}✓ Настройки сохранены.${NC}"
+                        fi
+                        read -p "Нажмите Enter..."
+                        ;;
                     *) ;;
                 esac
                 ;;
             5)
-                echo ""
-                if [ "$wdt_mode" = "server" ]; then
-                    echo -e "  ${YELLOW}Примечание для Яндекс.Диска:${NC} используйте ${BOLD}пароль приложения${NC} (id.yandex.ru)"
+                if [ "$wdt_mode" = "multi" ]; then
+                    menu_webdav_tunnel_pool
+                else
+                    echo ""
+                    if [[ "$wdt_url" =~ mail\.ru ]]; then
+                        echo -e "  ${YELLOW}Примечание для Mail.ru:${NC} используйте ${BOLD}пароль для внешних приложений${NC} (account.mail.ru)"
+                    elif [[ "$wdt_url" =~ yandex ]]; then
+                        echo -e "  ${YELLOW}Примечание для Яндекс.Диска:${NC} используйте ${BOLD}пароль приложения${NC} (id.yandex.ru)"
+                    fi
+                    read -p "  Новый логин [${wdt_login}]: " new_login
+                    read -p "  Новый пароль: " new_pass
+                    if [ -n "$new_login" ]; then
+                        set_wdavtunnel_prop "WEBDAV_LOGIN" "$new_login"
+                    fi
+                    if [ -n "$new_pass" ]; then
+                        set_wdavtunnel_prop "WEBDAV_PASSWORD" "$new_pass"
+                    fi
+                    chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                    chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                    echo -e "${GREEN}✓ Логин/пароль обновлены. Перезапустите туннель для применения.${NC}"
+                    read -p "Нажмите Enter..."
                 fi
-                read -p "  Новый логин [${wdt_login}]: " new_login
-                read -p "  Новый пароль: " new_pass
-                if [ -n "$new_login" ]; then
-                    set_wdavtunnel_prop "WEBDAV_LOGIN" "$new_login"
-                fi
-                if [ -n "$new_pass" ]; then
-                    set_wdavtunnel_prop "WEBDAV_PASSWORD" "$new_pass"
-                fi
-                chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
-                chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
-                echo -e "${GREEN}✓ Логин/пароль обновлены. Перезапустите туннель для применения.${NC}"
-                read -p "Нажмите Enter..."
                 ;;
             6)
-                if [ "$wdt_mode" = "server" ]; then
+                if [ "$wdt_mode" = "multi" ]; then
+                    echo "Не применимо в режиме мульти-пула"
+                    sleep 1
+                elif [ "$wdt_mode" = "server" ]; then
                     echo ""
                     read -p "  Новый WebDAV URL [текущий: ${wdt_url}]: " new_url
                     if [ -n "$new_url" ]; then
                         set_wdavtunnel_prop "WEBDAV_URL" "$new_url"
                         echo -e "${GREEN}✓ URL изменён на ${new_url}. Перезапустите туннель для применения.${NC}"
                     fi
+                    read -p "Нажмите Enter..."
                 else
                     echo ""
                     read -p "  Новый порт WebDAV-сервера (текущий: ${wdt_port}): " new_port
@@ -6232,8 +6762,8 @@ EOF_CFG
                     else
                         echo -e "${RED}  Неверный порт (1024-65535)${NC}"
                     fi
+                    read -p "Нажмите Enter..."
                 fi
-                read -p "Нажмите Enter..."
                 ;;
             7)
                 if [ "$wdt_enc" = "true" ] || [ "$wdt_enc" = "1" ]; then
@@ -6757,18 +7287,19 @@ main_hub() {
             echo -e "${CYAN}║${NC}  ${BOLD}[6] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
-        if is_webdav_tunnel_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[14] 📦 WebDAV Tunnel (TCP over WebDAV)${NC} -> $(get_wdavtunnel_status)"
-            echo -e "${CYAN}║${NC}       Порт: :${BOLD}$(get_wdavtunnel_listen_port)/TCP${NC}  |  Enc: $(get_wdavtunnel_prop WEBDAV_ENC false) | Маршрут: $(get_wdavtunnel_routing)"
+        if is_sub_server_installed; then
+            echo -e "${CYAN}║${NC}  ${BOLD}[13] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
+            echo -e "${CYAN}║${NC}       API: http://127.0.0.1:22217   |  Порт: :22217 [127.0.0.1] 🔒"
         else
-            echo -e "${CYAN}║${NC}  ${BOLD}[14] 📦 WebDAV Tunnel (TCP over WebDAV)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+            echo -e "${CYAN}║${NC}  ${BOLD}[13] 📋 Подписки TUNA${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
-        if is_sub_server_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[7] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
-            echo -e "${CYAN}║${NC}      API: http://127.0.0.1:22217   |  Порт: :22217 [127.0.0.1] 🔒"
+        if is_webdav_tunnel_installed; then
+            local w_prov=$(get_wdavtunnel_provider_label)
+            echo -e "${CYAN}║${NC}  ${BOLD}[14] 📦 WebDAV Tunnel (WireTurn)${NC}  -> $(get_wdavtunnel_status)"
+            echo -e "${CYAN}║${NC}       Провайдер: ${w_prov} | Маршрут: $(get_wdavtunnel_routing)"
         else
-            echo -e "${CYAN}║${NC}  ${BOLD}[7] 📋 Подписки TUNA${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+            echo -e "${CYAN}║${NC}  ${BOLD}[14] 📦 WebDAV Tunnel (WireTurn)${NC}  -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
@@ -6777,9 +7308,7 @@ main_hub() {
         echo -e "  ${PURPLE}${BOLD}[3]${NC} 🛡️  ${BOLD}Управление WDTT / qwdtt${NC} (Egress в ядро / Прямой выход, клиенты, фаервол)"
         echo -e "  ${CYAN}${BOLD}[4]${NC} 🔒 ${BOLD}Управление CSQTT${NC} (Защита веб-панели, туннель фаервол, логин/пароли)"
         echo -e "  ${YELLOW}${BOLD}[5]${NC} 🌐 ${BOLD}Управление DNS-туннелями${NC} (MasterDnsVPN / CottenDNS, stormdns://, WAN)"
-        echo ""
         echo -e "  ${YELLOW}${BOLD}[6]${NC} 📡 ${BOLD}Управление OpenFlux${NC} (Мультиплекс 1-8 • Яндекс/Mail.ru • Режим L4)"
-        echo -e "  ${CYAN}${BOLD}[14]${NC} 📦 ${BOLD}Управление WebDAV Tunnel${NC} (TCP over WebDAV • selfhosted • AES-256-GCM)"
         echo ""
         echo -e "  ${RED}${BOLD}[7]${NC} 🛡️  ${BOLD}Центр управления фаерволом портов${NC} (Включение/Выключение протоколов, Локдаун)"
         echo -e "  ${BOLD}[8]${NC} 📊 Сводный статус всех служб и портов сервера"
@@ -6788,6 +7317,7 @@ main_hub() {
         echo -e "  ${GREEN}${BOLD}[11]${NC} ⚙️  ${BOLD}Оптимизация и безопасность${NC} (DNS с пингом, BBR/буферы под RAM, Swap 2/4G, Fail2ban)"
         echo -e "  ${PURPLE}${BOLD}[12]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
         echo -e "  ${CYAN}${BOLD}[13]${NC} 📋 ${BOLD}Сервер подписок TUNA${NC} (Профили, выдача Base64-ссылок, ротация токенов)"
+        echo -e "  ${CYAN}${BOLD}[14]${NC} 📦 ${BOLD}Управление WebDAV Tunnel${NC} (Mail.ru / Selfhosted / Яндекс.Диск • WireTurn)"
         echo -e "  ${BOLD}[0]${NC} 🚪 Выход"
         echo ""
         read -p "Выберите раздел [0-14]: " top_choice
