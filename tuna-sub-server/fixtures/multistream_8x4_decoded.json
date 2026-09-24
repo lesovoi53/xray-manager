@@ -1,5 +1,5 @@
 {
-  "schema": "openflux-bundle",
+  "schema": "tuna.openflux.bundle",
   "version": 2,
   "issuer_id": "c1f10903-88f5-467f-94d7-eaeead8eef24",
   "id": "88888888-2222-5555-9999-000000000000",
@@ -11,7 +11,6 @@
     {
       "id": "00000000-0000-0000-0000-000000000011",
       "name": "MultiStream-Group-1",
-      "mode": "multistream",
       "transport": "mailru",
       "urls": [
         "https://mailru.example.com/doc/ch1/part_1",
@@ -20,12 +19,11 @@
         "https://mailru.example.com/doc/ch1/part_4"
       ],
       "codec": "legacy",
-      "encryption_key": "ms_key_22222222"
+      "encryption_key": "ms_key_hex_22222222"
     },
     {
       "id": "00000000-0000-0000-0000-000000000012",
       "name": "MultiStream-Group-2",
-      "mode": "multistream",
       "transport": "boards",
       "urls": [
         "https://boards.example.com/doc/ch2/part_1",
@@ -34,26 +32,24 @@
         "https://boards.example.com/doc/ch2/part_4"
       ],
       "codec": "batched",
-      "encryption_key": "ms_key_44444444"
+      "encryption_key": "ms_key_hex_44444444"
     },
     {
       "id": "00000000-0000-0000-0000-000000000013",
       "name": "MultiStream-Group-3",
-      "mode": "multistream",
       "transport": "cupsonline",
       "urls": [
-        "https://cupsonline.example.com/doc/ch3/part_1",
-        "https://cupsonline.example.com/doc/ch3/part_2",
-        "https://cupsonline.example.com/doc/ch3/part_3",
-        "https://cupsonline.example.com/doc/ch3/part_4"
+        "https://cups.online/live-coding/?room=ch3_part_1",
+        "https://cups.online/live-coding/?room=ch3_part_2",
+        "https://cups.online/live-coding/?room=ch3_part_3",
+        "https://cups.online/live-coding/?room=ch3_part_4"
       ],
       "codec": "legacy",
-      "encryption_key": "ms_key_66666666"
+      "encryption_key": "ms_key_hex_66666666"
     },
     {
       "id": "00000000-0000-0000-0000-000000000014",
       "name": "MultiStream-Group-4",
-      "mode": "multistream",
       "transport": "mailru",
       "urls": [
         "https://mailru.example.com/doc/ch4/part_1",
@@ -62,12 +58,11 @@
         "https://mailru.example.com/doc/ch4/part_4"
       ],
       "codec": "batched",
-      "encryption_key": "ms_key_88888888"
+      "encryption_key": "ms_key_hex_88888888"
     },
     {
       "id": "00000000-0000-0000-0000-000000000015",
       "name": "MultiStream-Group-5",
-      "mode": "multistream",
       "transport": "boards",
       "urls": [
         "https://boards.example.com/doc/ch5/part_1",
@@ -76,26 +71,24 @@
         "https://boards.example.com/doc/ch5/part_4"
       ],
       "codec": "legacy",
-      "encryption_key": "ms_key_111111110"
+      "encryption_key": "ms_key_hex_111111110"
     },
     {
       "id": "00000000-0000-0000-0000-000000000016",
       "name": "MultiStream-Group-6",
-      "mode": "multistream",
       "transport": "cupsonline",
       "urls": [
-        "https://cupsonline.example.com/doc/ch6/part_1",
-        "https://cupsonline.example.com/doc/ch6/part_2",
-        "https://cupsonline.example.com/doc/ch6/part_3",
-        "https://cupsonline.example.com/doc/ch6/part_4"
+        "https://cups.online/live-coding/?room=ch6_part_1",
+        "https://cups.online/live-coding/?room=ch6_part_2",
+        "https://cups.online/live-coding/?room=ch6_part_3",
+        "https://cups.online/live-coding/?room=ch6_part_4"
       ],
       "codec": "batched",
-      "encryption_key": "ms_key_133333332"
+      "encryption_key": "ms_key_hex_133333332"
     },
     {
       "id": "00000000-0000-0000-0000-000000000017",
       "name": "MultiStream-Group-7",
-      "mode": "multistream",
       "transport": "mailru",
       "urls": [
         "https://mailru.example.com/doc/ch7/part_1",
@@ -104,12 +97,11 @@
         "https://mailru.example.com/doc/ch7/part_4"
       ],
       "codec": "legacy",
-      "encryption_key": "ms_key_155555554"
+      "encryption_key": "ms_key_hex_155555554"
     },
     {
       "id": "00000000-0000-0000-0000-000000000018",
       "name": "MultiStream-Group-8",
-      "mode": "multistream",
       "transport": "boards",
       "urls": [
         "https://boards.example.com/doc/ch8/part_1",
@@ -118,7 +110,7 @@
         "https://boards.example.com/doc/ch8/part_4"
       ],
       "codec": "batched",
-      "encryption_key": "ms_key_177777776"
+      "encryption_key": "ms_key_hex_177777776"
     }
   ]
 }

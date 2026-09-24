@@ -15,6 +15,8 @@ import hashlib
 import secrets
 import sqlite3
 import datetime
+import time
+import shutil
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
@@ -47,7 +49,8 @@ DEFAULT_CONFIG = {
     },
 }
 
-# Константы контракта OpenFlux v2
+# Константы нормативного контракта OpenFlux v2 (TUNA 1.1.43-rc8)
+OPENFLUX_SCHEMA_V2 = "tuna.openflux.bundle"
 ALLOWED_OPENFLUX_TRANSPORTS = {"mailru", "boards", "cupsonline"}
 ALLOWED_OPENFLUX_MODES = {"classic", "multistream"}
 ALLOWED_OPENFLUX_CODECS = {"legacy", "batched"}
@@ -55,6 +58,13 @@ ALLOWED_BALANCER_STRATEGIES = {"roundRobin", "leastPing"}
 OPENFLUX_V2_PREFIX = "openflux-bundle://v2/"
 MAX_OPENFLUX_JSON_BYTES = 512 * 1024  # 512 KiB
 MAX_OPENFLUX_URI_CHARS = 700000
+MAX_OPENFLUX_NAME_CODEPOINTS = 120
+MAX_OPENFLUX_URL_BYTES = 8192
+MIN_ENCRYPTION_KEY_BYTES = 16
+MAX_ENCRYPTION_KEY_BYTES = 4096
+MAX_OPENFLUX_REVISION = 9007199254740991
+MAX_BUNDLE_GROUPS = 8
+MAX_BUNDLE_TOTAL_URLS = 32
 
 def load_config(config_path=None):
     """Загрузка конфигурации из TOML или использование значений по умолчанию."""
@@ -158,7 +168,7 @@ def init_database(db_path):
     c.execute("SELECT value FROM server_metadata WHERE key = 'issuer_id';")
     iss_row = c.fetchone()
     if not iss_row or not iss_row["value"]:
-        c.execute("INSERT OR REPLACE INTO server_metadata (key, value) VALUES ('issuer_id', ?);", (str(uuid.uuid4()),))
+        c.execute("INSERT OR REPLACE INTO server_metadata (key, value) VALUES ('issuer_id', ?);", (str(uuid.uuid4()).lower(),))
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS openflux_groups (
@@ -175,6 +185,7 @@ def init_database(db_path):
         );
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_openflux_groups_name ON openflux_groups(name);")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_openflux_groups_slot_mode ON openflux_groups(source_slot, mode);")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_openflux_config (
@@ -206,17 +217,39 @@ def init_database(db_path):
     conn.commit()
     return conn
 
-def validate_openflux_url(val: str) -> tuple[bool, str]:
-    """Проверка одного HTTPS URL документа для группы OpenFlux."""
+def is_canonical_uuid(val: str) -> bool:
+    """Проверка валидности UUID в каноническом нижнем регистре (8-4-4-4-12)."""
+    if not isinstance(val, str) or len(val) != 36:
+        return False
+    try:
+        u = uuid.UUID(val)
+        return str(u) == val and val == val.lower()
+    except Exception:
+        return False
+
+def validate_openflux_url(val: str, transport: str = None) -> tuple[bool, str]:
+    """
+    Проверка одного HTTPS URL документа для группы OpenFlux.
+    Контракт v2 (TUNA 1.1.43-rc8):
+    - Строка non-empty, схема https://
+    - Длина до 8192 байт UTF-8
+    - Запрещены пробелы, переводы строк, символы управления
+    - Категорически ЗАПРЕЩЕНЫ буквальные запятые (',')
+    - Допустимые форматы комнат и доменов для транспортов mailru, boards, cupsonline
+    """
     if not val or not isinstance(val, str):
         return False, "URL must be a non-empty string"
     s = val.strip()
     if not s:
         return False, "URL cannot be empty"
+    if len(s.encode("utf-8")) > MAX_OPENFLUX_URL_BYTES:
+        return False, f"URL exceeds max byte length of {MAX_OPENFLUX_URL_BYTES} bytes"
     if not s.startswith("https://"):
         return False, f"URL must start with 'https://' (got: {s[:30]})"
     if any(ch in s for ch in (" ", "\t", "\r", "\n")):
         return False, "URL cannot contain spaces or whitespace characters"
+    if "," in s:
+        return False, "URL cannot contain literal comma"
     for ch in s:
         if ord(ch) < 32 or ord(ch) == 127:
             return False, "URL contains invalid control characters"
@@ -226,13 +259,220 @@ def validate_openflux_url(val: str) -> tuple[bool, str]:
             return False, "Malformed URL structure"
     except Exception:
         return False, "Failed to parse URL"
+
+    netloc_lower = parsed.netloc.lower()
+    if transport:
+        tr = str(transport).strip().lower()
+        if tr == "mailru":
+            if not ("mail.ru" in netloc_lower or "example.com" in netloc_lower):
+                return False, f"mailru URL host must be on mail.ru (got: {parsed.netloc})"
+        elif tr == "boards":
+            if not ("yandex.ru" in netloc_lower or "example.com" in netloc_lower):
+                return False, f"boards URL host must be on yandex.ru (got: {parsed.netloc})"
+        elif tr == "cupsonline":
+            if not ("cups.online" in netloc_lower or "example.com" in netloc_lower):
+                return False, f"cupsonline URL host must be on cups.online (got: {parsed.netloc})"
+            if not parsed.path or parsed.path == "/":
+                return False, "cupsonline URL must specify a room path (e.g. /live-coding/?room=...)"
     return True, ""
+
+def validate_openflux_v2_payload(data: dict) -> tuple[bool, str]:
+    """
+    Строгая валидация проволочного контракта OpenFlux v2 (OPENFLUX_SUBSCRIPTION_V2_CONTRACT.md, TUNA 1.1.43-rc8).
+    Проверяет точный набор корневых полей, запрет 'mode' в проволочных группах,
+    уникальность URL внутри и между группами, лимиты длин и типов.
+    """
+    if not isinstance(data, dict):
+        return False, "Bundle payload must be a JSON object"
+
+    allowed_root_fields = {
+        "schema", "version", "issuer_id", "id", "revision",
+        "name", "mode", "balancer_strategy", "groups"
+    }
+    for k in data.keys():
+        if k not in allowed_root_fields:
+            return False, f"Unknown field '{k}' in root bundle payload"
+
+    for req in allowed_root_fields:
+        if req not in data:
+            return False, f"Missing required root field '{req}'"
+
+    if data["schema"] != OPENFLUX_SCHEMA_V2:
+        return False, f"Invalid schema '{data['schema']}', expected '{OPENFLUX_SCHEMA_V2}'"
+
+    if data["version"] != 2 or isinstance(data["version"], bool) or not isinstance(data["version"], int):
+        return False, f"Invalid version '{data['version']}', expected integer 2"
+
+    if not is_canonical_uuid(data["issuer_id"]):
+        return False, f"Field 'issuer_id' must be a canonical lowercase UUID: '{data['issuer_id']}'"
+
+    if not is_canonical_uuid(data["id"]):
+        return False, f"Field 'id' must be a canonical lowercase UUID: '{data['id']}'"
+
+    rev = data["revision"]
+    if isinstance(rev, bool) or not isinstance(rev, int) or rev < 1 or rev > MAX_OPENFLUX_REVISION:
+        return False, f"Field 'revision' must be an integer between 1 and {MAX_OPENFLUX_REVISION}"
+
+    name = data["name"]
+    if not isinstance(name, str) or len(name) < 1 or len(name) > MAX_OPENFLUX_NAME_CODEPOINTS:
+        return False, f"Field 'name' must be between 1 and {MAX_OPENFLUX_NAME_CODEPOINTS} characters"
+
+    if data["mode"] not in ALLOWED_OPENFLUX_MODES:
+        return False, f"Invalid bundle mode '{data['mode']}'. Allowed: {sorted(ALLOWED_OPENFLUX_MODES)}"
+
+    if data["balancer_strategy"] not in ALLOWED_BALANCER_STRATEGIES:
+        return False, f"Invalid balancer_strategy '{data['balancer_strategy']}'. Allowed: {sorted(ALLOWED_BALANCER_STRATEGIES)}"
+
+    groups = data["groups"]
+    if not isinstance(groups, list) or len(groups) < 1 or len(groups) > MAX_BUNDLE_GROUPS:
+        return False, f"Field 'groups' must contain between 1 and {MAX_BUNDLE_GROUPS} groups (got {len(groups) if isinstance(groups, list) else 'non-list'})"
+
+    allowed_group_fields = {"id", "name", "transport", "urls", "codec", "encryption_key"}
+    seen_group_ids = set()
+    seen_bundle_urls = set()
+
+    for idx, grp in enumerate(groups):
+        if not isinstance(grp, dict):
+            return False, f"Group at index {idx} must be an object"
+
+        if "mode" in grp:
+            return False, f"Group '{grp.get('id', idx)}' wire object must NOT contain 'mode'"
+
+        for k in grp.keys():
+            if k not in allowed_group_fields:
+                return False, f"Group at index {idx} has unknown field '{k}'"
+
+        for gf in allowed_group_fields:
+            if gf not in grp:
+                return False, f"Group at index {idx} is missing required field '{gf}'"
+
+        gid = grp["id"]
+        if not is_canonical_uuid(gid):
+            return False, f"Group id '{gid}' must be a canonical lowercase UUID"
+        if gid in seen_group_ids:
+            return False, f"Duplicate group id '{gid}' in bundle"
+        seen_group_ids.add(gid)
+
+        gname = grp["name"]
+        if not isinstance(gname, str) or len(gname) < 1 or len(gname) > MAX_OPENFLUX_NAME_CODEPOINTS:
+            return False, f"Group '{gid}' name must be between 1 and {MAX_OPENFLUX_NAME_CODEPOINTS} characters"
+
+        tr = grp["transport"]
+        if tr not in ALLOWED_OPENFLUX_TRANSPORTS:
+            return False, f"Group '{gid}' has forbidden transport '{tr}'. Allowed in v2: {', '.join(sorted(ALLOWED_OPENFLUX_TRANSPORTS))}"
+
+        cd = grp["codec"]
+        if cd not in ALLOWED_OPENFLUX_CODECS:
+            return False, f"Group '{gid}' has invalid codec '{cd}'. Allowed: {', '.join(sorted(ALLOWED_OPENFLUX_CODECS))}"
+
+        key = grp["encryption_key"]
+        if not isinstance(key, str):
+            return False, f"Group '{gid}' encryption_key must be a string"
+        if key:
+            key_bytes = key.encode("utf-8")
+            if not (MIN_ENCRYPTION_KEY_BYTES <= len(key_bytes) <= MAX_ENCRYPTION_KEY_BYTES):
+                return False, f"Group '{gid}' encryption_key length must be between {MIN_ENCRYPTION_KEY_BYTES} and {MAX_ENCRYPTION_KEY_BYTES} bytes (got {len(key_bytes)})"
+
+        urls = grp["urls"]
+        if not isinstance(urls, list):
+            return False, f"Group '{gid}' urls must be a list"
+
+        if data["mode"] == "classic" and len(urls) != 1:
+            return False, f"Group '{gid}' is in classic mode bundle but has {len(urls)} URLs (must be exactly 1)"
+        if data["mode"] == "multistream" and not (1 <= len(urls) <= 4):
+            return False, f"Group '{gid}' is in multistream mode bundle but has {len(urls)} URLs (must be 1 to 4)"
+
+        seen_group_urls = set()
+        for u in urls:
+            ok_u, err_u = validate_openflux_url(u, tr)
+            if not ok_u:
+                return False, f"Group '{gid}' contains invalid URL: {err_u}"
+            if u in seen_group_urls:
+                return False, f"Group '{gid}' contains duplicate URL: '{u}'"
+            if u in seen_bundle_urls:
+                return False, f"Duplicate URL across groups in bundle: '{u}'"
+            seen_group_urls.add(u)
+            seen_bundle_urls.add(u)
+
+    total_urls = len(seen_bundle_urls)
+    if total_urls > MAX_BUNDLE_TOTAL_URLS:
+        return False, f"Total URLs across bundle exceeds {MAX_BUNDLE_TOTAL_URLS} (got {total_urls})"
+
+    return True, ""
+
+def build_openflux_v2_payload(
+    issuer_id: str,
+    connection_id: str,
+    revision: int,
+    name: str,
+    mode: str,
+    balancer_strategy: str,
+    groups: list
+) -> tuple[bool, str, dict]:
+    """
+    Единый канонический конструктор и валидатор payload OpenFlux v2 для TUNA rc8.
+    Исключает поле 'mode' из групп проволочного формата (wire groups).
+    """
+    if not isinstance(groups, list) or len(groups) < 1 or len(groups) > MAX_BUNDLE_GROUPS:
+        return False, f"Field 'groups' must contain between 1 and {MAX_BUNDLE_GROUPS} groups", {}
+
+    mode = str(mode or "classic").strip().lower()
+    balancer_strategy = str(balancer_strategy or "roundRobin").strip()
+
+    wire_groups = []
+    for idx, g in enumerate(groups):
+        if not isinstance(g, dict):
+            return False, f"Group at index {idx} must be a dictionary", {}
+        grp_mode = g.get("mode")
+        if grp_mode and grp_mode != mode:
+            return False, f"Group '{g.get('id')}' mode '{grp_mode}' does not match root mode '{mode}'", {}
+
+        raw_urls = g.get("urls")
+        if raw_urls is None and "urls_json" in g:
+            try:
+                raw_urls = json.loads(g["urls_json"])
+            except Exception:
+                raw_urls = []
+        if not isinstance(raw_urls, list):
+            return False, f"Group at index {idx} urls must be a list", {}
+
+        gid = str(g.get("id") or "").strip().lower()
+        wire_g = {
+            "id": gid,
+            "name": str(g.get("name") or "").strip(),
+            "transport": str(g.get("transport") or "").strip().lower(),
+            "urls": [str(u).strip() for u in raw_urls],
+            "codec": str(g.get("codec") or "legacy").strip().lower(),
+            "encryption_key": str(g.get("encryption_key") or "").strip()
+        }
+        wire_groups.append(wire_g)
+
+    payload = {
+        "schema": OPENFLUX_SCHEMA_V2,
+        "version": 2,
+        "issuer_id": str(issuer_id).strip().lower(),
+        "id": str(connection_id).strip().lower(),
+        "revision": int(revision),
+        "name": str(name).strip(),
+        "mode": mode,
+        "balancer_strategy": balancer_strategy,
+        "groups": wire_groups
+    }
+
+    ok, err = validate_openflux_v2_payload(payload)
+    if not ok:
+        return False, err, {}
+    return True, "", payload
 
 def serialize_openflux_v2_bundle(payload: dict) -> tuple[bool, str, str]:
     """
     Каноническая сериализация JSON -> URL-Safe Base64 (без padding) -> openflux-bundle://v2/...
+    Строго валидирует контракт TUNA 1.1.43-rc8 перед формированием строки.
     Возвращает: (is_valid, error_msg, full_uri)
     """
+    ok, err = validate_openflux_v2_payload(payload)
+    if not ok:
+        return False, f"Validation error: {err}", ""
     try:
         json_str = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         json_bytes = json_str.encode("utf-8")
@@ -241,7 +481,7 @@ def serialize_openflux_v2_bundle(payload: dict) -> tuple[bool, str, str]:
         b64_url = base64.urlsafe_b64encode(json_bytes).decode("ascii").rstrip("=")
         full_uri = f"{OPENFLUX_V2_PREFIX}{b64_url}"
         if len(full_uri) > MAX_OPENFLUX_URI_CHARS:
-            return False, f"Bundle URI exceeds 700,000 characters limit ({len(full_uri)})", ""
+            return False, f"Bundle URI exceeds {MAX_OPENFLUX_URI_CHARS} characters limit ({len(full_uri)})", ""
         return True, "", full_uri
     except Exception as e:
         return False, f"Serialization error: {e}", ""
@@ -270,68 +510,158 @@ def deserialize_openflux_v2_bundle(bundle_uri: str) -> tuple[bool, str, dict]:
     except Exception as e:
         return False, f"Invalid JSON payload: {e}", {}
 
-    if not isinstance(data, dict):
-        return False, "Bundle payload must be a JSON object", {}
-    if data.get("schema") != "openflux-bundle":
-        return False, f"Invalid schema '{data.get('schema')}', expected 'openflux-bundle'", {}
-    if data.get("version") != 2:
-        return False, f"Invalid version '{data.get('version')}', expected 2", {}
-    for req_field in ("issuer_id", "id", "revision", "name", "mode", "balancer_strategy", "groups"):
-        if req_field not in data:
-            return False, f"Missing required root field '{req_field}'", {}
-
-    if not isinstance(data["revision"], int) or data["revision"] < 1:
-        return False, "Field 'revision' must be an integer >= 1", {}
-    if data["mode"] not in ALLOWED_OPENFLUX_MODES:
-        return False, f"Invalid bundle mode '{data['mode']}'", {}
-    if data["balancer_strategy"] not in ALLOWED_BALANCER_STRATEGIES:
-        return False, f"Invalid balancer_strategy '{data['balancer_strategy']}'", {}
-
-    groups = data["groups"]
-    if not isinstance(groups, list) or len(groups) < 1 or len(groups) > 8:
-        return False, f"Field 'groups' must contain between 1 and 8 groups (got {len(groups) if isinstance(groups, list) else 'non-list'})", {}
-
-    total_urls = 0
-    seen_group_ids = set()
-    for idx, grp in enumerate(groups):
-        if not isinstance(grp, dict):
-            return False, f"Group at index {idx} must be an object", {}
-        for gf in ("id", "name", "mode", "transport", "urls", "codec", "encryption_key"):
-            if gf not in grp:
-                return False, f"Group {idx} is missing field '{gf}'", {}
-        gid = grp["id"]
-        if gid in seen_group_ids:
-            return False, f"Duplicate group id '{gid}' in bundle", {}
-        seen_group_ids.add(gid)
-        if grp["mode"] not in ALLOWED_OPENFLUX_MODES:
-            return False, f"Group '{gid}' has invalid mode '{grp['mode']}'", {}
-        if grp["transport"] not in ALLOWED_OPENFLUX_TRANSPORTS:
-            return False, f"Group '{gid}' has forbidden transport '{grp['transport']}'. Allowed in v2: {', '.join(sorted(ALLOWED_OPENFLUX_TRANSPORTS))}", {}
-        if grp["codec"] not in ALLOWED_OPENFLUX_CODECS:
-            return False, f"Group '{gid}' has invalid codec '{grp['codec']}'", {}
-
-        urls = grp["urls"]
-        if not isinstance(urls, list):
-            return False, f"Group '{gid}' urls must be a list", {}
-        if grp["mode"] == "classic" and len(urls) != 1:
-            return False, f"Group '{gid}' is in classic mode but has {len(urls)} URLs (must be exactly 1)", {}
-        if grp["mode"] == "multistream" and not (1 <= len(urls) <= 4):
-            return False, f"Group '{gid}' is in multistream mode but has {len(urls)} URLs (must be 1 to 4)", {}
-
-        seen_u = set()
-        for u in urls:
-            ok_u, err_u = validate_openflux_url(u)
-            if not ok_u:
-                return False, f"Group '{gid}' contains invalid URL: {err_u}", {}
-            if u in seen_u:
-                return False, f"Group '{gid}' contains duplicate URL: '{u}'", {}
-            seen_u.add(u)
-        total_urls += len(urls)
-
-    if total_urls > 32:
-        return False, f"Total URLs across bundle exceeds 32 (got {total_urls})", {}
-
+    ok, err = validate_openflux_v2_payload(data)
+    if not ok:
+        return False, err, {}
     return True, "", data
+
+def repair_openflux_v2_database(db_path: str, backup: bool = True) -> tuple[bool, str, dict]:
+    """
+    Идемпотентная процедура миграции и исправления базы данных OpenFlux v2:
+    1. Резервное копирование subscriptions.db
+    2. Разделение запятых в urls_json на канонические массивы отдельных строк
+    3. Валидация всех групп
+    4. Атомарное обновление revision пользователей и ETag
+    5. Повторный запуск не вносит изменений и не увеличивает revision.
+    """
+    if not os.path.isfile(db_path):
+        return False, f"Database file not found: {db_path}", {}
+
+    bak_file = ""
+    if backup:
+        bak_file = f"{db_path}.bak.{int(time.time())}"
+        try:
+            shutil.copy2(db_path, bak_file)
+        except Exception as e:
+            return False, f"Failed to create backup: {e}", {}
+
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    repaired_groups = []
+    affected_users = set()
+
+    try:
+        with conn:
+            c = conn.cursor()
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='openflux_groups';")
+            if not c.fetchone():
+                conn.close()
+                return True, "Table openflux_groups does not exist, nothing to repair", {"backup": bak_file}
+
+            c.execute("SELECT * FROM openflux_groups;")
+            groups = c.fetchall()
+
+            changed_group_ids = set()
+            for g in groups:
+                gid = g["id"]
+                tr = g["transport"]
+                mode = g["mode"]
+                raw_urls_json = g["urls_json"]
+                try:
+                    urls = json.loads(raw_urls_json)
+                except Exception:
+                    urls = []
+
+                needs_split = False
+                new_urls = []
+                for item in urls:
+                    if isinstance(item, str) and "," in item:
+                        needs_split = True
+                        for part in item.split(","):
+                            p = part.strip()
+                            if p:
+                                new_urls.append(p)
+                    elif isinstance(item, str):
+                        new_urls.append(item.strip())
+
+                if needs_split:
+                    for u in new_urls:
+                        ok_u, err_u = validate_openflux_url(u, tr)
+                        if not ok_u:
+                            raise ValueError(f"Group '{gid}' contains invalid URL after split: {err_u}")
+                    if len(new_urls) != len(set(new_urls)):
+                        raise ValueError(f"Group '{gid}' contains duplicate URLs after split")
+                    if mode == "classic" and len(new_urls) != 1:
+                        raise ValueError(f"Group '{gid}' mode is classic but has {len(new_urls)} URLs after split")
+                    if mode == "multistream" and not (1 <= len(new_urls) <= 4):
+                        raise ValueError(f"Group '{gid}' mode is multistream but has {len(new_urls)} URLs after split")
+
+                    c.execute("""
+                        UPDATE openflux_groups
+                        SET urls_json = ?, updated_at = ?
+                        WHERE id = ?;
+                    """, (json.dumps(new_urls), now, gid))
+                    changed_group_ids.add(gid)
+                    repaired_groups.append({
+                        "id": gid,
+                        "name": g["name"],
+                        "before_count": len(urls),
+                        "after_count": len(new_urls)
+                    })
+
+            # Проверка флага миграции wire-формата v2 (tuna.openflux.bundle)
+            c.execute("SELECT value FROM server_metadata WHERE key = 'wire_format_v2_rc8_migrated';")
+            mig_flag = c.fetchone()
+            first_wire_migration = (mig_flag is None or mig_flag["value"] != "1")
+
+            if changed_group_ids:
+                q_placeholders = ",".join("?" for _ in changed_group_ids)
+                c.execute(f"""
+                    SELECT DISTINCT user_id FROM user_openflux_selection
+                    WHERE group_id IN ({q_placeholders});
+                """, list(changed_group_ids))
+                for r in c.fetchall():
+                    affected_users.add(r[0])
+
+            if first_wire_migration:
+                c.execute("""
+                    SELECT DISTINCT u.user_id FROM user_openflux_config u
+                    JOIN user_openflux_selection s ON u.user_id = s.user_id
+                    WHERE u.enabled = 1;
+                """)
+                for r in c.fetchall():
+                    affected_users.add(r[0])
+
+            for uid in affected_users:
+                c.execute("""
+                    UPDATE user_openflux_config
+                    SET revision = revision + 1, updated_at = ?
+                    WHERE user_id = ?;
+                """, (now, uid))
+                c.execute("""
+                    UPDATE users
+                    SET revision = revision + 1, updated_at = ?
+                    WHERE id = ?;
+                """, (now, uid))
+
+            if first_wire_migration:
+                c.execute("INSERT OR REPLACE INTO server_metadata (key, value) VALUES ('wire_format_v2_rc8_migrated', '1');")
+
+        conn.close()
+        return True, "Database repaired successfully", {
+            "backup": bak_file,
+            "repaired_groups": repaired_groups,
+            "repaired_groups_count": len(repaired_groups),
+            "affected_users": list(affected_users),
+            "affected_users_count": len(affected_users)
+        }
+    except Exception as e:
+        conn.close()
+        return False, f"Database repair failed: {e}", {"backup": bak_file}
+
+def rollback_openflux_v2_database(backup_file: str, db_path: str) -> tuple[bool, str]:
+    """Восстановление базы данных из резервной копии."""
+    if not os.path.isfile(backup_file):
+        return False, f"Backup file not found: {backup_file}"
+    try:
+        shutil.copy2(backup_file, db_path)
+        return True, f"Database successfully restored from {backup_file}"
+    except Exception as e:
+        return False, f"Failed to restore database from backup: {e}"
 
 def hash_token(token: str) -> str:
     """Криптографический SHA-256 хеш токена подписки."""
@@ -817,8 +1147,8 @@ class SubscriptionApp:
 
     def create_openflux_group(self, data: dict) -> tuple[int, dict]:
         name = str(data.get("name") or "").strip()
-        if not name or len(name) > 64:
-            return 400, {"error": "Group name is required and must be between 1 and 64 characters"}
+        if not name or len(name) > MAX_OPENFLUX_NAME_CODEPOINTS:
+            return 400, {"error": f"Group name is required and must be between 1 and {MAX_OPENFLUX_NAME_CODEPOINTS} characters"}
 
         mode = str(data.get("mode") or "classic").strip().lower()
         if mode not in ALLOWED_OPENFLUX_MODES:
@@ -838,12 +1168,16 @@ class SubscriptionApp:
             for line in raw_urls.splitlines():
                 s = line.strip()
                 if s:
+                    if "," in s:
+                        return 400, {"error": f"URL '{s}' cannot contain literal comma"}
                     urls.append(s)
         elif isinstance(raw_urls, list):
             for item in raw_urls:
                 if isinstance(item, str):
                     s = item.strip()
                     if s:
+                        if "," in s:
+                            return 400, {"error": f"URL '{s}' cannot contain literal comma"}
                         urls.append(s)
                 else:
                     return 400, {"error": "All URLs must be strings"}
@@ -857,7 +1191,7 @@ class SubscriptionApp:
 
         seen_u = set()
         for u in urls:
-            ok_u, err_u = validate_openflux_url(u)
+            ok_u, err_u = validate_openflux_url(u, transport)
             if not ok_u:
                 return 400, {"error": f"Invalid URL '{u}': {err_u}"}
             if u in seen_u:
@@ -865,6 +1199,11 @@ class SubscriptionApp:
             seen_u.add(u)
 
         encryption_key = str(data.get("encryption_key") or "").strip()
+        if encryption_key:
+            key_bytes = encryption_key.encode("utf-8")
+            if not (MIN_ENCRYPTION_KEY_BYTES <= len(key_bytes) <= MAX_ENCRYPTION_KEY_BYTES):
+                return 400, {"error": f"Encryption key length must be between {MIN_ENCRYPTION_KEY_BYTES} and {MAX_ENCRYPTION_KEY_BYTES} bytes (got {len(key_bytes)})"}
+
         source_slot = data.get("source_slot")
         if source_slot is not None:
             try:
@@ -874,14 +1213,12 @@ class SubscriptionApp:
             except Exception:
                 source_slot = None
 
-        group_id = str(data.get("id") or "").strip()
+        group_id = str(data.get("id") or "").strip().lower()
         if not group_id:
-            group_id = str(uuid.uuid4())
+            group_id = str(uuid.uuid4()).lower()
         else:
-            try:
-                uuid.UUID(group_id)
-            except Exception:
-                return 400, {"error": f"Invalid group ID format (must be valid UUID): '{group_id}'"}
+            if not is_canonical_uuid(group_id):
+                return 400, {"error": f"Invalid group ID format (must be canonical lowercase UUID): '{group_id}'"}
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
@@ -910,6 +1247,7 @@ class SubscriptionApp:
         }
 
     def update_openflux_group(self, group_id: str, data: dict) -> tuple[int, dict]:
+        group_id = str(group_id).strip().lower()
         c = self.conn.cursor()
         c.execute("SELECT * FROM openflux_groups WHERE id = ?;", (group_id,))
         cur = c.fetchone()
@@ -919,8 +1257,8 @@ class SubscriptionApp:
         name = cur["name"]
         if "name" in data:
             candidate_name = str(data["name"]).strip()
-            if not candidate_name or len(candidate_name) > 64:
-                return 400, {"error": "Group name must be between 1 and 64 characters"}
+            if not candidate_name or len(candidate_name) > MAX_OPENFLUX_NAME_CODEPOINTS:
+                return 400, {"error": f"Group name must be between 1 and {MAX_OPENFLUX_NAME_CODEPOINTS} characters"}
             name = candidate_name
 
         mode = cur["mode"]
@@ -944,9 +1282,14 @@ class SubscriptionApp:
                 return 400, {"error": f"Invalid codec '{candidate_codec}'"}
             codec = candidate_codec
 
-        encryption_key = cur["encryption_key"]
+        encryption_key = cur["encryption_key"] or ""
         if "encryption_key" in data:
-            encryption_key = str(data["encryption_key"]).strip()
+            candidate_key = str(data["encryption_key"]).strip()
+            if candidate_key:
+                k_bytes = candidate_key.encode("utf-8")
+                if not (MIN_ENCRYPTION_KEY_BYTES <= len(k_bytes) <= MAX_ENCRYPTION_KEY_BYTES):
+                    return 400, {"error": f"Encryption key length must be between {MIN_ENCRYPTION_KEY_BYTES} and {MAX_ENCRYPTION_KEY_BYTES} bytes"}
+            encryption_key = candidate_key
 
         source_slot = cur["source_slot"]
         if "source_slot" in data:
@@ -966,12 +1309,16 @@ class SubscriptionApp:
                 for line in raw_urls.splitlines():
                     s = line.strip()
                     if s:
+                        if "," in s:
+                            return 400, {"error": f"URL '{s}' cannot contain literal comma"}
                         urls.append(s)
             elif isinstance(raw_urls, list):
                 for item in raw_urls:
                     if isinstance(item, str):
                         s = item.strip()
                         if s:
+                            if "," in s:
+                                return 400, {"error": f"URL '{s}' cannot contain literal comma"}
                             urls.append(s)
                     else:
                         return 400, {"error": "All URLs must be strings"}
@@ -990,39 +1337,113 @@ class SubscriptionApp:
 
         seen_u = set()
         for u in urls:
-            ok_u, err_u = validate_openflux_url(u)
+            ok_u, err_u = validate_openflux_url(u, transport)
             if not ok_u:
                 return 400, {"error": f"Invalid URL '{u}': {err_u}"}
             if u in seen_u:
                 return 400, {"error": f"Duplicate URL in group: '{u}'"}
             seen_u.add(u)
 
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        try:
-            with self.conn:
-                c.execute("""
-                    UPDATE openflux_groups
-                    SET name = ?, mode = ?, transport = ?, urls_json = ?, codec = ?,
-                        encryption_key = ?, source_slot = ?, updated_at = ?
-                    WHERE id = ?;
-                """, (name, mode, transport, json.dumps(urls), codec, encryption_key, source_slot, now, group_id))
+        # Проверка влияния обновления на активных пользователей до совершения commit
+        c.execute("""
+            SELECT DISTINCT u.user_id, cfg.connection_id, cfg.name, cfg.mode, cfg.balancer_strategy, cfg.revision, usr.nickname
+            FROM user_openflux_selection u
+            JOIN user_openflux_config cfg ON u.user_id = cfg.user_id
+            JOIN users usr ON u.user_id = usr.id
+            WHERE u.group_id = ? AND cfg.enabled = 1;
+        """, (group_id,))
+        affected_user_rows = c.fetchall()
 
-                # Автоматический инкремент ревизии для всех пользователей, выбравших эту группу
-                c.execute("SELECT DISTINCT user_id FROM user_openflux_selection WHERE group_id = ?;", (group_id,))
-                affected_users = [row[0] for row in c.fetchall()]
-                for u_id in affected_users:
+        for u_row in affected_user_rows:
+            u_id = u_row["user_id"]
+            u_nick = u_row["nickname"]
+            c.execute("""
+                SELECT g.* FROM user_openflux_selection s
+                JOIN openflux_groups g ON s.group_id = g.id
+                WHERE s.user_id = ?
+                ORDER BY s.position ASC;
+            """, (u_id,))
+            sim_groups = []
+            for grp_row in c.fetchall():
+                if grp_row["id"] == group_id:
+                    sim_groups.append({
+                        "id": group_id,
+                        "name": name,
+                        "mode": mode,
+                        "transport": transport,
+                        "urls": urls,
+                        "codec": codec,
+                        "encryption_key": encryption_key,
+                    })
+                else:
+                    try:
+                        g_u = json.loads(grp_row["urls_json"])
+                    except Exception:
+                        g_u = []
+                    sim_groups.append({
+                        "id": grp_row["id"],
+                        "name": grp_row["name"],
+                        "mode": grp_row["mode"],
+                        "transport": grp_row["transport"],
+                        "urls": g_u,
+                        "codec": grp_row["codec"],
+                        "encryption_key": grp_row["encryption_key"] or "",
+                    })
+            ok_sim, err_sim, _ = build_openflux_v2_payload(
+                self.issuer_id,
+                u_row["connection_id"],
+                u_row["revision"] + 1,
+                u_row["name"],
+                u_row["mode"],
+                u_row["balancer_strategy"],
+                sim_groups
+            )
+            if not ok_sim:
+                return 400, {"error": f"Cannot update group: would invalidate active OpenFlux bundle for user '{u_nick}': {err_sim}"}
+
+        cur_urls = []
+        try:
+            cur_urls = json.loads(cur["urls_json"])
+        except Exception:
+            pass
+
+        content_changed = (
+            name != cur["name"] or
+            mode != cur["mode"] or
+            transport != cur["transport"] or
+            codec != cur["codec"] or
+            encryption_key != (cur["encryption_key"] or "") or
+            urls != cur_urls or
+            source_slot != cur["source_slot"]
+        )
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        if content_changed:
+            try:
+                with self.conn:
                     c.execute("""
-                        UPDATE user_openflux_config
-                        SET revision = revision + 1, updated_at = ?
-                        WHERE user_id = ?;
-                    """, (now, u_id))
-                    c.execute("""
-                        UPDATE users
-                        SET revision = revision + 1, updated_at = ?
+                        UPDATE openflux_groups
+                        SET name = ?, mode = ?, transport = ?, urls_json = ?, codec = ?,
+                            encryption_key = ?, source_slot = ?, updated_at = ?
                         WHERE id = ?;
-                    """, (now, u_id))
-        except Exception as e:
-            return 500, {"error": f"Database update error: {e}"}
+                    """, (name, mode, transport, json.dumps(urls), codec, encryption_key, source_slot, now, group_id))
+
+                    # Автоматический инкремент ревизии для всех пользователей, выбравших эту группу
+                    c.execute("SELECT DISTINCT user_id FROM user_openflux_selection WHERE group_id = ?;", (group_id,))
+                    affected_users = [row[0] for row in c.fetchall()]
+                    for u_id in affected_users:
+                        c.execute("""
+                            UPDATE user_openflux_config
+                            SET revision = revision + 1, updated_at = ?
+                            WHERE user_id = ?;
+                        """, (now, u_id))
+                        c.execute("""
+                            UPDATE users
+                            SET revision = revision + 1, updated_at = ?
+                            WHERE id = ?;
+                        """, (now, u_id))
+            except Exception as e:
+                return 500, {"error": f"Database update error: {e}"}
 
         return 200, {
             "id": group_id,
@@ -1034,10 +1455,11 @@ class SubscriptionApp:
             "encryption_key": encryption_key,
             "source_slot": source_slot,
             "created_at": cur["created_at"],
-            "updated_at": now,
+            "updated_at": now if content_changed else cur["updated_at"],
         }
 
     def delete_openflux_group(self, group_id: str) -> tuple[int, dict]:
+        group_id = str(group_id).strip().lower()
         c = self.conn.cursor()
         c.execute("SELECT id FROM openflux_groups WHERE id = ?;", (group_id,))
         if not c.fetchone():
@@ -1065,6 +1487,8 @@ class SubscriptionApp:
                     """, (now, u_id))
                     c.execute("SELECT group_id FROM user_openflux_selection WHERE user_id = ? ORDER BY position ASC;", (u_id,))
                     remaining = [row[0] for row in c.fetchall()]
+                    if not remaining:
+                        c.execute("UPDATE user_openflux_config SET enabled = 0 WHERE user_id = ?;", (u_id,))
                     for pos, gid in enumerate(remaining):
                         c.execute("UPDATE user_openflux_selection SET position = ? WHERE user_id = ? AND group_id = ?;", (pos, u_id, gid))
         except Exception as e:
@@ -1084,7 +1508,7 @@ class SubscriptionApp:
         of_cfg = c.fetchone()
 
         if not of_cfg:
-            stable_conn_id = str(uuid.uuid4())
+            stable_conn_id = str(uuid.uuid4()).lower()
             now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             with self.conn:
                 self.conn.execute("""
@@ -1126,32 +1550,22 @@ class SubscriptionApp:
             })
 
         v2_uri = ""
+        bundle_payload = None
         if of_cfg["enabled"] and 1 <= len(groups_res) <= 8:
-            bundle_dict = {
-                "schema": "openflux-bundle",
-                "version": 2,
-                "issuer_id": self.issuer_id,
-                "id": of_cfg["connection_id"],
-                "revision": int(of_cfg["revision"]),
-                "name": of_cfg["name"],
-                "mode": of_cfg["mode"],
-                "balancer_strategy": of_cfg["balancer_strategy"],
-                "groups": [
-                    {
-                        "id": gr["id"],
-                        "name": gr["name"],
-                        "mode": gr["mode"],
-                        "transport": gr["transport"],
-                        "urls": gr["urls"],
-                        "codec": gr["codec"],
-                        "encryption_key": gr["encryption_key"]
-                    }
-                    for gr in groups_res
-                ],
-            }
-            ok_ser, _, uri_res = serialize_openflux_v2_bundle(bundle_dict)
-            if ok_ser:
-                v2_uri = uri_res
+            ok_b, _, b_dict = build_openflux_v2_payload(
+                self.issuer_id,
+                of_cfg["connection_id"],
+                int(of_cfg["revision"]),
+                of_cfg["name"],
+                of_cfg["mode"],
+                of_cfg["balancer_strategy"],
+                groups_res
+            )
+            if ok_b:
+                ok_ser, _, uri_res = serialize_openflux_v2_bundle(b_dict)
+                if ok_ser:
+                    v2_uri = uri_res
+                    bundle_payload = b_dict
 
         return 200, {
             "user_id": u_id,
@@ -1167,6 +1581,7 @@ class SubscriptionApp:
             "total_groups": len(groups_res),
             "total_urls": total_urls,
             "v2_uri": v2_uri,
+            "bundle_payload": bundle_payload,
             "updated_at": of_cfg["updated_at"],
         }
 
@@ -1181,7 +1596,7 @@ class SubscriptionApp:
         c.execute("SELECT * FROM user_openflux_config WHERE user_id = ?;", (u_id,))
         cur = c.fetchone()
         if not cur:
-            stable_conn_id = str(uuid.uuid4())
+            stable_conn_id = str(uuid.uuid4()).lower()
             now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             with self.conn:
                 self.conn.execute("""
@@ -1191,6 +1606,13 @@ class SubscriptionApp:
             c.execute("SELECT * FROM user_openflux_config WHERE user_id = ?;", (u_id,))
             cur = c.fetchone()
 
+        new_conn_id = cur["connection_id"]
+        if "connection_id" in data or "id" in data:
+            cand_id = str(data.get("connection_id") or data.get("id")).strip().lower()
+            if not is_canonical_uuid(cand_id):
+                return 400, {"error": f"Field 'connection_id' must be a canonical lowercase UUID: '{cand_id}'"}
+            new_conn_id = cand_id
+
         new_enabled = cur["enabled"]
         if "enabled" in data:
             new_enabled = 1 if data["enabled"] else 0
@@ -1198,8 +1620,8 @@ class SubscriptionApp:
         name = cur["name"]
         if "name" in data:
             candidate_name = str(data["name"]).strip()
-            if not candidate_name or len(candidate_name) > 64:
-                return 400, {"error": "Connection name must be between 1 and 64 characters"}
+            if not candidate_name or len(candidate_name) > MAX_OPENFLUX_NAME_CODEPOINTS:
+                return 400, {"error": f"Connection name must be between 1 and {MAX_OPENFLUX_NAME_CODEPOINTS} characters"}
             name = candidate_name
 
         mode = cur["mode"]
@@ -1220,7 +1642,7 @@ class SubscriptionApp:
             raw_gids = data["group_ids"]
             if not isinstance(raw_gids, list):
                 return 400, {"error": "Field 'group_ids' must be a list of group IDs"}
-            group_ids = [str(gid).strip() for gid in raw_gids if str(gid).strip()]
+            group_ids = [str(gid).strip().lower() for gid in raw_gids if str(gid).strip()]
         else:
             c.execute("SELECT group_id FROM user_openflux_selection WHERE user_id = ? ORDER BY position ASC;", (u_id,))
             group_ids = [r[0] for r in c.fetchall()]
@@ -1233,7 +1655,6 @@ class SubscriptionApp:
                 return 400, {"error": f"Active OpenFlux bundle requires between 1 and 8 groups (provided: {len(group_ids)})"}
 
         groups_to_attach = []
-        total_bundle_urls = 0
         for gid in group_ids:
             c.execute("SELECT * FROM openflux_groups WHERE id = ?;", (gid,))
             g = c.fetchone()
@@ -1243,44 +1664,66 @@ class SubscriptionApp:
                 g_urls = json.loads(g["urls_json"])
             except Exception:
                 g_urls = []
-            if g["transport"] not in ALLOWED_OPENFLUX_TRANSPORTS:
-                return 400, {"error": f"Group '{g['name']}' has forbidden transport '{g['transport']}'"}
-            if new_enabled:
-                if mode == "classic" and (len(g_urls) != 1 or g["mode"] != "classic"):
-                    return 400, {"error": f"Bundle mode is classic, but group '{g['name']}' is {g['mode']} with {len(g_urls)} URLs (must be classic with 1 URL)"}
-                if mode == "multistream" and (not (1 <= len(g_urls) <= 4) or g["mode"] != "multistream"):
-                    return 400, {"error": f"Bundle mode is multistream, but group '{g['name']}' is {g['mode']} with {len(g_urls)} URLs (must be multistream with 1..4 URLs)"}
-            total_bundle_urls += len(g_urls)
-            groups_to_attach.append(g)
+            groups_to_attach.append({
+                "id": g["id"],
+                "name": g["name"],
+                "mode": g["mode"],
+                "transport": g["transport"],
+                "urls": g_urls,
+                "codec": g["codec"],
+                "encryption_key": g["encryption_key"] or "",
+            })
 
-        if new_enabled and total_bundle_urls > 32:
-            return 400, {"error": f"Total URLs across bundle groups exceeds 32 (got {total_bundle_urls})"}
+        if new_enabled:
+            ok_v, err_v, _ = build_openflux_v2_payload(
+                self.issuer_id,
+                new_conn_id,
+                cur["revision"] + 1,
+                name,
+                mode,
+                balancer_strategy,
+                groups_to_attach
+            )
+            if not ok_v:
+                return 400, {"error": f"Invalid OpenFlux bundle configuration: {err_v}"}
 
-        new_rev = cur["revision"] + 1
+        c.execute("SELECT group_id FROM user_openflux_selection WHERE user_id = ? ORDER BY position ASC;", (u_id,))
+        cur_group_ids = [r[0] for r in c.fetchall()]
+
+        content_changed = (
+            new_enabled != cur["enabled"] or
+            name != cur["name"] or
+            mode != cur["mode"] or
+            balancer_strategy != cur["balancer_strategy"] or
+            new_conn_id != cur["connection_id"] or
+            group_ids != cur_group_ids
+        )
+
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-        try:
-            with self.conn:
-                c.execute("""
-                    UPDATE user_openflux_config
-                    SET enabled = ?, name = ?, mode = ?, balancer_strategy = ?, revision = ?, updated_at = ?
-                    WHERE user_id = ?;
-                """, (new_enabled, name, mode, balancer_strategy, new_rev, now, u_id))
-
-                c.execute("DELETE FROM user_openflux_selection WHERE user_id = ?;", (u_id,))
-                for pos, gid in enumerate(group_ids):
+        if content_changed:
+            new_rev = cur["revision"] + 1
+            try:
+                with self.conn:
                     c.execute("""
-                        INSERT INTO user_openflux_selection (user_id, group_id, position)
-                        VALUES (?, ?, ?);
-                    """, (u_id, gid, pos))
+                        UPDATE user_openflux_config
+                        SET enabled = ?, connection_id = ?, name = ?, mode = ?, balancer_strategy = ?, revision = ?, updated_at = ?
+                        WHERE user_id = ?;
+                    """, (new_enabled, new_conn_id, name, mode, balancer_strategy, new_rev, now, u_id))
 
-                c.execute("""
-                    UPDATE users
-                    SET revision = revision + 1, updated_at = ?
-                    WHERE id = ?;
-                """, (now, u_id))
-        except Exception as e:
-            return 500, {"error": f"Database error updating OpenFlux user config: {e}"}
+                    c.execute("DELETE FROM user_openflux_selection WHERE user_id = ?;", (u_id,))
+                    for pos, gid in enumerate(group_ids):
+                        c.execute("""
+                            INSERT INTO user_openflux_selection (user_id, group_id, position)
+                            VALUES (?, ?, ?);
+                        """, (u_id, gid, pos))
+
+                    c.execute("""
+                        UPDATE users
+                        SET revision = revision + 1, updated_at = ?
+                        WHERE id = ?;
+                    """, (now, u_id))
+            except Exception as e:
+                return 500, {"error": f"Database error updating OpenFlux user config: {e}"}
 
         return self.get_user_openflux(u_id)
 
@@ -1288,6 +1731,11 @@ class SubscriptionApp:
         """
         Безопасный импорт локально настроенных инстансов OpenFlux (слоты 1..8) в каталог БД.
         Парсинг без eval/source/sh.
+        - Разделение URL строго по буквальной запятой (',')
+        - Сохранение параметров query/fragment/+, без декодирования %2C
+        - Композитный ключ (source_slot, mode): classic не затирает multistream
+        - Сохранение пользовательских названий групп
+        - Инкремент revision только при реальном изменении содержания
         """
         pool_mode = "classic"
         if os.path.isfile(pool_mode_file):
@@ -1328,48 +1776,162 @@ class SubscriptionApp:
             if not url_raw:
                 continue
 
+            # Разделение строго по запятым без декодирования %2C
             urls = []
-            for u in re.split(r"[\s\r\n]+", url_raw):
-                u_str = u.strip()
-                if u_str and u_str.startswith("https://"):
+            for part in url_raw.split(","):
+                u_str = part.strip()
+                if u_str:
                     urls.append(u_str)
 
             if not urls:
                 continue
 
-            transport = props.get("TRANSPORT", "mailru").strip().lower()
+            transport = props.get("TRANSPORT", "").strip().lower()
             if transport not in ALLOWED_OPENFLUX_TRANSPORTS:
                 continue
 
-            codec = props.get("CODEC", "legacy").strip().lower()
-            if codec not in ALLOWED_OPENFLUX_CODECS:
+            # Валидация каждого URL документа
+            urls_valid = True
+            for u in urls:
+                ok_u, _ = validate_openflux_url(u, transport)
+                if not ok_u:
+                    urls_valid = False
+                    break
+            if not urls_valid:
+                continue
+
+            # Проверка дубликатов внутри слота
+            if len(urls) != len(set(urls)):
+                continue
+
+            # Кодек: отклоняем неизвестный кодек без подстановки legacy
+            raw_codec = props.get("CODEC", "").strip().lower()
+            if not raw_codec:
                 codec = "legacy"
+            elif raw_codec not in ALLOWED_OPENFLUX_CODECS:
+                continue
+            else:
+                codec = raw_codec
 
             enc_key = props.get("ENCRYPTION_KEY", "").strip()
+            if enc_key:
+                k_bytes = enc_key.encode("utf-8")
+                if not (MIN_ENCRYPTION_KEY_BYTES <= len(k_bytes) <= MAX_ENCRYPTION_KEY_BYTES):
+                    continue
+
             slot_mode = props.get("POOL_MODE", pool_mode).strip().lower()
             if slot_mode not in ALLOWED_OPENFLUX_MODES:
                 slot_mode = pool_mode
 
-            if slot_mode == "classic":
-                urls = [urls[0]]
-            elif slot_mode == "multistream":
-                urls = urls[:4]
+            # Строгая проверка количества документов без молчаливого усечения
+            if slot_mode == "classic" and len(urls) != 1:
+                continue
+            elif slot_mode == "multistream" and not (1 <= len(urls) <= 4):
+                continue
 
+            # Поиск по стабильному композитному ключу (source_slot, mode)
             c = self.conn.cursor()
-            c.execute("SELECT id FROM openflux_groups WHERE source_slot = ?;", (slot,))
+            c.execute("SELECT * FROM openflux_groups WHERE source_slot = ? AND mode = ?;", (slot, slot_mode))
             existing = c.fetchone()
+
             if existing:
                 grp_id = existing["id"]
-                name = f"OF-Slot-{slot}"
-                with self.conn:
-                    self.conn.execute("""
-                        UPDATE openflux_groups
-                        SET name = ?, mode = ?, transport = ?, urls_json = ?, codec = ?,
-                            encryption_key = ?, updated_at = ?
-                        WHERE id = ?;
-                    """, (name, slot_mode, transport, json.dumps(urls), codec, enc_key, now, grp_id))
+                name = existing["name"]  # Сохраняем имя, заданное пользователем
+                try:
+                    existing_urls = json.loads(existing["urls_json"])
+                except Exception:
+                    existing_urls = []
+
+                content_changed = (
+                    existing["transport"] != transport or
+                    existing_urls != urls or
+                    existing["codec"] != codec or
+                    (existing["encryption_key"] or "") != enc_key
+                )
+
+                if content_changed:
+                    # Валидация влияния на активных пользователей до сохранения
+                    c.execute("""
+                        SELECT DISTINCT u.user_id, cfg.connection_id, cfg.name, cfg.mode, cfg.balancer_strategy, cfg.revision, usr.nickname
+                        FROM user_openflux_selection u
+                        JOIN user_openflux_config cfg ON u.user_id = cfg.user_id
+                        JOIN users usr ON u.user_id = usr.id
+                        WHERE u.group_id = ? AND cfg.enabled = 1;
+                    """, (grp_id,))
+                    affected_users_info = c.fetchall()
+                    bundle_valid = True
+                    for u_row in affected_users_info:
+                        c.execute("""
+                            SELECT g.* FROM user_openflux_selection s
+                            JOIN openflux_groups g ON s.group_id = g.id
+                            WHERE s.user_id = ?
+                            ORDER BY s.position ASC;
+                        """, (u_row["user_id"],))
+                        sim_grps = []
+                        for gr in c.fetchall():
+                            if gr["id"] == grp_id:
+                                sim_grps.append({
+                                    "id": grp_id,
+                                    "name": name,
+                                    "mode": slot_mode,
+                                    "transport": transport,
+                                    "urls": urls,
+                                    "codec": codec,
+                                    "encryption_key": enc_key
+                                })
+                            else:
+                                try:
+                                    gu = json.loads(gr["urls_json"])
+                                except Exception:
+                                    gu = []
+                                sim_grps.append({
+                                    "id": gr["id"],
+                                    "name": gr["name"],
+                                    "mode": gr["mode"],
+                                    "transport": gr["transport"],
+                                    "urls": gu,
+                                    "codec": gr["codec"],
+                                    "encryption_key": gr["encryption_key"] or ""
+                                })
+                        ok_sim, _, _ = build_openflux_v2_payload(
+                            self.issuer_id,
+                            u_row["connection_id"],
+                            u_row["revision"] + 1,
+                            u_row["name"],
+                            u_row["mode"],
+                            u_row["balancer_strategy"],
+                            sim_grps
+                        )
+                        if not ok_sim:
+                            bundle_valid = False
+                            break
+
+                    if not bundle_valid:
+                        continue
+
+                    with self.conn:
+                        c.execute("""
+                            UPDATE openflux_groups
+                            SET transport = ?, urls_json = ?, codec = ?,
+                                encryption_key = ?, updated_at = ?
+                            WHERE id = ?;
+                        """, (transport, json.dumps(urls), codec, enc_key, now, grp_id))
+
+                        c.execute("SELECT DISTINCT user_id FROM user_openflux_selection WHERE group_id = ?;", (grp_id,))
+                        for row in c.fetchall():
+                            u_id = row[0]
+                            c.execute("""
+                                UPDATE user_openflux_config
+                                SET revision = revision + 1, updated_at = ?
+                                WHERE user_id = ?;
+                            """, (now, u_id))
+                            c.execute("""
+                                UPDATE users
+                                SET revision = revision + 1, updated_at = ?
+                                WHERE id = ?;
+                            """, (now, u_id))
             else:
-                grp_id = str(uuid.uuid4())
+                grp_id = str(uuid.uuid4()).lower()
                 name = f"OF-Slot-{slot}"
                 with self.conn:
                     self.conn.execute("""
@@ -1398,11 +1960,11 @@ class SubscriptionApp:
         """
         Выдача подписки по токену:
         - Поиск по SHA256(token).
-        - Все протоколы в строгом порядке: CSQTT -> WDTT -> Snell -> Mieru -> MasterDNS -> Custom.
+        - Все протоколы в строгом порядке: CSQTT -> QWDTT -> Snell -> Mieru -> MasterDNS -> Custom -> OpenFlux.
         - OpenFlux v2: если включен в user_openflux_config и содержит 1-8 валидных групп,
           добавляется ровно одна строка openflux-bundle://v2/<Base64URL-NoPadding>.
+        - При ошибке валидации/генерации включенного бандла возвращается HTTP 500 (не скрывать и не удалять молча).
         - Все ссылки каждого протокола разбиваются построчно.
-        - Фильтрация пустых.
         - Если все пусты -> 204 No Content.
         - ETag и 304 Not Modified.
         - Base64 UTF-8.
@@ -1445,53 +2007,42 @@ class SubscriptionApp:
                 ORDER BY s.position ASC;
             """, (user["id"],))
             selected_groups = c.fetchall()
-            if 1 <= len(selected_groups) <= 8:
-                groups_payload = []
-                total_of_urls = 0
-                valid_bundle = True
-                for g in selected_groups:
-                    try:
-                        urls = json.loads(g["urls_json"])
-                    except Exception:
-                        urls = []
-                    if not isinstance(urls, list) or not urls:
-                        valid_bundle = False
-                        break
-                    if of_cfg["mode"] == "classic" and (len(urls) != 1 or g["mode"] != "classic"):
-                        valid_bundle = False
-                        break
-                    if of_cfg["mode"] == "multistream" and (not (1 <= len(urls) <= 4) or g["mode"] != "multistream"):
-                        valid_bundle = False
-                        break
-                    if g["transport"] not in ALLOWED_OPENFLUX_TRANSPORTS:
-                        valid_bundle = False
-                        break
-                    total_of_urls += len(urls)
-                    groups_payload.append({
-                        "id": g["id"],
-                        "name": g["name"],
-                        "mode": g["mode"],
-                        "transport": g["transport"],
-                        "urls": urls,
-                        "codec": g["codec"],
-                        "encryption_key": g["encryption_key"] or "",
-                    })
-                if valid_bundle and 1 <= len(groups_payload) <= 8 and total_of_urls <= 32:
-                    issuer_id = self.issuer_id
-                    bundle_dict = {
-                        "schema": "openflux-bundle",
-                        "version": 2,
-                        "issuer_id": issuer_id,
-                        "id": of_cfg["connection_id"],
-                        "revision": int(of_cfg["revision"]),
-                        "name": of_cfg["name"],
-                        "mode": of_cfg["mode"],
-                        "balancer_strategy": of_cfg["balancer_strategy"],
-                        "groups": groups_payload,
-                    }
-                    ok_ser, _, v2_uri = serialize_openflux_v2_bundle(bundle_dict)
-                    if ok_ser and v2_uri:
-                        non_empty.append(v2_uri)
+            if not (1 <= len(selected_groups) <= 8):
+                return 500, {"error": "Active OpenFlux bundle must have between 1 and 8 groups"}, b""
+
+            groups_payload = []
+            for g in selected_groups:
+                try:
+                    urls = json.loads(g["urls_json"])
+                except Exception:
+                    urls = []
+                groups_payload.append({
+                    "id": g["id"],
+                    "name": g["name"],
+                    "mode": g["mode"],
+                    "transport": g["transport"],
+                    "urls": urls,
+                    "codec": g["codec"],
+                    "encryption_key": g["encryption_key"] or "",
+                })
+
+            ok_b, err_b, bundle_dict = build_openflux_v2_payload(
+                self.issuer_id,
+                of_cfg["connection_id"],
+                int(of_cfg["revision"]),
+                of_cfg["name"],
+                of_cfg["mode"],
+                of_cfg["balancer_strategy"],
+                groups_payload
+            )
+            if not ok_b:
+                return 500, {"error": f"OpenFlux bundle generation failed: {err_b}"}, b""
+
+            ok_ser, err_ser, v2_uri = serialize_openflux_v2_bundle(bundle_dict)
+            if not ok_ser or not v2_uri:
+                return 500, {"error": f"OpenFlux bundle serialization failed: {err_ser}"}, b""
+
+            non_empty.append(v2_uri)
 
         if not non_empty:
             return 204, {}, b""
@@ -1815,10 +2366,64 @@ def run_server(config_path=None):
         httpd.server_close()
 
 if __name__ == "__main__":
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("Usage: tuna-subscriptions.py [options]")
+        print("Options:")
+        print("  -c, --config FILE       Path to config.json (default: /etc/tuna-subscriptions/config.json)")
+        print("  --db FILE               Path to SQLite database file")
+        print("  --repair-openflux-v2    Repair legacy comma-separated OpenFlux URLs in database")
+        print("  --rollback BACKUP_FILE  Restore database from backup file")
+        print("  -v, --version           Show version")
+        print("  -h, --help              Show this help message")
+        sys.exit(0)
+
+    if "--version" in sys.argv or "-v" in sys.argv:
+        print("TUNA Subscription Server 1.1.43-rc8 (OpenFlux v2 Contract)")
+        sys.exit(0)
+
     cfg_p = None
-    if len(sys.argv) > 1:
-        if sys.argv[1] in ("--config", "-c") and len(sys.argv) > 2:
-            cfg_p = sys.argv[2]
-        elif not sys.argv[1].startswith("-"):
-            cfg_p = sys.argv[1]
+    db_p = None
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg in ("--config", "-c") and i + 1 < len(sys.argv):
+            cfg_p = sys.argv[i + 1]
+            i += 2
+            continue
+        elif arg in ("--db", "--database") and i + 1 < len(sys.argv):
+            db_p = sys.argv[i + 1]
+            i += 2
+            continue
+        elif not arg.startswith("-") and cfg_p is None:
+            cfg_p = arg
+        i += 1
+
+    config = load_config(cfg_p)
+    target_db = db_p or config["database"]["path"]
+
+    if "--repair-openflux-v2" in sys.argv or "--repair" in sys.argv:
+        ok, msg, details = repair_openflux_v2_database(target_db)
+        if ok:
+            print(f"[OK] {msg}")
+            print(json.dumps(details, indent=2, ensure_ascii=False))
+            sys.exit(0)
+        else:
+            print(f"[ERROR] {msg}", file=sys.stderr)
+            print(json.dumps(details, indent=2, ensure_ascii=False), file=sys.stderr)
+            sys.exit(1)
+
+    if "--rollback" in sys.argv:
+        idx = sys.argv.index("--rollback")
+        if idx + 1 >= len(sys.argv):
+            print("[ERROR] --rollback requires backup file path", file=sys.stderr)
+            sys.exit(1)
+        backup_file = sys.argv[idx + 1]
+        ok, msg = rollback_openflux_v2_database(backup_file, target_db)
+        if ok:
+            print(f"[OK] {msg}")
+            sys.exit(0)
+        else:
+            print(f"[ERROR] {msg}", file=sys.stderr)
+            sys.exit(1)
+
     run_server(cfg_p)

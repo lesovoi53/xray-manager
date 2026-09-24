@@ -15,6 +15,7 @@ import urllib.request
 import urllib.error
 import tempfile
 import threading
+import sqlite3
 import unittest
 
 # Добавляем родительский каталог в sys.path
@@ -28,6 +29,12 @@ ThreadingHTTPServer = tuna_module.ThreadingHTTPServer
 serialize_openflux_v2_bundle = tuna_module.serialize_openflux_v2_bundle
 deserialize_openflux_v2_bundle = tuna_module.deserialize_openflux_v2_bundle
 validate_openflux_url = tuna_module.validate_openflux_url
+validate_openflux_v2_payload = tuna_module.validate_openflux_v2_payload
+build_openflux_v2_payload = tuna_module.build_openflux_v2_payload
+repair_openflux_v2_database = tuna_module.repair_openflux_v2_database
+rollback_openflux_v2_database = tuna_module.rollback_openflux_v2_database
+is_canonical_uuid = tuna_module.is_canonical_uuid
+init_database = tuna_module.init_database
 
 
 
@@ -678,7 +685,7 @@ class TunaSubscriptionTests(unittest.TestCase):
     # --------------------------------------------------------------------------
     def test_24_openflux_serialization_and_deserialization_roundtrip(self):
         sample_payload = {
-            "schema": "openflux-bundle",
+            "schema": "tuna.openflux.bundle",
             "version": 2,
             "issuer_id": "c1f10903-88f5-467f-94d7-eaeead8eef24",
             "id": "e93e2b20-1a74-4b53-b26a-93911c7ffae1",
@@ -690,7 +697,6 @@ class TunaSubscriptionTests(unittest.TestCase):
                 {
                     "id": "8bfa5716-1763-471a-ba2d-c1240c114ce7",
                     "name": "OF-Group-1",
-                    "mode": "classic",
                     "transport": "mailru",
                     "urls": [
                         "https://cloud.mail.ru/public/Test1/doc1"
@@ -713,18 +719,19 @@ class TunaSubscriptionTests(unittest.TestCase):
         # Обратная десериализация
         ok_de, err_de, decoded = deserialize_openflux_v2_bundle(v2_uri)
         self.assertTrue(ok_de, f"Deserialization failed: {err_de}")
-        self.assertEqual(decoded["schema"], "openflux-bundle")
+        self.assertEqual(decoded["schema"], "tuna.openflux.bundle")
         self.assertEqual(decoded["version"], 2)
         self.assertEqual(decoded["name"], "TUNA-OpenFlux-Office")
         self.assertEqual(decoded["groups"][0]["transport"], "mailru")
         self.assertEqual(decoded["groups"][0]["codec"], "legacy")
+        self.assertNotIn("mode", decoded["groups"][0])
 
     # --------------------------------------------------------------------------
     # ТЕСТ 25: Валидация схемы и запрет недопустимых транспортов/форматов в v2
     # --------------------------------------------------------------------------
     def test_25_openflux_validation_rules_and_limits(self):
         base_payload = {
-            "schema": "openflux-bundle",
+            "schema": "tuna.openflux.bundle",
             "version": 2,
             "issuer_id": "c1f10903-88f5-467f-94d7-eaeead8eef24",
             "id": "e93e2b20-1a74-4b53-b26a-93911c7ffae1",
@@ -736,11 +743,10 @@ class TunaSubscriptionTests(unittest.TestCase):
                 {
                     "id": "11111111-1111-1111-1111-111111111111",
                     "name": "G1",
-                    "mode": "classic",
                     "transport": "mailru",
                     "urls": ["https://cloud.mail.ru/public/Test/doc1"],
                     "codec": "legacy",
-                    "encryption_key": "k1"
+                    "encryption_key": "key1234567890123"
                 }
             ]
         }
@@ -748,53 +754,54 @@ class TunaSubscriptionTests(unittest.TestCase):
         # 1. Запрещенный транспорт (vyandex, yandex, vless и др.)
         bad_tr_payload = json.loads(json.dumps(base_payload))
         bad_tr_payload["groups"][0]["transport"] = "vyandex"
-        _, _, uri_bad = serialize_openflux_v2_bundle(bad_tr_payload)
-        ok, err, _ = deserialize_openflux_v2_bundle(uri_bad)
-        self.assertFalse(ok)
-        self.assertIn("forbidden transport", err)
+        ok_tr, err_tr, _ = serialize_openflux_v2_bundle(bad_tr_payload)
+        self.assertFalse(ok_tr)
+        self.assertIn("forbidden transport", err_tr)
 
-        # 2. Неверная схема
+        # 2. Неверная схема (старая openflux-bundle должна отклоняться)
         bad_schema = json.loads(json.dumps(base_payload))
-        bad_schema["schema"] = "other-bundle"
-        _, _, uri_bs = serialize_openflux_v2_bundle(bad_schema)
-        ok, err, _ = deserialize_openflux_v2_bundle(uri_bs)
-        self.assertFalse(ok)
+        bad_schema["schema"] = "openflux-bundle"
+        ok_bs, err_bs, _ = serialize_openflux_v2_bundle(bad_schema)
+        self.assertFalse(ok_bs)
+        self.assertIn("Invalid schema", err_bs)
 
-        # 3. Неверная версия
+        # 3. Запрет mode внутри wire-группы
+        bad_grp_mode = json.loads(json.dumps(base_payload))
+        bad_grp_mode["groups"][0]["mode"] = "classic"
+        ok_gm, err_gm, _ = serialize_openflux_v2_bundle(bad_grp_mode)
+        self.assertFalse(ok_gm)
+        self.assertIn("wire object must NOT contain 'mode'", err_gm)
+
+        # 4. Неверная версия
         bad_ver = json.loads(json.dumps(base_payload))
         bad_ver["version"] = 1
-        _, _, uri_bv = serialize_openflux_v2_bundle(bad_ver)
-        ok, err, _ = deserialize_openflux_v2_bundle(uri_bv)
-        self.assertFalse(ok)
+        ok_bv, err_bv, _ = serialize_openflux_v2_bundle(bad_ver)
+        self.assertFalse(ok_bv)
 
-        # 4. В режиме classic более 1 URL
+        # 5. В режиме classic более 1 URL
         bad_cl_urls = json.loads(json.dumps(base_payload))
         bad_cl_urls["groups"][0]["urls"] = ["https://cloud.mail.ru/1", "https://cloud.mail.ru/2"]
-        _, _, uri_bcl = serialize_openflux_v2_bundle(bad_cl_urls)
-        ok, err, _ = deserialize_openflux_v2_bundle(uri_bcl)
-        self.assertFalse(ok)
+        ok_cl, _, _ = serialize_openflux_v2_bundle(bad_cl_urls)
+        self.assertFalse(ok_cl)
 
-        # 5. В режиме multistream более 4 URL
+        # 6. В режиме multistream более 4 URL
         bad_ms_urls = json.loads(json.dumps(base_payload))
         bad_ms_urls["mode"] = "multistream"
-        bad_ms_urls["groups"][0]["mode"] = "multistream"
         bad_ms_urls["groups"][0]["urls"] = [f"https://cloud.mail.ru/{i}" for i in range(5)]
-        _, _, uri_bms = serialize_openflux_v2_bundle(bad_ms_urls)
-        ok, err, _ = deserialize_openflux_v2_bundle(uri_bms)
-        self.assertFalse(ok)
+        ok_ms, _, _ = serialize_openflux_v2_bundle(bad_ms_urls)
+        self.assertFalse(ok_ms)
 
-        # 6. Дубликаты URL в группе
+        # 7. Дубликаты URL в группе
         bad_dup = json.loads(json.dumps(base_payload))
         bad_dup["mode"] = "multistream"
-        bad_dup["groups"][0]["mode"] = "multistream"
         bad_dup["groups"][0]["urls"] = ["https://cloud.mail.ru/same", "https://cloud.mail.ru/same"]
-        _, _, uri_dup = serialize_openflux_v2_bundle(bad_dup)
-        ok, err, _ = deserialize_openflux_v2_bundle(uri_dup)
-        self.assertFalse(ok)
+        ok_dup, _, _ = serialize_openflux_v2_bundle(bad_dup)
+        self.assertFalse(ok_dup)
 
-        # 7. Невалидный URL (http:// вместо https://)
+        # 8. Невалидный URL (http:// вместо https:// или пробелы или запятые)
         self.assertFalse(validate_openflux_url("http://insecure.site")[0])
         self.assertFalse(validate_openflux_url("https://site.com/with space")[0])
+        self.assertFalse(validate_openflux_url("https://cloud.mail.ru/doc1,https://cloud.mail.ru/doc2")[0])
         self.assertTrue(validate_openflux_url("https://cloud.mail.ru/public/abc")[0])
 
     # --------------------------------------------------------------------------
@@ -808,7 +815,7 @@ class TunaSubscriptionTests(unittest.TestCase):
             "transport": "mailru",
             "urls": ["https://cloud.mail.ru/public/123/file.dat"],
             "codec": "legacy",
-            "encryption_key": "secret123",
+            "encryption_key": "secret1234567890",
             "source_slot": 1
         }
         st1, _, b1 = self.api_request("POST", "/api/openflux/groups", g1_data)
@@ -829,7 +836,7 @@ class TunaSubscriptionTests(unittest.TestCase):
                 "https://boards.example.com/d/3"
             ],
             "codec": "batched",
-            "encryption_key": "sec_boards"
+            "encryption_key": "sec_boards_12345"
         }
         st2, _, b2 = self.api_request("POST", "/api/openflux/groups", g2_data)
         self.assertEqual(st2, 201)
@@ -837,6 +844,25 @@ class TunaSubscriptionTests(unittest.TestCase):
         g2_id = res2["id"]
         self.assertEqual(len(res2["urls"]), 3)
         self.assertEqual(res2["codec"], "batched")
+
+        # Проверка отклонения короткого ключа (< 16 байт)
+        st_short_k, _, _ = self.api_request("POST", "/api/openflux/groups", {
+            "name": "Short-Key",
+            "mode": "classic",
+            "transport": "mailru",
+            "urls": ["https://cloud.mail.ru/public/short/key"],
+            "encryption_key": "short_key"
+        })
+        self.assertEqual(st_short_k, 400)
+
+        # Проверка отклонения URL с буквальной запятой
+        st_comma, _, _ = self.api_request("POST", "/api/openflux/groups", {
+            "name": "Comma-URL",
+            "mode": "classic",
+            "transport": "mailru",
+            "urls": ["https://cloud.mail.ru/public/1,2"]
+        })
+        self.assertEqual(st_comma, 400)
 
         # 3. Отклонение запрещенного транспорта (vyandex)
         st_bad, _, b_bad = self.api_request("POST", "/api/openflux/groups", {
@@ -987,7 +1013,7 @@ class TunaSubscriptionTests(unittest.TestCase):
             "transport": "mailru",
             "urls": ["https://cloud.mail.ru/public/Sub/test.txt"],
             "codec": "legacy",
-            "encryption_key": "sub_key_123"
+            "encryption_key": "sub_key_12345678"
         })
         gid = json.loads(b_g.decode())["id"]
 
@@ -1116,7 +1142,7 @@ class TunaSubscriptionTests(unittest.TestCase):
 
         # 0. Бандл Single Group (1 группа, classic, mailru)
         single_bundle = {
-            "schema": "openflux-bundle",
+            "schema": "tuna.openflux.bundle",
             "version": 2,
             "issuer_id": issuer_id,
             "id": "e93e2b20-1a74-4b53-b26a-93911c7ffae1",
@@ -1128,7 +1154,6 @@ class TunaSubscriptionTests(unittest.TestCase):
                 {
                     "id": "8bfa5716-1763-471a-ba2d-c1240c114ce7",
                     "name": "OF-Group-MailRu",
-                    "mode": "classic",
                     "transport": "mailru",
                     "urls": ["https://cloud.mail.ru/public/Test/doc1"],
                     "codec": "legacy",
@@ -1151,18 +1176,20 @@ class TunaSubscriptionTests(unittest.TestCase):
         for idx in range(1, 9):
             tr = transports[(idx - 1) % len(transports)]
             codec = "batched" if idx % 2 == 0 else "legacy"
+            url = f"https://{tr}.example.com/doc/ch{idx}"
+            if tr == "cupsonline":
+                url = f"https://cups.online/live-coding/?room=ch{idx}"
             classic_groups.append({
                 "id": f"00000000-0000-0000-0000-00000000000{idx}",
                 "name": f"Classic-Group-{idx}",
-                "mode": "classic",
                 "transport": tr,
-                "urls": [f"https://{tr}.example.com/doc/ch{idx}"],
+                "urls": [url],
                 "codec": codec,
                 "encryption_key": f"key_hex_{idx * 11111111}"
             })
 
         classic_bundle = {
-            "schema": "openflux-bundle",
+            "schema": "tuna.openflux.bundle",
             "version": 2,
             "issuer_id": issuer_id,
             "id": "77777777-1111-4444-8888-999999999999",
@@ -1190,19 +1217,21 @@ class TunaSubscriptionTests(unittest.TestCase):
         for idx in range(1, 9):
             tr = transports[(idx - 1) % len(transports)]
             codec = "batched" if idx % 2 == 0 else "legacy"
-            urls = [f"https://{tr}.example.com/doc/ch{idx}/part_{part}" for part in range(1, 5)]
+            if tr == "cupsonline":
+                urls = [f"https://cups.online/live-coding/?room=ch{idx}_part_{part}" for part in range(1, 5)]
+            else:
+                urls = [f"https://{tr}.example.com/doc/ch{idx}/part_{part}" for part in range(1, 5)]
             ms_groups.append({
                 "id": f"00000000-0000-0000-0000-00000000001{idx}",
                 "name": f"MultiStream-Group-{idx}",
-                "mode": "multistream",
                 "transport": tr,
                 "urls": urls,
                 "codec": codec,
-                "encryption_key": f"ms_key_{idx * 22222222}"
+                "encryption_key": f"ms_key_hex_{idx * 22222222}"
             })
 
         ms_bundle = {
-            "schema": "openflux-bundle",
+            "schema": "tuna.openflux.bundle",
             "version": 2,
             "issuer_id": issuer_id,
             "id": "88888888-2222-5555-9999-000000000000",
@@ -1269,12 +1298,462 @@ class TunaSubscriptionTests(unittest.TestCase):
         self.assertEqual(res["imported_count"], 2)
 
         # Проверяем что в базе появились слоты 1 и 2, а слот 3 пропущен
-        st_get1, _, b_g1 = self.api_request("GET", "/api/openflux/groups/OF-Slot-1")
+        slot1_grp = [g for g in res["groups"] if g["slot"] == 1][0]
+        st_get1, _, b_g1 = self.api_request("GET", f"/api/openflux/groups/{slot1_grp['id']}")
         self.assertEqual(st_get1, 200)
         self.assertEqual(json.loads(b_g1.decode())["transport"], "mailru")
 
+        slot2_grp = [g for g in res["groups"] if g["slot"] == 2][0]
+        st_get2, _, b_g2 = self.api_request("GET", f"/api/openflux/groups/{slot2_grp['id']}")
+        self.assertEqual(st_get2, 200)
+        self.assertEqual(json.loads(b_g2.decode())["transport"], "boards")
+
+        self.assertFalse(any(g["slot"] == 3 for g in res["groups"]))
         st_get3, _, _ = self.api_request("GET", "/api/openflux/groups/OF-Slot-3")
         self.assertEqual(st_get3, 404)
+
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 34: Импорт env с четырьмя URL через запятую и сохранение %2C / параметров
+    # --------------------------------------------------------------------------
+    def test_34_import_env_four_comma_separated_urls_and_percent_preservation(self):
+        mock_dir = os.path.join(self.test_dir, "test34_instances")
+        os.makedirs(mock_dir, exist_ok=True)
+        env_file = os.path.join(mock_dir, "1.env")
+
+        # 4 URL через запятую: query с %2C (запятая закодированная), +, %20, fragment
+        url1 = "https://cloud.mail.ru/public/A/1?tag=a%2Cb&val=1+2"
+        url2 = "https://cloud.mail.ru/public/A/2?q=foo%20bar"
+        url3 = "https://cloud.mail.ru/public/A/3#section1"
+        url4 = "https://cloud.mail.ru/public/A/4?x=1&y=2"
+        raw_val = f"{url1},{url2},{url3},{url4}"
+
+        with open(env_file, "w", encoding="utf-8") as f:
+            f.write(f'TRANSPORT="mailru"\nCODEC="batched"\nPOOL_MODE="multistream"\nURL="{raw_val}"\n')
+
+        pool_mode_file = os.path.join(self.test_dir, "test34_pool.mode")
+        with open(pool_mode_file, "w", encoding="utf-8") as f:
+            f.write("multistream\n")
+
+        st_imp, _, b_imp = self.api_request("POST", "/api/openflux/import-local", {
+            "instances_dir": mock_dir,
+            "pool_mode_file": pool_mode_file
+        })
+        self.assertEqual(st_imp, 200)
+        res = json.loads(b_imp.decode())
+        self.assertTrue(res["success"])
+        imported = [g for g in res["groups"] if g["slot"] == 1][0]
+
+        # Ровно 4 строки, без разделения по %2C
+        self.assertEqual(len(imported["urls"]), 4)
+        self.assertEqual(imported["urls"][0], url1)
+        self.assertEqual(imported["urls"][1], url2)
+        self.assertEqual(imported["urls"][2], url3)
+        self.assertEqual(imported["urls"][3], url4)
+
+        # Канонический API отклоняет элемент с буквальной запятой
+        st_bad, _, b_bad = self.api_request("POST", "/api/openflux/groups", {
+            "name": "Comma-Bad",
+            "mode": "multistream",
+            "transport": "mailru",
+            "urls": [url1, f"{url2},{url3}"]
+        })
+        self.assertEqual(st_bad, 400)
+        self.assertIn("cannot contain literal comma", json.loads(b_bad.decode())["error"])
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 35: Реальный текущий набор VPS (4 группы, 4 документа = 16 документов, batched)
+    # --------------------------------------------------------------------------
+    def test_35_four_groups_four_docs_batched_real_current_vps_set(self):
+        mock_dir = os.path.join(self.test_dir, "test35_instances")
+        os.makedirs(mock_dir, exist_ok=True)
+
+        # Слоты 1, 2 (mailru), 3 (boards), 5 (cupsonline)
+        slots_data = {
+            1: ("mailru", [f"https://cloud.mail.ru/public/slot1/doc{i}" for i in range(1, 5)]),
+            2: ("mailru", [f"https://cloud.mail.ru/public/slot2/doc{i}" for i in range(1, 5)]),
+            3: ("boards", [f"https://boards.example.com/board/slot3_doc{i}" for i in range(1, 5)]),
+            5: ("cupsonline", [f"https://cups.online/live-coding/?room=slot5_doc{i}" for i in range(1, 5)]),
+        }
+
+        for slot_num, (tr, u_list) in slots_data.items():
+            env_f = os.path.join(mock_dir, f"{slot_num}.env")
+            raw_urls = ",".join(u_list)
+            with open(env_f, "w", encoding="utf-8") as f:
+                f.write(f'ROLE="exit"\nMODE="l4"\nTRANSPORT="{tr}"\nCODEC="batched"\nURL="{raw_urls}"\nENCRYPTION_KEY=""\n')
+
+        pool_mode_file = os.path.join(self.test_dir, "test35_pool.mode")
+        with open(pool_mode_file, "w", encoding="utf-8") as f:
+            f.write("multistream\n")
+
+        st_imp, _, b_imp = self.api_request("POST", "/api/openflux/import-local", {
+            "instances_dir": mock_dir,
+            "pool_mode_file": pool_mode_file
+        })
+        self.assertEqual(st_imp, 200)
+        res = json.loads(b_imp.decode())
+        self.assertEqual(res["imported_count"], 4)
+
+        # Создаем пользователя и подключаем 4 группы (multistream, roundRobin)
+        _, _, b_u = self.api_request("POST", "/api/users", {"nickname": "vps_test_user"})
+        user_info = json.loads(b_u.decode())
+        u_id = user_info["id"]
+        tok = user_info["token"]
+
+        group_ids = [g["id"] for g in res["groups"]]
+        st_cfg, _, _ = self.api_request("PUT", f"/api/users/{u_id}/openflux", {
+            "enabled": True,
+            "name": "VPS-Multistream-16",
+            "mode": "multistream",
+            "balancer_strategy": "roundRobin",
+            "group_ids": group_ids
+        })
+        self.assertEqual(st_cfg, 200)
+
+        # Запрашиваем подписку
+        st_sub, _, b_sub = self.api_request("GET", f"/sub/{tok}")
+        self.assertEqual(st_sub, 200)
+        lines = [l.strip() for l in base64.b64decode(b_sub).decode("utf-8").splitlines() if l.strip()]
+        of_lines = [l for l in lines if l.startswith("openflux-bundle://v2/")]
+        self.assertEqual(len(of_lines), 1)
+
+        ok, err, bundle = deserialize_openflux_v2_bundle(of_lines[0])
+        self.assertTrue(ok, f"Bundle deserialization failed: {err}")
+        self.assertEqual(bundle["schema"], "tuna.openflux.bundle")
+        self.assertEqual(bundle["version"], 2)
+        self.assertEqual(bundle["mode"], "multistream")
+        self.assertEqual(bundle["balancer_strategy"], "roundRobin")
+        self.assertEqual(len(bundle["groups"]), 4)
+
+        lengths = [len(g["urls"]) for g in bundle["groups"]]
+        self.assertEqual(lengths, [4, 4, 4, 4])
+        total_docs = sum(lengths)
+        self.assertEqual(total_docs, 16)
+
+        # Все кодеки batched, все PSK пустые, mode отсутствует в wire-группах
+        for g in bundle["groups"]:
+            self.assertEqual(g["codec"], "batched")
+            self.assertEqual(g["encryption_key"], "")
+            self.assertNotIn("mode", g)
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 36: Проволочный контракт v2: отклонение старой schema, group.mode и объединенных URL
+    # --------------------------------------------------------------------------
+    def test_36_contract_v2_rejection_of_old_schema_group_mode_and_merged_urls(self):
+        valid_group = {
+            "id": "11111111-2222-3333-4444-555555555555",
+            "name": "Valid-Group",
+            "transport": "mailru",
+            "urls": ["https://cloud.mail.ru/public/123/doc1"],
+            "codec": "batched",
+            "encryption_key": ""
+        }
+        valid_bundle = {
+            "schema": "tuna.openflux.bundle",
+            "version": 2,
+            "issuer_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "id": "22222222-3333-4444-5555-666666666666",
+            "revision": 1,
+            "name": "Contract-Check",
+            "mode": "classic",
+            "balancer_strategy": "roundRobin",
+            "groups": [valid_group]
+        }
+
+        # 1. Валидный бандл проходит
+        ok, err = validate_openflux_v2_payload(valid_bundle)
+        self.assertTrue(ok, f"Expected valid, got: {err}")
+
+        # 2. Старая schema ("openflux-bundle") отклоняется
+        bad_schema = dict(valid_bundle, schema="openflux-bundle")
+        ok_bs, err_bs = validate_openflux_v2_payload(bad_schema)
+        self.assertFalse(ok_bs)
+        self.assertIn("Invalid schema", err_bs)
+
+        # 3. Наличие mode в группе проволочного формата отклоняется
+        grp_with_mode = dict(valid_group, mode="classic")
+        bad_grp = dict(valid_bundle, groups=[grp_with_mode])
+        ok_bg, err_bg = validate_openflux_v2_payload(bad_grp)
+        self.assertFalse(ok_bg)
+        self.assertIn("must NOT contain 'mode'", err_bg)
+
+        # 4. Объединенный URL с буквальной запятой отклоняется
+        grp_merged = dict(valid_group, urls=["https://cloud.mail.ru/1,https://cloud.mail.ru/2"])
+        bad_urls = dict(valid_bundle, groups=[grp_merged])
+        ok_bu, err_bu = validate_openflux_v2_payload(bad_urls)
+        self.assertFalse(ok_bu)
+        self.assertIn("literal comma", err_bu)
+
+        # 5. Неизвестное поле в корне отклоняется
+        bad_root = dict(valid_bundle, unknown_key="val")
+        ok_br, err_br = validate_openflux_v2_payload(bad_root)
+        self.assertFalse(ok_br)
+        self.assertIn("Unknown field", err_br)
+
+        # 6. Неканонический UUID отклоняется
+        bad_uuid = dict(valid_bundle, id="NOT-A-UUID")
+        ok_buu, err_buu = validate_openflux_v2_payload(bad_uuid)
+        self.assertFalse(ok_buu)
+        self.assertIn("canonical lowercase UUID", err_buu)
+
+        # 7. Десериализация старого URI отклоняется
+        old_uri = "openflux-bundle://v2/" + base64.urlsafe_b64encode(json.dumps(bad_schema).encode()).decode().rstrip("=")
+        ok_des, err_des, _ = deserialize_openflux_v2_bundle(old_uri)
+        self.assertFalse(ok_des)
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 37: Консистентность HTTP-выдачи, API-preview и TUI-preview
+    # --------------------------------------------------------------------------
+    def test_37_http_issuance_api_preview_tui_preview_consistency(self):
+        # Создаем пользователя с OpenFlux
+        _, _, b_u = self.api_request("POST", "/api/users", {"nickname": "preview_sync_user"})
+        user = json.loads(b_u.decode())
+        u_id = user["id"]
+        tok = user["token"]
+
+        _, _, b_g = self.api_request("POST", "/api/openflux/groups", {
+            "name": "Sync-Group",
+            "mode": "classic",
+            "transport": "boards",
+            "urls": ["https://boards.example.com/sync_doc"],
+            "codec": "legacy"
+        })
+        gid = json.loads(b_g.decode())["id"]
+
+        self.api_request("PUT", f"/api/users/{u_id}/openflux", {
+            "enabled": True,
+            "name": "Preview-Sync",
+            "mode": "classic",
+            "balancer_strategy": "roundRobin",
+            "group_ids": [gid]
+        })
+
+        # 1. API Preview: GET /api/users/<id>/openflux
+        st_api, _, b_api = self.api_request("GET", f"/api/users/{u_id}/openflux")
+        self.assertEqual(st_api, 200)
+        api_data = json.loads(b_api.decode())
+        api_uri = api_data["v2_uri"]
+        api_payload = api_data["bundle_payload"]
+
+        # 2. HTTP Issuance: GET /sub/<token>
+        st_sub, _, b_sub = self.api_request("GET", f"/sub/{tok}")
+        self.assertEqual(st_sub, 200)
+        sub_text = base64.b64decode(b_sub).decode("utf-8").strip()
+        http_uri = sub_text.splitlines()[-1]
+
+        # URI байт-в-байт идентичен
+        self.assertEqual(api_uri, http_uri)
+
+        # 3. TUI Preview декодирует v2_uri
+        # Имитируем поведение TUI (чтение base64url из v2_uri)
+        raw_b64 = api_uri[len("openflux-bundle://v2/"):]
+        padding = "=" * ((4 - len(raw_b64) % 4) % 4)
+        tui_payload = json.loads(base64.urlsafe_b64decode(raw_b64 + padding).decode("utf-8"))
+
+        # Все три представления идентичны
+        self.assertEqual(api_payload, tui_payload)
+        ok, _, deserialized_payload = deserialize_openflux_v2_bundle(http_uri)
+        self.assertTrue(ok)
+        self.assertEqual(api_payload, deserialized_payload)
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 38: Идемпотентность починки БД и откат (repair & rollback)
+    # --------------------------------------------------------------------------
+    def test_38_database_repair_and_rollback_idempotence(self):
+        # Создаем отдельную тестовую БД для проверки починки
+        test_db = os.path.join(self.test_dir, "repair_test.db")
+        conn = init_database(test_db)
+
+        # Создаем в repair_test.db некорректную группу с объединенным URL через запятую
+        now = "2026-09-25T00:00:00+00:00"
+        gid = "a0a0a0a0-bbbb-cccc-dddd-eeeeeeeeeeee"
+        uid = "f0f0f0f0-1111-2222-3333-444444444444"
+        merged_urls = ["https://cloud.mail.ru/public/1,https://cloud.mail.ru/public/2"]
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO users (id, nickname, enabled, subscription_token, subscription_token_hash, revision, created_at, updated_at) VALUES (?, 'rep_user', 1, 'rep_tok', 'rep_hash', 5, ?, ?);", (uid, now, now))
+            conn.execute("INSERT OR REPLACE INTO openflux_groups (id, name, mode, transport, urls_json, codec, encryption_key, source_slot, created_at, updated_at) VALUES (?, 'Corrupted-Group', 'multistream', 'mailru', ?, 'batched', '', 1, ?, ?);", (gid, json.dumps(merged_urls), now, now))
+            conn.execute("INSERT OR REPLACE INTO user_openflux_config (user_id, enabled, connection_id, name, mode, balancer_strategy, revision, updated_at) VALUES (?, 1, 'cccccccc-dddd-eeee-ffff-000000000000', 'Rep-Cfg', 'multistream', 'roundRobin', 5, ?);", (uid, now))
+            conn.execute("INSERT OR REPLACE INTO user_openflux_selection (user_id, group_id, position) VALUES (?, ?, 0);", (uid, gid))
+        conn.close()
+
+        # 1. Первый запуск repair
+        ok1, msg1, res1 = repair_openflux_v2_database(test_db, backup=True)
+        self.assertTrue(ok1, msg1)
+        self.assertEqual(res1["repaired_groups_count"], 1)
+        self.assertEqual(res1["affected_users_count"], 1)
+        backup_file = res1["backup"]
+        self.assertTrue(os.path.isfile(backup_file))
+
+        # Проверяем что группа исправлена (2 URL) и revision инкрементирован (5 -> 6)
+        conn = sqlite3.connect(test_db)
+        c = conn.cursor()
+        c.execute("SELECT urls_json FROM openflux_groups WHERE id = ?;", (gid,))
+        urls_after = json.loads(c.fetchone()[0])
+        self.assertEqual(len(urls_after), 2)
+        self.assertEqual(urls_after[0], "https://cloud.mail.ru/public/1")
+        self.assertEqual(urls_after[1], "https://cloud.mail.ru/public/2")
+
+        c.execute("SELECT revision FROM user_openflux_config WHERE user_id = ?;", (uid,))
+        self.assertEqual(c.fetchone()[0], 6)
+        conn.close()
+
+        # 2. Второй запуск repair (идемпотентность)
+        ok2, msg2, res2 = repair_openflux_v2_database(test_db, backup=False)
+        self.assertTrue(ok2, msg2)
+        self.assertEqual(res2["repaired_groups_count"], 0)
+        self.assertEqual(res2["affected_users_count"], 0)
+
+        # Revision НЕ изменился
+        conn = sqlite3.connect(test_db)
+        c = conn.cursor()
+        c.execute("SELECT revision FROM user_openflux_config WHERE user_id = ?;", (uid,))
+        self.assertEqual(c.fetchone()[0], 6)
+        conn.close()
+
+        # 3. Откат к бэкапу
+        ok_rb, msg_rb = rollback_openflux_v2_database(backup_file, test_db)
+        self.assertTrue(ok_rb, msg_rb)
+
+        # Проверяем возврат к 1 неисправленному URL и revision 5
+        conn = sqlite3.connect(test_db)
+        c = conn.cursor()
+        c.execute("SELECT urls_json FROM openflux_groups WHERE id = ?;", (gid,))
+        self.assertEqual(len(json.loads(c.fetchone()[0])), 1)
+        c.execute("SELECT revision FROM user_openflux_config WHERE user_id = ?;", (uid,))
+        self.assertEqual(c.fetchone()[0], 5)
+        conn.close()
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 39: Атомарная валидация изменений группы предотвращает частичные поломки
+    # --------------------------------------------------------------------------
+    def test_39_atomic_prevalidation_prevents_partial_changes(self):
+        _, _, b_u = self.api_request("POST", "/api/users", {"nickname": "atomic_user"})
+        user = json.loads(b_u.decode())
+        u_id = user["id"]
+
+        _, _, b_g = self.api_request("POST", "/api/openflux/groups", {
+            "name": "Atomic-Group",
+            "mode": "classic",
+            "transport": "mailru",
+            "urls": ["https://cloud.mail.ru/public/atomic1"],
+            "codec": "legacy"
+        })
+        gid = json.loads(b_g.decode())["id"]
+
+        self.api_request("PUT", f"/api/users/{u_id}/openflux", {
+            "enabled": True,
+            "mode": "classic",
+            "group_ids": [gid]
+        })
+
+        # Попытка обновить группу в classic mode, добавив 2-й URL (недопустимо в classic)
+        st_bad, _, b_bad = self.api_request("PUT", f"/api/openflux/groups/{gid}", {
+            "urls": ["https://cloud.mail.ru/public/1", "https://cloud.mail.ru/public/2"]
+        })
+        self.assertEqual(st_bad, 400)
+        self.assertIn("Classic mode requires exactly 1 URL", json.loads(b_bad.decode())["error"])
+
+        # Проверяем что группа осталась неизменной
+        st_g, _, b_chk = self.api_request("GET", f"/api/openflux/groups/{gid}")
+        self.assertEqual(st_g, 200)
+        chk = json.loads(b_chk.decode())
+        self.assertEqual(chk["urls"], ["https://cloud.mail.ru/public/atomic1"])
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 40: Композитный ключ (source_slot, mode) сохраняет имена и разные режимы
+    # --------------------------------------------------------------------------
+    def test_40_composite_key_slot_and_mode_preserves_custom_names_and_separate_modes(self):
+        mock_dir = os.path.join(self.test_dir, "test40_instances")
+        os.makedirs(mock_dir, exist_ok=True)
+
+        # 1. Импортируем слот 4 в classic
+        with open(os.path.join(mock_dir, "4.env"), "w", encoding="utf-8") as f:
+            f.write('TRANSPORT="mailru"\nURL="https://cloud.mail.ru/slot4_classic"\n')
+
+        pool_mode_file = os.path.join(self.test_dir, "test40_pool.mode")
+        with open(pool_mode_file, "w", encoding="utf-8") as f:
+            f.write("classic\n")
+
+        self.api_request("POST", "/api/openflux/import-local", {
+            "instances_dir": mock_dir,
+            "pool_mode_file": pool_mode_file
+        })
+
+        # Находим созданную группу и переименовываем
+        st_l, _, b_l = self.api_request("GET", "/api/openflux/groups")
+        all_groups = json.loads(b_l.decode())
+        g4_classic = [g for g in all_groups if g["source_slot"] == 4 and g["mode"] == "classic"][0]
+        g4_id = g4_classic["id"]
+
+        self.api_request("PUT", f"/api/openflux/groups/{g4_id}", {
+            "name": "Custom-Name-For-Slot-4"
+        })
+
+        # 2. Повторный импорт слота 4 в classic: имя Custom-Name-For-Slot-4 должно сохраниться!
+        self.api_request("POST", "/api/openflux/import-local", {
+            "instances_dir": mock_dir,
+            "pool_mode_file": pool_mode_file
+        })
+
+        st_get, _, b_get = self.api_request("GET", f"/api/openflux/groups/{g4_id}")
+        self.assertEqual(st_get, 200)
+        self.assertEqual(json.loads(b_get.decode())["name"], "Custom-Name-For-Slot-4")
+
+        # 3. Теперь импортируем слот 4 в multistream: classic не должен быть затерт!
+        with open(os.path.join(mock_dir, "4.env"), "w", encoding="utf-8") as f:
+            f.write('TRANSPORT="boards"\nURL="https://boards.example.com/ms1,https://boards.example.com/ms2"\n')
+        with open(pool_mode_file, "w", encoding="utf-8") as f:
+            f.write("multistream\n")
+
+        self.api_request("POST", "/api/openflux/import-local", {
+            "instances_dir": mock_dir,
+            "pool_mode_file": pool_mode_file
+        })
+
+        # Проверяем что обе группы существуют одновременно
+        st_l2, _, b_l2 = self.api_request("GET", "/api/openflux/groups")
+        all_grps2 = json.loads(b_l2.decode())
+        classic_matches = [g for g in all_grps2 if g["source_slot"] == 4 and g["mode"] == "classic"]
+        ms_matches = [g for g in all_grps2 if g["source_slot"] == 4 and g["mode"] == "multistream"]
+
+        self.assertEqual(len(classic_matches), 1)
+        self.assertEqual(classic_matches[0]["name"], "Custom-Name-For-Slot-4")
+        self.assertEqual(len(ms_matches), 1)
+        self.assertNotEqual(classic_matches[0]["id"], ms_matches[0]["id"])
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 41: Строгие типы, границы размеров, canonical UUID и маскирование логов
+    # --------------------------------------------------------------------------
+    def test_41_strict_schema_types_limits_and_log_masking(self):
+        # 1. Проверка маскирования токена в логах
+        token_secret = "SECRET_SUPER_TOKEN_123"
+        self.api_request("GET", f"/sub/{token_secret}")
+        if os.path.isfile(self.log_file):
+            with open(self.log_file, "r", encoding="utf-8") as f:
+                log_content = f.read()
+                self.assertNotIn(token_secret, log_content)
+                self.assertIn("[REDACTED_TOKEN]", log_content)
+
+        # 2. Имя > 120 символов отклоняется
+        st_long_n, _, _ = self.api_request("POST", "/api/openflux/groups", {
+            "name": "A" * 121,
+            "transport": "mailru",
+            "urls": ["https://cloud.mail.ru/1"]
+        })
+        self.assertEqual(st_long_n, 400)
+
+        # 3. URL > 8192 байт отклоняется
+        st_long_u, _, _ = self.api_request("POST", "/api/openflux/groups", {
+            "name": "Long-URL",
+            "transport": "mailru",
+            "urls": ["https://cloud.mail.ru/" + ("x" * 8200)]
+        })
+        self.assertEqual(st_long_u, 400)
+
+        # 4. Canonical UUID проверка
+        self.assertTrue(is_canonical_uuid("00000000-0000-0000-0000-000000000000"))
+        self.assertFalse(is_canonical_uuid("00000000-0000-0000-0000-00000000000A")) # Uppercase
+        self.assertFalse(is_canonical_uuid("not-a-uuid"))
 
 
 if __name__ == "__main__":

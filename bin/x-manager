@@ -5673,42 +5673,34 @@ import json, sys, base64
 raw = sys.argv[1]
 try:
     data = json.loads(raw)
-    groups = data.get("groups", [])
-    if not groups:
-        print("\033[1;33mБандл пуст: ни одной группы не выбрано.\033[0m")
+    uri = data.get("v2_uri", "")
+    payload = data.get("bundle_payload")
+    if not uri:
+        if not data.get("enabled"):
+            print("\033[1;33mOpenFlux v2 отключен для пользователя.\033[0m")
+        elif not data.get("groups"):
+            print("\033[1;33mБандл пуст: ни одной группы не выбрано.\033[0m")
+        else:
+            print("\033[1;31mСервер подписок не смог сформировать валидный v2_uri (проверьте корректность групп и документов).\033[0m")
         sys.exit(0)
-    
-    payload = {
-        "version": 2,
-        "connection_id": data.get("connection_id", ""),
-        "name": data.get("name", "OpenFlux Bundle"),
-        "mode": data.get("mode", "classic"),
-        "balancer_strategy": data.get("balancer_strategy", "roundRobin"),
-        "groups": []
-    }
-    for g in groups:
-        grp_obj = {
-            "id": g["id"],
-            "name": g["name"],
-            "transport": g["transport"],
-            "urls": g.get("urls", []),
-            "codec": g.get("codec", "legacy")
-        }
-        if g.get("encryption_key"):
-            grp_obj["encryption_key"] = g["encryption_key"]
-        payload["groups"].append(grp_obj)
-        
-    canonical_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    b64url = base64.urlsafe_b64encode(canonical_json.encode("utf-8")).decode("ascii").rstrip("=")
-    uri = f"openflux-bundle://v2/{b64url}"
-    
+
+    if not payload:
+        b64url = uri.replace("openflux-bundle://v2/", "")
+        pad = len(b64url) % 4
+        if pad:
+            b64url += "=" * (4 - pad)
+        raw_b = base64.urlsafe_b64decode(b64url.encode("ascii"))
+        payload = json.loads(raw_b.decode("utf-8"))
+
+    canonical_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    grp_count = len(payload.get("groups", []))
+
     print("\033[1;36mРасшифрованный JSON бандла (payload):\033[0m")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     print("")
     print("\033[1;32mГотовая строка подписки v2 (OpenFlux URI):\033[0m")
     print(f"\033[1;33m{uri}\033[0m")
     print("")
-    grp_count = len(payload.get("groups", []))
     print(f"Размер JSON: {len(canonical_json)} байт | Длина URI: {len(uri)} символов | Групп: {grp_count}")
 except Exception as e:
     print(f"\033[1;31mОшибка формирования предпросмотра: {e}\033[0m")
@@ -5792,19 +5784,18 @@ except Exception as e:
             2)
                 clear
                 echo -e "${CYAN}=== СОЗДАНИЕ НОВОЙ ГРУППЫ OPENFLUX V2 ===${NC}\n"
-                local g_id=""
+                local g_id=$(python3 -c "import uuid; print(str(uuid.uuid4()).lower())")
+                echo -e "ID группы (автоматический UUID): ${GREEN}${g_id}${NC}"
+
+                local g_name=""
                 while true; do
-                    read -p "ID группы (латиница/цифры/дефис, например 'mailru-fast'): " g_id
-                    g_id=$(echo "$g_id" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                    if [[ "$g_id" =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; then
+                    read -p "Отображаемое имя группы (например 'Mail.Ru Channel 1'): " g_name
+                    g_name=$(echo "$g_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                    if [ -n "$g_name" ]; then
                         break
                     fi
-                    echo -e "${RED}Неверный ID. Допустимы только [a-zA-Z0-9_-] длиной от 1 до 64 символов.${NC}"
+                    echo -e "${RED}Имя группы не может быть пустым.${NC}"
                 done
-
-                read -p "Отображаемое имя группы (например 'Mail.Ru Channel 1'): " g_name
-                g_name=$(echo "$g_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                [ -z "$g_name" ] && g_name="$g_id"
 
                 echo ""
                 echo -e "Выберите режим группы:"
@@ -5817,7 +5808,7 @@ except Exception as e:
                 echo ""
                 echo -e "Выберите транспорт группы (контракт v2):"
                 echo -e "  [1] mailru (Облако Mail.ru)"
-                echo -e "  [2] boards (Miro Boards)"
+                echo -e "  [2] boards (Яндекс.Доски)"
                 echo -e "  [3] cupsonline (VK Cups Online)"
                 read -p "Транспорт [1-3, дефолт 1]: " tr_choice
                 local g_tr="mailru"
@@ -5839,13 +5830,13 @@ except Exception as e:
                 local g_urls=()
                 if [ "$g_mode" = "classic" ]; then
                     while true; do
-                        read -p "Введите URL для группы (http/https): " single_url
+                        read -p "Введите URL для группы (https): " single_url
                         single_url=$(echo "$single_url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                        if [[ "$single_url" =~ ^https?://.+ ]]; then
+                        if [[ "$single_url" =~ ^https://.+ ]] && [[ ! "$single_url" =~ , ]]; then
                             g_urls+=("$single_url")
                             break
                         else
-                            echo -e "${RED}URL должен начинаться с http:// или https://${NC}"
+                            echo -e "${RED}URL должен начинаться с https:// и не содержать запятых${NC}"
                         fi
                     done
                 else
@@ -5859,17 +5850,17 @@ except Exception as e:
                             echo -e "${RED}Требуется минимум 1 URL!${NC}"
                             continue
                         fi
-                        if [[ "$u_in" =~ ^https?://.+ ]]; then
+                        if [[ "$u_in" =~ ^https://.+ ]] && [[ ! "$u_in" =~ , ]]; then
                             g_urls+=("$u_in")
                             u_idx=$((u_idx + 1))
                         else
-                            echo -e "${RED}URL должен начинаться с http:// или https://${NC}"
+                            echo -e "${RED}URL должен начинаться с https:// и не содержать запятых${NC}"
                         fi
                     done
                 fi
 
                 echo ""
-                read -p "Ключ шифрования (AES-GCM base64 или строка, Enter - отключено): " g_key
+                read -p "Ключ шифрования (16-4096 байт, Enter - отключено): " g_key
                 g_key=$(echo "$g_key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
                 local payload_json=$(python3 -c '
@@ -5881,7 +5872,7 @@ data = {
     "transport": sys.argv[4],
     "codec": sys.argv[5],
     "urls": [u for u in sys.argv[6].splitlines() if u.strip()],
-    "encryption_key": sys.argv[7] if sys.argv[7] else None
+    "encryption_key": sys.argv[7] if sys.argv[7] else ""
 }
 print(json.dumps(data))
 ' "$g_id" "$g_name" "$g_mode" "$g_tr" "$g_cod" "$(printf '%s\n' "${g_urls[@]}")" "$g_key")
@@ -6392,13 +6383,16 @@ show_openflux_header() {
     local key_status="${YELLOW}Отключено${NC}"
     [ -n "$of_key" ] && key_status="${GREEN}Включено (AES-GCM)${NC}"
 
+    local of_codec_desc="(LZ4)"
+    [ "$of_codec" = "batched" ] && of_codec_desc="(Zstd)"
+
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${BOLD}          РАЗДЕЛ: УПРАВЛЕНИЕ МУЛЬТИКАНАЛЬНЫМ OPENFLUX (1-8)            ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  Сервер:      ${BOLD}${SERVER_IP}${NC}  |  Статус: ${of_status}"
     echo -e "${CYAN}║${NC}  Режим сети:  ${CYAN}L4 (gVisor Userspace Proxy)${NC}  |  Маршрут: $(get_openflux_routing)"
     echo -e "${CYAN}║${NC}  Архитектура: $(get_openflux_pool_mode_label)"
-    echo -e "${CYAN}║${NC}  Транспорт:   ${GREEN}${of_transport}${NC} (дефолт)  |  Кодек: ${MAGENTA}${of_codec}${NC} (LZ4)"
+    echo -e "${CYAN}║${NC}  Транспорт:   ${GREEN}${of_transport}${NC} (дефолт)  |  Кодек: ${MAGENTA}${of_codec}${NC} ${of_codec_desc}"
     echo -e "${CYAN}║${NC}  Шифрование:  ${key_status}  |  Шлюз Xray: :12346 REDIRECT"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -8359,8 +8353,8 @@ menu_openflux() {
                 echo -e "${BOLD}--- ВЫБОР КОДЕКА СЖАТИЯ ДЛЯ ВСЕХ КАНАЛОВ ---${NC}"
                 echo "Текущий кодек: ${of_codec}"
                 echo ""
-                echo " 1) legacy (LZ4 - ОБЯЗАТЕЛЕН для мобильных клиентов Android и iOS!)"
-                echo " 2) batched (zstd + coalescing - для десктопного OpenFlux CLI)"
+                echo " 1) legacy (LZ4)"
+                echo " 2) batched (zstd + coalescing)"
                 read -rp "Выберите кодек [1-2]: " cod_choice
                 case "$cod_choice" in
                     1) set_openflux_prop "CODEC" "legacy"; echo -e "${GREEN}✓ Кодек установлен: legacy (LZ4)${NC}" ;;
