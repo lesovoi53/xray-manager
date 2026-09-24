@@ -6148,9 +6148,6 @@ try:
         j_details = ", ".join(details)
         detail_str = f" ({j_details})" if details else ""
         sub_url = u.get("subscription_url", "")
-        server_ip = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "127.0.0.1"
-        if sub_url and ("127.0.0.1" in sub_url or "0.0.0.0" in sub_url):
-            sub_url = sub_url.replace("127.0.0.1", server_ip).replace("0.0.0.0", server_ip)
         print("──────────────────────────────────────────────────────────────────────")
         print(f"👤 Пользователь: \033[1;32m{nick}\033[0m")
         print(f"🆔 ID:           {uid}")
