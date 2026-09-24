@@ -6076,9 +6076,17 @@ sync_tuna_sub_daemon() {
     fi
 }
 
+sync_openflux_to_sub_server() {
+    local sub_api="http://127.0.0.1:22217"
+    if curl -s "${sub_api}/health" >/dev/null 2>&1; then
+        curl -s -X POST "${sub_api}/api/openflux/import-local" >/dev/null 2>&1 || true
+    fi
+}
+
 menu_subscriptions() {
     local SUB_API="http://127.0.0.1:22217"
     sync_tuna_sub_daemon
+    sync_openflux_to_sub_server
 
     while true; do
         clear
@@ -8281,6 +8289,7 @@ menu_openflux() {
                         echo -e "${YELLOW}Канал ${target_ch} отключен.${NC}"
                     fi
                 fi
+                sync_openflux_to_sub_server
                 sleep 2
                 ;;
             2)
@@ -8319,6 +8328,7 @@ menu_openflux() {
                 done
                 echo ""
                 echo -e "${GREEN}${BOLD}✓ Настройка завершена!${NC}"
+                sync_openflux_to_sub_server
                 sleep 2
                 ;;
             3)
@@ -8346,6 +8356,7 @@ menu_openflux() {
                         systemctl restart "openflux@$r_ch"
                     fi
                 done
+                sync_openflux_to_sub_server
                 sleep 2
                 ;;
             4)
@@ -8366,6 +8377,7 @@ menu_openflux() {
                         systemctl restart "openflux@$r_ch"
                     fi
                 done
+                sync_openflux_to_sub_server
                 sleep 2
                 ;;
             5)
@@ -8408,6 +8420,7 @@ menu_openflux() {
                         systemctl restart "openflux@$r_ch"
                     fi
                 done
+                sync_openflux_to_sub_server
                 sleep 3
                 ;;
             6)
