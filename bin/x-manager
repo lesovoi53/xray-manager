@@ -6589,26 +6589,27 @@ test_all_webdav_accounts() {
     local s_user=$(get_wdavtunnel_prop "SELFHOSTED_LOGIN" "lesovoi")
     local s_pass=$(get_wdavtunnel_prop "SELFHOSTED_PASSWORD" "")
     echo -e " ${BOLD}1. Встроенный сервер VPS (Selfhosted :${s_port}):${NC} логин: ${s_user:-[нет]}"
-    test_webdav_account "selfhosted" "$s_user" "$s_pass" "http://127.0.0.1:${s_port}/"
+    test_webdav_account "selfhosted" "$s_user" "$s_pass" "http://127.0.0.1:${s_port}/" || true
 
     local m_user=$(get_wdavtunnel_prop "MAILRU_LOGIN" "")
     local m_pass=$(get_wdavtunnel_prop "MAILRU_PASSWORD" "")
     echo -e " ${BOLD}2. Облако Mail.ru (webdav.cloud.mail.ru):${NC} логин: ${m_user:-[нет]}"
-    test_webdav_account "mailru" "$m_user" "$m_pass" ""
+    test_webdav_account "mailru" "$m_user" "$m_pass" "" || true
 
     local y_user=$(get_wdavtunnel_prop "YANDEX_LOGIN" "")
     local y_pass=$(get_wdavtunnel_prop "YANDEX_PASSWORD" "")
     echo -e " ${BOLD}3. Яндекс Диск (webdav.yandex.ru):${NC} логин: ${y_user:-[нет]}"
-    test_webdav_account "yandex" "$y_user" "$y_pass" ""
+    test_webdav_account "yandex" "$y_user" "$y_pass" "" || true
 
     local c_url=$(get_wdavtunnel_prop "CUSTOM_URL" "")
     local c_user=$(get_wdavtunnel_prop "CUSTOM_LOGIN" "")
     local c_pass=$(get_wdavtunnel_prop "CUSTOM_PASSWORD" "")
     if [ -n "$c_url" ] || [ -n "$c_user" ]; then
         echo -e " ${BOLD}4. Пользовательский сервер (Custom):${NC} URL: ${c_url:-[нет]}"
-        test_webdav_account "custom" "$c_user" "$c_pass" "$c_url"
+        test_webdav_account "custom" "$c_user" "$c_pass" "$c_url" || true
     fi
     echo ""
+    return 0
 }
 
 menu_webdav_tunnel() {
@@ -7187,7 +7188,7 @@ test_openflux_link() {
 
     if [ -z "$target_url" ]; then
         echo -e "   ${YELLOW}[НЕ НАСТРОЕН] (ссылка пуста)${NC}"
-        return 1
+        return 0
     fi
 
     # Разбор списка URL для Multi-Stream (если несколько через запятую)
@@ -7284,12 +7285,13 @@ test_all_openflux_channels() {
                 is_multi="${CYAN}[Одиночный]${NC}"
             fi
             echo -e " ${BOLD}Канал $ch ${is_multi} [${ch_tr}]:${NC}"
-            test_openflux_link "$ch_url" "$ch_tr"
+            test_openflux_link "$ch_url" "$ch_tr" || true
         else
             echo -e " ${GRAY}Канал $ch: [НЕ НАСТРОЕН] (ссылка не задана)${NC}"
         fi
     done
     echo ""
+    return 0
 }
 
 menu_openflux() {
