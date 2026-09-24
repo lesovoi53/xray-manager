@@ -818,7 +818,7 @@ if [ "$INSTALL_OPENFLUX" = "yes" ]; then
             cat << EOF_CH > "$cf"
 ROLE="exit"
 MODE="l4"
-TRANSPORT="vyandex"
+TRANSPORT="mailru"
 CODEC="legacy"
 DEBUG="1"
 URL=""

@@ -220,9 +220,9 @@ init_openflux_profiles() {
     # Инициализация профиля multistream если он пуст
     local ms_count=$(ls -A "${OPENFLUX_DIR}/profiles/multistream" 2>/dev/null | grep -E '^[1-8]\.env' | wc -l)
     if [ "$ms_count" -eq 0 ]; then
-        local of_tr="vyandex"
+        local of_tr="mailru"
         [ -f "${OPENFLUX_INSTANCES_DIR}/1.env" ] && of_tr=$(grep -oP '^TRANSPORT=\K.*' "${OPENFLUX_INSTANCES_DIR}/1.env" | tr -d '"' | head -n1)
-        [ -z "$of_tr" ] && of_tr="vyandex"
+        [ -z "$of_tr" ] && of_tr="mailru"
         local of_cod="legacy"
         local of_dbg="1"
         local of_k=""
@@ -339,7 +339,7 @@ get_openflux_routing() {
 
 detect_transport_from_url() {
     local raw_u="$1"
-    local fallback="${2:-vyandex}"
+    local fallback="${2:-mailru}"
     local u=$(echo "$raw_u" | cut -d',' -f1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if [[ "$u" =~ boards\.yandex\.ru || "$u" =~ /whiteboard || "$u" =~ /guest/\?hash= ]]; then
         echo "boards"
@@ -348,11 +348,7 @@ detect_transport_from_url() {
     elif [[ "$u" =~ cups\.online ]]; then
         echo "cupsonline"
     elif [[ "$u" =~ disk\.yandex\.ru || "$u" =~ docs\.yandex\.ru ]]; then
-        if [ "$fallback" = "yandex" ]; then
-            echo "yandex"
-        else
-            echo "vyandex"
-        fi
+        echo "unsupported_yandex"
     else
         echo "$fallback"
     fi
@@ -5769,7 +5765,7 @@ show_openflux_header() {
     local of_cfg=$(echo "$of_counts" | cut -d':' -f2)
     local of_status="${RED}ОСТАНОВЛЕН${NC}"
     [ "$of_act" -gt 0 ] && of_status="${GREEN}АКТИВНО: ${of_act}/8${NC}"
-    local of_transport=$(get_openflux_prop "TRANSPORT" "vyandex")
+    local of_transport=$(get_openflux_prop "TRANSPORT" "mailru")
     local of_codec=$(get_openflux_prop "CODEC" "legacy")
     local of_key=$(get_openflux_prop "ENCRYPTION_KEY" "")
     local key_status="${YELLOW}Отключено${NC}"
@@ -5905,7 +5901,7 @@ if [ -f "$ENV_FILE" ]; then
 fi
 ROLE="${ROLE:-exit}"
 MODE="${MODE:-l4}"
-TRANSPORT="${TRANSPORT:-vyandex}"
+TRANSPORT="${TRANSPORT:-mailru}"
 URL="${URL:-}"
 CODEC="${CODEC:-legacy}"
 DEBUG="${DEBUG:-1}"
@@ -7362,31 +7358,11 @@ test_openflux_link() {
             cupsonline)
                 echo -e "   ${prefix}${GREEN}✓ [cups.online] Комнаты интервью live-coding${NC}"
                 ;;
+            unsupported_yandex|vyandex|yandex)
+                echo -e "   ${prefix}${RED}✗ [ОТКЛЮЧЕН] Яндекс.Документы (Волга) отключены из-за блокировки SmartCaptcha на хостингах. Используйте Яндекс.Доски (boards.yandex.ru), Mail.ru или Cups.online!${NC}"
+                ;;
             *)
-                # yandex / vyandex
-                local headers_tmp="/tmp/ycheck_$$.hdr"
-                local body_tmp="/tmp/ycheck_$$.body"
-                curl -s -m 8 -D "$headers_tmp" -o "$body_tmp" "$u" 2>/dev/null || true
-                local final_loc=$(grep -i "^Location:" "$headers_tmp" 2>/dev/null | tail -n 1 | tr -d '\r\n')
-                local http_status=$(head -n 1 "$headers_tmp" 2>/dev/null | awk '{print $2}')
-                rm -f "$headers_tmp" 2>/dev/null || true
-
-                if [[ "$final_loc" =~ passport\.yandex\.ru || "$final_loc" =~ /auth ]]; then
-                    echo -e "   ${prefix}${RED}✗ [ПРИВАТНЫЙ] Документ требует логина! Откройте 'Доступ по ссылке'${NC}"
-                elif [[ "$final_loc" =~ showcaptchafast ]]; then
-                    echo -e "   ${prefix}${YELLOW}⚠ [Капча Яндекса] Сработает авто-обход при запуске туннеля${NC}"
-                elif [ "$http_status" = "404" ] || [ "$http_status" = "410" ]; then
-                    echo -e "   ${prefix}${RED}✗ [HTTP 404] Документ не найден или удален${NC}"
-                elif [ "$http_status" = "200" ] || [ "$http_status" = "302" ]; then
-                    if grep -qi '"canEdit":false' "$body_tmp" 2>/dev/null || grep -qi 'readonly' "$body_tmp" 2>/dev/null; then
-                        echo -e "   ${prefix}${YELLOW}⚠ [ТОЛЬКО ЧТЕНИЕ] Включите в Яндекс Диске права 'С правом редактирования'!${NC}"
-                    else
-                        echo -e "   ${prefix}${GREEN}✓ [Яндекс Документ] Доступен для редактирования и туннелирования!${NC}"
-                    fi
-                else
-                    echo -e "   ${prefix}${RED}✗ Ошибка проверки ссылки (код ${http_status:-000})${NC}"
-                fi
-                rm -f "$body_tmp" 2>/dev/null || true
+                echo -e "   ${prefix}${YELLOW}ℹ Транспорт: ${detected_tr}${NC}"
                 ;;
         esac
         idx=$((idx + 1))
@@ -7401,7 +7377,7 @@ test_all_openflux_channels() {
     echo ""
     for ch in 1 2 3 4 5 6 7 8; do
         local ch_url=$(get_openflux_channel_prop "$ch" "URL" "")
-        local ch_tr=$(get_openflux_channel_prop "$ch" "TRANSPORT" "vyandex")
+        local ch_tr=$(get_openflux_channel_prop "$ch" "TRANSPORT" "mailru")
         if [ -n "$ch_url" ]; then
             local is_multi=""
             if [[ "$ch_url" =~ , ]]; then
@@ -7589,14 +7565,14 @@ menu_openflux() {
         echo -e "  ${PURPLE}[M]${NC} 🔀 ${BOLD}Архитектурный режим:${NC} [1] Классический балансир (8×1) ↔ [2] Multi-Stream (8×4, PR #56)"
         echo -e "  ${YELLOW}[1]${NC} 🔗 Выбрать и настроить ссылку для канала (1-8)"
         echo -e "  ${YELLOW}[2]${NC} ⚡ Мастер настройки всех 8 каналов подряд"
-        echo -e "  ${YELLOW}[3]${NC} 🔄 Сменить транспорт по умолчанию (vyandex / boards / mailru / yandex)"
+        echo -e "  ${YELLOW}[3]${NC} 🔄 Сменить транспорт по умолчанию (mailru / boards / cupsonline)"
         echo -e "  ${YELLOW}[4]${NC} 📦 Сменить кодек сжатия (1: legacy [LZ4], 2: batched [zstd])"
         echo -e "  ${YELLOW}[5]${NC} 🔐 Управление сквозным ключом шифрования AES-256-GCM"
         echo -e "  ${YELLOW}[6]${NC} 🐞 Переключить режим отладки Debug (вкл/выкл в journalctl)"
         echo -e "  ${YELLOW}[7]${NC} 🌐 Маршрутизация трафика (Xray REDIRECT / Прямой выход)"
         echo -e "  ${YELLOW}[8]${NC} ▶️  Запустить / перезапустить ВСЕ настроенные каналы"
         echo -e "  ${YELLOW}[9]${NC} ⏹️  Остановить ВСЕ каналы OpenFlux"
-        echo -e "  ${PURPLE}[T]${NC} 🧪 ${BOLD}Экспресс-тест ссылок всех каналов 1-8 (Доски / Волга / Mail.ru)${NC}"
+        echo -e "  ${PURPLE}[T]${NC} 🧪 ${BOLD}Экспресс-тест ссылок всех каналов 1-8 (Доски / Mail.ru / Cups)${NC}"
         echo -e "  ${PURPLE}[B]${NC} ⚡ ${BOLD}Замер скорости API транспорта (сырой бенчмарк облака 1-8)${NC}"
         echo -e "  ${YELLOW}[10]${NC} 📜 Просмотр последних 30 строк логов (выбор канала 1-8 или общий)"
         echo -e "  ${YELLOW}[11]${NC} 🔍 Мониторинг логов в реальном времени (live follow)"
@@ -7636,7 +7612,7 @@ menu_openflux() {
                     echo "  Введите 1 ссылку на облачный документ для этого независимого канала."
                     echo "  Ссылки сохраняются изолированно в профиле Классического балансира."
                 fi
-                echo "• Поддерживаются: Яндекс Доски (boards.yandex.ru), Яндекс Волга, Облако Mail.ru."
+                echo "• Поддерживаются: Яндекс Доски (boards.yandex.ru), Облако Mail.ru, Cups.online."
                 echo "• Оставьте пустым и нажмите Enter, чтобы очистить ссылку (отключить канал)."
                 echo ""
                 read -rp "Новая ссылка: " new_u
@@ -7645,21 +7621,17 @@ menu_openflux() {
                     echo ""
                     echo -e "${CYAN}ℹ Выбор транспорта для Канала ${target_ch}:${NC}"
                     echo " 1) $auto_tr (определен автоматически по ссылке)"
-                    echo " 2) boards    (Яндекс Доски - boards.yandex.ru)"
-                    echo " 3) vyandex   (Яндекс Волга)"
-                    echo " 4) mailru    (Mail.ru Документы)"
-                    echo " 5) yandex    (Яндекс OnlyOffice)"
-                    echo " 6) oneme     (MAX Messenger / VK Calls)"
-                    echo " 7) cupsonline (Cups.online)"
-                    read -rp "Транспорт [1-7, Enter для '$auto_tr']: " sel_tr
+                    echo " 2) mailru     (Облако Mail.ru - docs.datacloudmail.ru)"
+                    echo " 3) boards     (Яндекс Доски - boards.yandex.ru)"
+                    echo " 4) cupsonline (Cups.online - комнаты live-coding)"
+                    echo " 5) oneme      (MAX Messenger / VK Calls)"
+                    read -rp "Транспорт [1-5, Enter для '$auto_tr']: " sel_tr
                     local use_tr="$auto_tr"
                     case "$sel_tr" in
-                        2) use_tr="boards" ;;
-                        3) use_tr="vyandex" ;;
-                        4) use_tr="mailru" ;;
-                        5) use_tr="yandex" ;;
-                        6) use_tr="oneme" ;;
-                        7) use_tr="cupsonline" ;;
+                        2) use_tr="mailru" ;;
+                        3) use_tr="boards" ;;
+                        4) use_tr="cupsonline" ;;
+                        5) use_tr="oneme" ;;
                         *) use_tr="$auto_tr" ;;
                     esac
                     echo ""
@@ -7707,8 +7679,8 @@ menu_openflux() {
                     echo -e "• ${YELLOW}[Режим 1: Классический балансир (8×1)]${NC}"
                     echo "  Для каждого канала вводите 1 ссылку на облачный документ."
                 fi
-                echo "Введите по очереди ссылки на документы Яндекс / Mail.ru (с правом редактирования)."
-                echo "Транспорт (vyandex / boards / mailru) определяется автоматически по формату ссылки."
+                echo "Введите по очереди ссылки на документы Яндекс / Mail.ru / Cups."
+                echo "Транспорт (mailru / boards / cupsonline) определяется автоматически по формату ссылки."
                 echo "Нажмите Enter без ввода, чтобы оставить текущую ссылку без изменений."
                 echo ""
                 for m_ch in 1 2 3 4 5 6 7 8; do
@@ -7739,17 +7711,15 @@ menu_openflux() {
                 echo -e "${BOLD}--- ВЫБОР РЕЖИМА ТРАНСПОРТА ДЛЯ ВСЕХ КАНАЛОВ ---${NC}"
                 echo "Текущий транспорт по умолчанию: ${of_transport}"
                 echo ""
-                echo " 1) Яндекс Волга (vyandex - современный редактор Яндекс 360 / Диск, рекомендуется)"
-                echo " 2) Яндекс Доски (boards - boards.yandex.ru, интерактивная доска, авто-обход капчи)"
-                echo " 3) Mail.ru Документы (mailru - docs.datacloudmail.ru, Облако Mail.ru)"
-                echo " 4) Яндекс.Документы (yandex - классический OnlyOffice редактор)"
-                read -rp "Выберите транспорт [1-4]: " tr_choice
+                echo " 1) Mail.ru Документы (mailru - docs.datacloudmail.ru, Облако Mail.ru, рекомендуется)"
+                echo " 2) Яндекс Доски (boards - boards.yandex.ru, интерактивная доска, без капчи)"
+                echo " 3) Cups.online (cupsonline - комнаты live-coding)"
+                read -rp "Выберите транспорт [1-3]: " tr_choice
                 local new_tr=""
                 case "$tr_choice" in
-                    1) new_tr="vyandex" ;;
+                    1) new_tr="mailru" ;;
                     2) new_tr="boards" ;;
-                    3) new_tr="mailru" ;;
-                    4) new_tr="yandex" ;;
+                    3) new_tr="cupsonline" ;;
                     *) echo -e "${YELLOW}Без изменений.${NC}" ;;
                 esac
                 if [ -n "$new_tr" ]; then
