@@ -861,6 +861,15 @@ if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = "yes" ]; then
         echo -e "  ✓ Бинарный файл /usr/local/bin/webdav-tunnel уже установлен"
     fi
 
+    # Runner script
+    if [ -f "$SCRIPT_DIR/scripts/webdav-tunnel-runner.sh" ]; then
+        cp -f "$SCRIPT_DIR/scripts/webdav-tunnel-runner.sh" /usr/local/bin/webdav-tunnel-runner.sh
+    else
+        curl -fsSL -o /usr/local/bin/webdav-tunnel-runner.sh \
+            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/webdav-tunnel-runner.sh?v=$(date +%s)" 2>/dev/null || true
+    fi
+    chmod +x /usr/local/bin/webdav-tunnel-runner.sh 2>/dev/null || true
+
     # Routing script
     if [ -f "$SCRIPT_DIR/scripts/webdav-tunnel-routing.sh" ]; then
         cp -f "$SCRIPT_DIR/scripts/webdav-tunnel-routing.sh" /usr/local/bin/webdav-tunnel-routing.sh

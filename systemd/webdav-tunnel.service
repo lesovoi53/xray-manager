@@ -1,36 +1,29 @@
 [Unit]
 Description=WebDAV Tunnel (TCP over WebDAV - selfhosted relay)
 Documentation=https://github.com/spkprsnts/webdav-tunnel
-After=network-online.target xray.service
+After=network-online.target
 Wants=network-online.target
-BindsTo=webdav-tunnel-routing.service
 
 [Service]
 Type=simple
 User=wdavtunnel
 Group=wdavtunnel
-EnvironmentFile=/etc/webdav-tunnel/config.env
+EnvironmentFile=-/etc/webdav-tunnel/config.env
 
-# Применить iptables-правила ДО старта туннеля
-ExecStartPre=/usr/local/bin/webdav-tunnel-routing.sh up
+# Применить iptables-правила ДО старта туннеля (с правами root через +)
+ExecStartPre=+/usr/local/bin/webdav-tunnel-routing.sh up
 
-# Запуск в selfhosted-режиме: встроенный WebDAV + relay в одном процессе
-ExecStart=/usr/local/bin/webdav-tunnel \
-    -mode selfhosted \
-    -webdav-listen ${WEBDAV_LISTEN} \
-    -webdav-storage ${WEBDAV_STORAGE} \
-    -login ${WEBDAV_LOGIN} \
-    -password ${WEBDAV_PASSWORD} \
-    -enc ${WEBDAV_ENC}
+# Запуск в selfhosted-режиме через runner-скрипт
+ExecStart=/usr/local/bin/webdav-tunnel-runner.sh
 
 # Убрать правила при остановке
-ExecStopPost=/usr/local/bin/webdav-tunnel-routing.sh down
+ExecStopPost=+/usr/local/bin/webdav-tunnel-routing.sh down
 
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
 
-# Изолированное пространство имён: не видит других процессов
+# Изолированное пространство имён
 PrivateTmp=true
 NoNewPrivileges=true
 ProtectSystem=strict

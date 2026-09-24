@@ -72,6 +72,7 @@ WDAVTUNNEL_DIR="/etc/webdav-tunnel"
 WDAVTUNNEL_CONFIG_ENV="/etc/webdav-tunnel/config.env"
 WDAVTUNNEL_STORAGE="/var/lib/webdav-tunnel/data"
 WDAVTUNNEL_BIN="/usr/local/bin/webdav-tunnel"
+WDAVTUNNEL_RUNNER="/usr/local/bin/webdav-tunnel-runner.sh"
 WDAVTUNNEL_ROUTING="/usr/local/bin/webdav-tunnel-routing.sh"
 WDAVTUNNEL_SERVICE="webdav-tunnel"
 WDAVTUNNEL_USER="wdavtunnel"
@@ -5966,9 +5967,17 @@ EOF_CFG
                         chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV"
                         chmod 640 "$WDAVTUNNEL_CONFIG_ENV"
                     fi
-                    # Routing script
+                    # Runner script
                     local sd
                     sd=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+                    if [ -f "$sd/../scripts/webdav-tunnel-runner.sh" ]; then
+                        cp -f "$sd/../scripts/webdav-tunnel-runner.sh" "$WDAVTUNNEL_RUNNER"
+                    else
+                        curl -fsSL -o "$WDAVTUNNEL_RUNNER" \
+                            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/webdav-tunnel-runner.sh?v=$(date +%s)" 2>/dev/null || true
+                    fi
+                    chmod +x "$WDAVTUNNEL_RUNNER" 2>/dev/null || true
+                    # Routing script
                     if [ -f "$sd/../scripts/webdav-tunnel-routing.sh" ]; then
                         cp -f "$sd/../scripts/webdav-tunnel-routing.sh" "$WDAVTUNNEL_ROUTING"
                     else
