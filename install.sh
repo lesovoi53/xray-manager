@@ -824,6 +824,85 @@ EOF_CH
     echo -e "  ✓ 8 каналов OpenFlux инициализированы (L4, Xray REDIRECT :${XRAY_REDIRECT_PORT})"
 fi
 
+# Установка WebDAV Tunnel (TCP over WebDAV, selfhosted mode)
+if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = "yes" ]; then
+    echo -e "${CYAN}==> Шаг 6b: Установка WebDAV Tunnel (TCP over WebDAV, selfhosted)...${NC}"
+    WDAVTUNNEL_USER="wdavtunnel"
+    WDAVTUNNEL_DIR="/etc/webdav-tunnel"
+    WDAVTUNNEL_STORAGE="/var/lib/webdav-tunnel/data"
+
+    id -u "$WDAVTUNNEL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$WDAVTUNNEL_USER" 2>/dev/null || true
+    mkdir -p "$WDAVTUNNEL_DIR" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel"
+
+    # Проверка/установка Go (используем тот же компилятор, что и для OpenFlux)
+    export PATH=$PATH:/usr/local/go/bin
+    if ! command -v go >/dev/null 2>&1 && [ ! -x /usr/local/go/bin/go ]; then
+        apt-get install -y -qq golang-go >/dev/null 2>&1 || true
+    fi
+
+    # Компиляция webdav-tunnel если бинарник отсутствует
+    if [ ! -f "/usr/local/bin/webdav-tunnel" ]; then
+        if command -v go >/dev/null 2>&1; then
+            tmp_wdt="/tmp/webdav_tunnel_build_$(date +%s)"
+            rm -rf "$tmp_wdt"
+            echo -e "  -> Клонирование и компиляция spkprsnts/webdav-tunnel..."
+            if git clone --depth 1 https://github.com/spkprsnts/webdav-tunnel.git "$tmp_wdt" >/dev/null 2>&1; then
+                (cd "$tmp_wdt" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /usr/local/bin/webdav-tunnel . && chmod +x /usr/local/bin/webdav-tunnel)
+                rm -rf "$tmp_wdt"
+                echo -e "  ✓ /usr/local/bin/webdav-tunnel успешно скомпилирован"
+            else
+                echo -e "${YELLOW}  ! Не удалось клонировать webdav-tunnel. Установите позже через x-manager [14].${NC}"
+                rm -rf "$tmp_wdt"
+            fi
+        else
+            echo -e "${YELLOW}  ! Компилятор Go недоступен. Сборку webdav-tunnel можно выполнить позже через x-manager [14].${NC}"
+        fi
+    else
+        echo -e "  ✓ Бинарный файл /usr/local/bin/webdav-tunnel уже установлен"
+    fi
+
+    # Routing script
+    if [ -f "$SCRIPT_DIR/scripts/webdav-tunnel-routing.sh" ]; then
+        cp -f "$SCRIPT_DIR/scripts/webdav-tunnel-routing.sh" /usr/local/bin/webdav-tunnel-routing.sh
+    else
+        curl -fsSL -o /usr/local/bin/webdav-tunnel-routing.sh \
+            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/webdav-tunnel-routing.sh?v=$(date +%s)" 2>/dev/null || true
+    fi
+    chmod +x /usr/local/bin/webdav-tunnel-routing.sh 2>/dev/null || true
+
+    # Systemd unit
+    if [ -f "$SCRIPT_DIR/systemd/webdav-tunnel.service" ]; then
+        cp -f "$SCRIPT_DIR/systemd/webdav-tunnel.service" /etc/systemd/system/webdav-tunnel.service
+    else
+        curl -fsSL -o /etc/systemd/system/webdav-tunnel.service \
+            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/systemd/webdav-tunnel.service?v=$(date +%s)" 2>/dev/null || true
+    fi
+
+    # Конфиг по умолчанию (если ещё нет)
+    if [ ! -f "$WDAVTUNNEL_DIR/config.env" ]; then
+        wdav_pass=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 24 2>/dev/null || date +%s | sha256sum | head -c 24)
+        cat > "$WDAVTUNNEL_DIR/config.env" <<EOF_WDAV
+WEBDAV_LISTEN=":8443"
+WEBDAV_STORAGE="${WDAVTUNNEL_STORAGE}"
+WEBDAV_LOGIN="wdav"
+WEBDAV_PASSWORD="${wdav_pass}"
+WEBDAV_ENC="false"
+ROUTING_MODE="xray"
+XRAY_REDIRECT_PORT="${XRAY_REDIRECT_PORT}"
+EOF_WDAV
+        chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_DIR/config.env"
+        chmod 640 "$WDAVTUNNEL_DIR/config.env"
+    fi
+
+    chown -R "$WDAVTUNNEL_USER:$WDAVTUNNEL_USER" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel" 2>/dev/null || true
+    # Symlinks
+    ln -sf /usr/local/bin/x-manager /usr/local/bin/x-webdav 2>/dev/null || true
+    ln -sf /usr/local/bin/x-manager /usr/local/bin/x-wdav 2>/dev/null || true
+    systemctl daemon-reload
+    echo -e "  ✓ WebDAV Tunnel инициализирован (selfhosted :8443, Xray REDIRECT :${XRAY_REDIRECT_PORT})"
+    echo -e "  ✓ Управление: x-webdav | x-manager → пункт [14]"
+fi
+
 # Настройка безопасности (Блокировка шлюзов извне и открытие портов протоколов)
 echo -e "${CYAN}==> Шаг 7: Настройка сетевой безопасности...${NC}"
 iptables -I INPUT 1 -i "$WAN_IF" -p tcp --dport "${XRAY_TPROXY_PORT}" -j DROP 2>/dev/null || true

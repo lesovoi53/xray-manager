@@ -68,6 +68,14 @@ OPENFLUX_ROUTING="/usr/local/bin/openflux-routing.sh"
 OPENFLUX_SERVICE_TEMPLATE="/etc/systemd/system/openflux@.service"
 OPENFLUX_ENV="/etc/openflux/openflux.env"
 
+WDAVTUNNEL_DIR="/etc/webdav-tunnel"
+WDAVTUNNEL_CONFIG_ENV="/etc/webdav-tunnel/config.env"
+WDAVTUNNEL_STORAGE="/var/lib/webdav-tunnel/data"
+WDAVTUNNEL_BIN="/usr/local/bin/webdav-tunnel"
+WDAVTUNNEL_ROUTING="/usr/local/bin/webdav-tunnel-routing.sh"
+WDAVTUNNEL_SERVICE="webdav-tunnel"
+WDAVTUNNEL_USER="wdavtunnel"
+
 
 WAN_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n 1)
 [ -z "$WAN_IF" ] && WAN_IF="ens3"
@@ -108,6 +116,10 @@ is_dns_installed() {
 
 is_openflux_installed() {
     [ -f "$OPENFLUX_BIN" ] || [ -f "$OPENFLUX_SERVICE_TEMPLATE" ] || [ -d "$OPENFLUX_DIR" ]
+}
+
+is_webdav_tunnel_installed() {
+    [ -f "$WDAVTUNNEL_BIN" ] || [ -f "/etc/systemd/system/${WDAVTUNNEL_SERVICE}.service" ] || [ -d "$WDAVTUNNEL_DIR" ]
 }
 
 get_openflux_channel_prop() {
@@ -3574,6 +3586,16 @@ rescan_and_adopt_protocols() {
         echo -e "  ${RED}[✗] OpenFlux (L4)${NC}:        Не установлен"
     fi
 
+    # WebDAV Tunnel
+    if is_webdav_tunnel_installed; then
+        [ ! -L "/usr/local/bin/x-webdav" ] && ln -sf /usr/local/bin/x-manager /usr/local/bin/x-webdav 2>/dev/null || true
+        [ ! -L "/usr/local/bin/x-wdav" ] && ln -sf /usr/local/bin/x-manager /usr/local/bin/x-wdav 2>/dev/null || true
+        echo -e "  ${GREEN}[✓] WebDAV Tunnel${NC}:        Обнаружен! $(get_wdavtunnel_status) | Порт: :$(get_wdavtunnel_listen_port)/TCP"
+        count=$((count + 1))
+    else
+        echo -e "  ${RED}[✗] WebDAV Tunnel${NC}:        Не установлен"
+    fi
+
     # Firewall aliases
     [ ! -L "/usr/local/bin/x-fw" ] && ln -sf /usr/local/bin/x-manager /usr/local/bin/x-fw 2>/dev/null || true
     [ ! -L "/usr/local/bin/x-firewall" ] && ln -sf /usr/local/bin/x-manager /usr/local/bin/x-firewall 2>/dev/null || true
@@ -3660,6 +3682,11 @@ view_global_status() {
     else
         printf "  %-22s %-25b\n" "OpenFlux (L4):" "$(get_openflux_status)"
     fi
+    if is_webdav_tunnel_installed; then
+        printf "  %-22s %-25b [Порт: :%s/TCP | %b]\n" "WebDAV Tunnel:" "$(get_wdavtunnel_status)" "$(get_wdavtunnel_listen_port)" "$(get_wdavtunnel_routing)"
+    else
+        printf "  %-22s %b\n" "WebDAV Tunnel:" "${RED}НЕ УСТАНОВЛЕН${NC}"
+    fi
     local xray_st="inactive"
     if systemctl is-active --quiet xray 2>/dev/null; then
         xray_st="${GREEN}active (xray.service)${NC}"
@@ -3693,7 +3720,7 @@ view_global_status() {
 
 restart_all_services() {
     clear
-    echo -e "${YELLOW}Перезапуск всех сетевых служб (Mieru, Snell, WDTT, CSQTT, DNS)...${NC}"
+    echo -e "${YELLOW}Перезапуск всех сетевых служб (Mieru, Snell, WDTT, CSQTT, DNS, OpenFlux, WebDAV Tunnel)...${NC}"
     systemctl restart mita 2>/dev/null || true
     systemctl restart snell 2>/dev/null || true
     systemctl restart wdtt 2>/dev/null || true
@@ -3711,6 +3738,9 @@ restart_all_services() {
             fi
         done
     fi
+    if is_webdav_tunnel_installed; then
+        systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
+    fi
     sleep 2
     echo -e "Mieru: $(get_mieru_status)"
     echo -e "Snell: $(get_snell_status)"
@@ -3720,6 +3750,9 @@ restart_all_services() {
     fi
     if is_dns_installed; then
         echo -e "DNS:   $(get_dns_status)"
+    fi
+    if is_webdav_tunnel_installed; then
+        echo -e "WebDAV Tunnel: $(get_wdavtunnel_status)"
     fi
     sync_active_firewall_rules
     sleep 2
@@ -5789,6 +5822,344 @@ EOF_UNIT
     read -p "Нажмите Enter для продолжения..." dummy
 }
 
+# ==============================================================================
+# WEBDAV TUNNEL — Хелперы (чтение/запись конфига, статус)
+# ==============================================================================
+
+get_wdavtunnel_prop() {
+    local prop="$1"
+    local default="${2:-}"
+    local val=""
+    if [ -f "$WDAVTUNNEL_CONFIG_ENV" ]; then
+        val=$(grep -oP "^${prop}=\\K.*" "$WDAVTUNNEL_CONFIG_ENV" | tr -d '"' | tr -d "'" | head -n 1)
+    fi
+    echo "${val:-$default}"
+}
+
+set_wdavtunnel_prop() {
+    local prop="$1"
+    local val="$2"
+    mkdir -p "$WDAVTUNNEL_DIR"
+    [ ! -f "$WDAVTUNNEL_CONFIG_ENV" ] && touch "$WDAVTUNNEL_CONFIG_ENV"
+    if grep -q "^${prop}=" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null; then
+        sed -i "s|^${prop}=.*|${prop}=\"${val}\"|" "$WDAVTUNNEL_CONFIG_ENV"
+    else
+        echo "${prop}=\"${val}\"" >> "$WDAVTUNNEL_CONFIG_ENV"
+    fi
+}
+
+get_wdavtunnel_status() {
+    if ! is_webdav_tunnel_installed; then
+        echo -e "${RED}НЕ УСТАНОВЛЕН${NC}"
+        return
+    fi
+    if systemctl is-active --quiet "$WDAVTUNNEL_SERVICE" 2>/dev/null; then
+        echo -e "${GREEN}🟢 АКТИВЕН${NC}"
+    else
+        echo -e "${RED}🔴 ОСТАНОВЛЕН${NC}"
+    fi
+}
+
+get_wdavtunnel_routing() {
+    local mode=$(get_wdavtunnel_prop "ROUTING_MODE" "xray")
+    if [ "$mode" = "xray" ]; then
+        echo -e "${GREEN}→ Xray REDIRECT (:${XRAY_REDIRECT_PORT:-12346})${NC}"
+    else
+        echo -e "${YELLOW}→ Прямой выход (WAN)${NC}"
+    fi
+}
+
+get_wdavtunnel_listen_port() {
+    local listen=$(get_wdavtunnel_prop "WEBDAV_LISTEN" ":8443")
+    echo "$listen" | grep -oP ':\K[0-9]+$' || echo "8443"
+}
+
+get_wdavtunnel_client_uri() {
+    local port=$(get_wdavtunnel_listen_port)
+    local login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "")
+    local pass=$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "")
+    local enc=$(get_wdavtunnel_prop "WEBDAV_ENC" "false")
+    local srv="${SERVER_IP:-YOUR_SERVER_IP}"
+    if [ -z "$login" ] || [ -z "$pass" ]; then
+        echo "(не настроен — укажите логин и пароль)"
+        return
+    fi
+    local uri="webdav://${login}:${pass}@${srv}:${port}"
+    if [ "$enc" = "true" ] || [ "$enc" = "1" ]; then
+        uri="${uri}?enc=1"
+    fi
+    echo "$uri"
+}
+
+# Сборка webdav-tunnel из исходников
+build_webdav_tunnel_binary() {
+    echo -e "${YELLOW}  → Сборка webdav-tunnel из исходников (spkprsnts/webdav-tunnel)...${NC}"
+    export PATH=$PATH:/usr/local/go/bin
+    if ! command -v go >/dev/null 2>&1; then
+        echo -e "${RED}  ! Go компилятор не найден. Установите Go и попробуйте снова.${NC}"
+        return 1
+    fi
+    local tmp_dir="/tmp/webdav_tunnel_build_$(date +%s)"
+    rm -rf "$tmp_dir"
+    if git clone --depth 1 https://github.com/spkprsnts/webdav-tunnel.git "$tmp_dir" >/dev/null 2>&1; then
+        if (cd "$tmp_dir" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /usr/local/bin/webdav-tunnel . 2>/dev/null); then
+            chmod +x /usr/local/bin/webdav-tunnel
+            rm -rf "$tmp_dir"
+            echo -e "${GREEN}  ✓ /usr/local/bin/webdav-tunnel успешно скомпилирован${NC}"
+            return 0
+        else
+            rm -rf "$tmp_dir"
+            echo -e "${RED}  ! Ошибка компиляции.${NC}"
+            return 1
+        fi
+    else
+        rm -rf "$tmp_dir"
+        echo -e "${RED}  ! Не удалось клонировать репозиторий.${NC}"
+        return 1
+    fi
+}
+
+menu_webdav_tunnel() {
+    if ! is_webdav_tunnel_installed; then
+        clear
+        echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}║${BOLD}   WebDAV Tunnel — НЕ УСТАНОВЛЕН                                     ${YELLOW}║${NC}"
+        echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  WebDAV Tunnel — TCP-туннель поверх WebDAV (selfhosted-режим)."
+        echo -e "  Трафик маскируется под WebDAV-запросы к встроенному серверу."
+        echo ""
+        echo -e "  ${YELLOW}[1]${NC} 📦 Установить WebDAV Tunnel (скачать + собрать из исходников)"
+        echo -e "  ${BOLD}[0]${NC} ← Назад"
+        echo ""
+        read -p "Выберите действие [0-1]: " inst_ch
+        case "$inst_ch" in
+            1)
+                clear
+                echo -e "${CYAN}==> Установка WebDAV Tunnel...${NC}"
+                # Пользователь
+                id -u "$WDAVTUNNEL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$WDAVTUNNEL_USER" 2>/dev/null || true
+                # Директории
+                mkdir -p "$WDAVTUNNEL_DIR" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel"
+                chown -R "$WDAVTUNNEL_USER:$WDAVTUNNEL_USER" "$WDAVTUNNEL_DIR" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel" 2>/dev/null || true
+                # Go
+                export PATH=$PATH:/usr/local/go/bin
+                if ! command -v go >/dev/null 2>&1; then
+                    echo -e "${CYAN}  → Установка компилятора Go...${NC}"
+                    apt-get install -y -qq golang-go >/dev/null 2>&1 || true
+                fi
+                # Бинарник
+                if build_webdav_tunnel_binary; then
+                    # Дефолтный конфиг
+                    if [ ! -f "$WDAVTUNNEL_CONFIG_ENV" ]; then
+                        local rnd_pass
+                        rnd_pass=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 24 2>/dev/null || date +%s | sha256sum | head -c 24)
+                        cat > "$WDAVTUNNEL_CONFIG_ENV" <<EOF_CFG
+WEBDAV_LISTEN=":8443"
+WEBDAV_STORAGE="${WDAVTUNNEL_STORAGE}"
+WEBDAV_LOGIN="wdav"
+WEBDAV_PASSWORD="${rnd_pass}"
+WEBDAV_ENC="false"
+ROUTING_MODE="xray"
+XRAY_REDIRECT_PORT="${XRAY_REDIRECT_PORT:-12346}"
+EOF_CFG
+                        chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV"
+                        chmod 640 "$WDAVTUNNEL_CONFIG_ENV"
+                    fi
+                    # Routing script
+                    local sd
+                    sd=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+                    if [ -f "$sd/../scripts/webdav-tunnel-routing.sh" ]; then
+                        cp -f "$sd/../scripts/webdav-tunnel-routing.sh" "$WDAVTUNNEL_ROUTING"
+                    else
+                        curl -fsSL -o "$WDAVTUNNEL_ROUTING" \
+                            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/webdav-tunnel-routing.sh?v=$(date +%s)" 2>/dev/null || true
+                    fi
+                    chmod +x "$WDAVTUNNEL_ROUTING" 2>/dev/null || true
+                    # Systemd unit
+                    if [ -f "$sd/../systemd/webdav-tunnel.service" ]; then
+                        cp -f "$sd/../systemd/webdav-tunnel.service" "/etc/systemd/system/${WDAVTUNNEL_SERVICE}.service"
+                    else
+                        curl -fsSL -o "/etc/systemd/system/${WDAVTUNNEL_SERVICE}.service" \
+                            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/systemd/webdav-tunnel.service?v=$(date +%s)" 2>/dev/null || true
+                    fi
+                    systemctl daemon-reload
+                    echo -e "${GREEN}✓ WebDAV Tunnel установлен. Настройте логин/пароль и запустите из меню.${NC}"
+                fi
+                read -p "Нажмите Enter..."
+                ;;
+        esac
+        return
+    fi
+
+    while true; do
+        clear
+        local wdt_status
+        wdt_status=$(get_wdavtunnel_status)
+        local wdt_port
+        wdt_port=$(get_wdavtunnel_listen_port)
+        local wdt_login
+        wdt_login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "(не задан)")
+        local wdt_pass
+        wdt_pass=$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "(не задан)")
+        local wdt_enc
+        wdt_enc=$(get_wdavtunnel_prop "WEBDAV_ENC" "false")
+        local wdt_routing
+        wdt_routing=$(get_wdavtunnel_routing)
+        local wdt_uri
+        wdt_uri=$(get_wdavtunnel_client_uri)
+
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — TCP over WebDAV (selfhosted)                       ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  Статус: ${wdt_status}"
+        echo -e "${CYAN}║${NC}  Порт WebDAV (встроенный сервер): ${BOLD}:${wdt_port}/TCP${NC}"
+        echo -e "${CYAN}║${NC}  Логин: ${BOLD}${wdt_login}${NC}  |  Пароль: ${GREEN}${wdt_pass}${NC}"
+        echo -e "${CYAN}║${NC}  Шифрование чанков (AES-256-GCM): ${BOLD}${wdt_enc}${NC}"
+        echo -e "${CYAN}║${NC}  Маршрутизация: ${wdt_routing}"
+        echo -e "${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  URI для клиента (вставить в клиент):"
+        echo -e "${CYAN}║${NC}  ${GREEN}${wdt_uri}${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  ${GREEN}[1]${NC} ▶  Запустить WebDAV Tunnel"
+        echo -e "  ${RED}[2]${NC} ■  Остановить WebDAV Tunnel"
+        echo -e "  ${YELLOW}[3]${NC} 🔄 Перезапустить WebDAV Tunnel"
+        echo -e "  ${CYAN}[4]${NC} 🔑 Сменить логин/пароль WebDAV"
+        echo -e "  ${CYAN}[5]${NC} 🔌 Сменить порт WebDAV-сервера (текущий: :${wdt_port})"
+        echo -e "  ${CYAN}[6]${NC} 🔒 Включить / выключить AES-256-GCM шифрование чанков"
+        echo -e "  ${CYAN}[7]${NC} 🌐 Переключить маршрутизацию (Xray REDIRECT / Прямой WAN)"
+        echo -e "  ${CYAN}[8]${NC} 📋 Показать URI клиента (для вставки в приложение)"
+        echo -e "  ${CYAN}[9]${NC} 📜 Логи службы (journalctl)"
+        echo -e "  ${CYAN}[10]${NC} ⚡ Живые логи (journalctl -f)"
+        echo -e "  ${CYAN}[11]${NC} 🔨 Пересобрать бинарник из исходников (spkprsnts/webdav-tunnel)"
+        echo -e "  ${BOLD}[0]${NC} ← Назад в главное меню"
+        echo ""
+        read -p "Выберите действие [0-11]: " wdt_choice
+
+        case "$wdt_choice" in
+            1)
+                systemctl start "$WDAVTUNNEL_SERVICE" 2>/dev/null \
+                    && echo -e "${GREEN}✓ WebDAV Tunnel запущен${NC}" \
+                    || echo -e "${RED}✗ Не удалось запустить${NC}"
+                sleep 1
+                ;;
+            2)
+                systemctl stop "$WDAVTUNNEL_SERVICE" 2>/dev/null \
+                    && echo -e "${YELLOW}■ WebDAV Tunnel остановлен${NC}" \
+                    || echo -e "${RED}✗ Не удалось остановить${NC}"
+                sleep 1
+                ;;
+            3)
+                systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null \
+                    && echo -e "${GREEN}✓ WebDAV Tunnel перезапущен${NC}" \
+                    || echo -e "${RED}✗ Не удалось перезапустить${NC}"
+                sleep 1
+                ;;
+            4)
+                echo ""
+                read -p "  Новый логин WebDAV [${wdt_login}]: " new_login
+                read -p "  Новый пароль WebDAV: " new_pass
+                if [ -n "$new_login" ]; then
+                    set_wdavtunnel_prop "WEBDAV_LOGIN" "$new_login"
+                fi
+                if [ -n "$new_pass" ]; then
+                    set_wdavtunnel_prop "WEBDAV_PASSWORD" "$new_pass"
+                fi
+                chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                echo -e "${GREEN}✓ Логин/пароль обновлены. Перезапустите туннель для применения.${NC}"
+                read -p "Нажмите Enter..."
+                ;;
+            5)
+                echo ""
+                read -p "  Новый порт WebDAV-сервера (текущий: ${wdt_port}): " new_port
+                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ]; then
+                    set_wdavtunnel_prop "WEBDAV_LISTEN" ":${new_port}"
+                    echo -e "${GREEN}✓ Порт изменён на :${new_port}. Перезапустите для применения.${NC}"
+                    # Обновить правило фаервола
+                    iptables -C INPUT -p tcp --dport "$new_port" -m comment --comment "WDAVTUNNEL_MANAGED" -j ACCEPT 2>/dev/null \
+                        || iptables -I INPUT 1 -p tcp --dport "$new_port" -m comment --comment "WDAVTUNNEL_MANAGED" -j ACCEPT 2>/dev/null || true
+                else
+                    echo -e "${RED}  Неверный порт (1024-65535)${NC}"
+                fi
+                read -p "Нажмите Enter..."
+                ;;
+            6)
+                if [ "$wdt_enc" = "true" ] || [ "$wdt_enc" = "1" ]; then
+                    set_wdavtunnel_prop "WEBDAV_ENC" "false"
+                    echo -e "${YELLOW}Шифрование ВЫКЛЮЧЕНО. Перезапустите туннель.${NC}"
+                else
+                    set_wdavtunnel_prop "WEBDAV_ENC" "true"
+                    echo -e "${GREEN}✓ Шифрование AES-256-GCM ВКЛЮЧЕНО. Перезапустите туннель.${NC}"
+                fi
+                read -p "Нажмите Enter..."
+                ;;
+            7)
+                local cur_mode
+                cur_mode=$(get_wdavtunnel_prop "ROUTING_MODE" "xray")
+                if [ "$cur_mode" = "xray" ]; then
+                    set_wdavtunnel_prop "ROUTING_MODE" "direct"
+                    # Снять iptables-правила
+                    [ -x "$WDAVTUNNEL_ROUTING" ] && "$WDAVTUNNEL_ROUTING" down 2>/dev/null || true
+                    echo -e "${YELLOW}Маршрутизация: Прямой WAN (без Xray).${NC}"
+                else
+                    set_wdavtunnel_prop "ROUTING_MODE" "xray"
+                    # Применить iptables-правила
+                    [ -x "$WDAVTUNNEL_ROUTING" ] && "$WDAVTUNNEL_ROUTING" up 2>/dev/null || true
+                    echo -e "${GREEN}✓ Маршрутизация: Xray REDIRECT (:${XRAY_REDIRECT_PORT:-12346}).${NC}"
+                fi
+                read -p "Нажмите Enter..."
+                ;;
+            8)
+                clear
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — URI для клиентского приложения                     ${CYAN}║${NC}"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                echo ""
+                local uri_full
+                uri_full=$(get_wdavtunnel_client_uri)
+                echo -e "  ${BOLD}URI (selfhosted):${NC}"
+                echo -e "  ${GREEN}${uri_full}${NC}"
+                echo ""
+                echo -e "  ${BOLD}Использование на клиенте:${NC}"
+                echo -e "  webdav-tunnel -mode client \\"
+                echo -e "    -uri \"${uri_full}\" \\"
+                echo -e "    -socks-listen 127.0.0.1:1080"
+                echo ""
+                echo -e "  ${BOLD}Режимы:${NC}"
+                echo -e "  • SOCKS5 прокси готов на 127.0.0.1:1080"
+                echo -e "  • Настройте браузер / приложение через SOCKS5 127.0.0.1:1080"
+                # QR если доступен qrencode
+                if command -v qrencode >/dev/null 2>&1; then
+                    echo ""
+                    echo -e "  ${BOLD}QR-код:${NC}"
+                    qrencode -t ANSIUTF8 "$uri_full" 2>/dev/null || true
+                fi
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            9)
+                journalctl -u "$WDAVTUNNEL_SERVICE" -n 80 --no-pager 2>/dev/null || echo "(логи недоступны)"
+                read -p "Нажмите Enter..."
+                ;;
+            10)
+                echo -e "${YELLOW}(Нажмите Ctrl+C для остановки)${NC}"
+                journalctl -u "$WDAVTUNNEL_SERVICE" -f --no-pager 2>/dev/null || true
+                ;;
+            11)
+                clear
+                echo -e "${CYAN}==> Пересборка webdav-tunnel из исходников...${NC}"
+                export PATH=$PATH:/usr/local/go/bin
+                build_webdav_tunnel_binary && systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
+                read -p "Нажмите Enter..."
+                ;;
+            0) return ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
+}
+
 menu_openflux() {
     if ! is_openflux_installed; then
         clear
@@ -6171,6 +6542,9 @@ main_hub() {
     elif [ "$invoked" = "x-openflux" ] || [ "$invoked" = "x-flux" ]; then
         menu_openflux
         exit 0
+    elif [ "$invoked" = "x-webdav" ] || [ "$invoked" = "x-wdav" ]; then
+        menu_webdav_tunnel
+        exit 0
     fi
 
     while true; do
@@ -6232,6 +6606,13 @@ main_hub() {
             echo -e "${CYAN}║${NC}  ${BOLD}[6] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
+        if is_webdav_tunnel_installed; then
+            echo -e "${CYAN}║${NC}  ${BOLD}[14] 📦 WebDAV Tunnel (TCP over WebDAV)${NC} -> $(get_wdavtunnel_status)"
+            echo -e "${CYAN}║${NC}       Порт: :${BOLD}$(get_wdavtunnel_listen_port)/TCP${NC}  |  Enc: $(get_wdavtunnel_prop WEBDAV_ENC false) | Маршрут: $(get_wdavtunnel_routing)"
+        else
+            echo -e "${CYAN}║${NC}  ${BOLD}[14] 📦 WebDAV Tunnel (TCP over WebDAV)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+        fi
+        echo -e "${CYAN}║${NC}"
         if is_sub_server_installed; then
             echo -e "${CYAN}║${NC}  ${BOLD}[7] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
             echo -e "${CYAN}║${NC}      API: http://127.0.0.1:22217   |  Порт: :22217 [127.0.0.1] 🔒"
@@ -6247,17 +6628,18 @@ main_hub() {
         echo -e "  ${YELLOW}${BOLD}[5]${NC} 🌐 ${BOLD}Управление DNS-туннелями${NC} (MasterDnsVPN / CottenDNS, stormdns://, WAN)"
         echo ""
         echo -e "  ${YELLOW}${BOLD}[6]${NC} 📡 ${BOLD}Управление OpenFlux${NC} (Мультиплекс 1-8 • Яндекс/Mail.ru • Режим L4)"
+        echo -e "  ${CYAN}${BOLD}[14]${NC} 📦 ${BOLD}Управление WebDAV Tunnel${NC} (TCP over WebDAV • selfhosted • AES-256-GCM)"
         echo ""
         echo -e "  ${RED}${BOLD}[7]${NC} 🛡️  ${BOLD}Центр управления фаерволом портов${NC} (Включение/Выключение протоколов, Локдаун)"
         echo -e "  ${BOLD}[8]${NC} 📊 Сводный статус всех служб и портов сервера"
-        echo -e "  ${BOLD}[9]${NC} 🔄 Перезапустить все сервисы (Mieru + Snell + WDTT + CSQTT + DNS + OpenFlux)"
+        echo -e "  ${BOLD}[9]${NC} 🔄 Перезапустить все сервисы (Mieru + Snell + WDTT + CSQTT + DNS + OpenFlux + WebDAV)"
         echo -e "  ${BOLD}[10]${NC} 🔍 ${BOLD}Пересканировать и подхватить протоколы${NC} (Автоопределение установленных служб)"
         echo -e "  ${GREEN}${BOLD}[11]${NC} ⚙️  ${BOLD}Оптимизация и безопасность${NC} (DNS с пингом, BBR/буферы под RAM, Swap 2/4G, Fail2ban)"
         echo -e "  ${PURPLE}${BOLD}[12]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
         echo -e "  ${CYAN}${BOLD}[13]${NC} 📋 ${BOLD}Сервер подписок TUNA${NC} (Профили, выдача Base64-ссылок, ротация токенов)"
         echo -e "  ${BOLD}[0]${NC} 🚪 Выход"
         echo ""
-        read -p "Выберите раздел [0-13]: " top_choice
+        read -p "Выберите раздел [0-14]: " top_choice
         case "$top_choice" in
             1) menu_mieru ;;
             2) menu_snell ;;
@@ -6272,6 +6654,7 @@ main_hub() {
             11) menu_system_opt ;;
             12) menu_ssl ;;
             13) menu_subscriptions ;;
+            14) menu_webdav_tunnel ;;
             0) clear; exit 0 ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac
