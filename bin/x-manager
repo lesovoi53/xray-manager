@@ -6141,8 +6141,10 @@ try:
             v = counts.get(k, 0)
             if v > 0:
                 details.append(f"{label}: {v}")
-        if counts.get("openflux", 0) > 0 or u.get("openflux"):
-            details.append(f"OpenFlux: {counts.get('openflux', 1)} гр.")
+        of_cnt = counts.get("openflux", 0)
+        if of_cnt > 0 or u.get("openflux"):
+            cnt_val = of_cnt if of_cnt > 0 else 1
+            details.append(f"OpenFlux: {cnt_val} гр.")
         j_details = ", ".join(details)
         detail_str = f" ({j_details})" if details else ""
         sub_url = u.get("subscription_url", "")
@@ -6159,7 +6161,8 @@ try:
         else:
             print("🔗 Ссылка:       \033[1;33m[Не сгенерирована]\033[0m")
     print("──────────────────────────────────────────────────────────────────────")
-except Exception:
+except Exception as e:
+    print(f"Ошибка вывода: {e}")
     print(sys.argv[1])
 ' "$raw_users" "$SERVER_IP"
                 fi
