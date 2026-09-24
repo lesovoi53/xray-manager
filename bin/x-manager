@@ -185,6 +185,35 @@ get_openflux_counts() {
     echo "${active}:${configured}"
 }
 
+get_openflux_pool_mode() {
+    local m=$(get_openflux_prop "POOL_MODE" "")
+    if [ -z "$m" ]; then
+        local has_multi=0
+        for ch in 1 2 3 4 5 6 7 8; do
+            local u=$(get_openflux_channel_prop "$ch" "URL" "")
+            if [[ "$u" =~ , ]]; then
+                has_multi=1
+                break
+            fi
+        done
+        if [ "$has_multi" -eq 1 ]; then
+            m="multistream"
+        else
+            m="classic"
+        fi
+    fi
+    echo "$m"
+}
+
+get_openflux_pool_mode_label() {
+    local pm=$(get_openflux_pool_mode)
+    if [ "$pm" = "multistream" ]; then
+        echo -e "${PURPLE}Multi-Stream Bonding (8×4, PR #56)${NC}"
+    else
+        echo -e "${YELLOW}Классический мультиплекс (8×1)${NC}"
+    fi
+}
+
 get_openflux_status() {
     if ! is_openflux_installed; then
         echo -e "${RED}НЕ УСТАНОВЛЕН${NC}"
@@ -5653,10 +5682,11 @@ show_openflux_header() {
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${BOLD}          РАЗДЕЛ: УПРАВЛЕНИЕ МУЛЬТИКАНАЛЬНЫМ OPENFLUX (1-8)            ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  Сервер:     ${BOLD}${SERVER_IP}${NC}  |  Статус: ${of_status}"
-    echo -e "${CYAN}║${NC}  Режим:      ${CYAN}L4 (gVisor Userspace Proxy)${NC}  |  Маршрут: $(get_openflux_routing)"
-    echo -e "${CYAN}║${NC}  Транспорт:  ${GREEN}${of_transport}${NC} (дефолт)  |  Кодек: ${MAGENTA}${of_codec}${NC} (LZ4)"
-    echo -e "${CYAN}║${NC}  Шифрование: ${key_status}  |  Шлюз Xray: :12346 REDIRECT"
+    echo -e "${CYAN}║${NC}  Сервер:      ${BOLD}${SERVER_IP}${NC}  |  Статус: ${of_status}"
+    echo -e "${CYAN}║${NC}  Режим сети:  ${CYAN}L4 (gVisor Userspace Proxy)${NC}  |  Маршрут: $(get_openflux_routing)"
+    echo -e "${CYAN}║${NC}  Архитектура: $(get_openflux_pool_mode_label)"
+    echo -e "${CYAN}║${NC}  Транспорт:   ${GREEN}${of_transport}${NC} (дефолт)  |  Кодек: ${MAGENTA}${of_codec}${NC} (LZ4)"
+    echo -e "${CYAN}║${NC}  Шифрование:  ${key_status}  |  Шлюз Xray: :12346 REDIRECT"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -7340,7 +7370,8 @@ menu_openflux() {
             printf "   Канал %d: %-22b [%-7s] %b\n" "$ch" "$ch_st" "$ch_tr" "$disp_url"
         done
         echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${YELLOW}[1]${NC} 🔗 Выбрать и настроить ссылку для канала (1-8) (Одиночный / Multi-Stream)"
+        echo -e "  ${PURPLE}[M]${NC} 🔀 ${BOLD}Архитектурный режим:${NC} [1] Классический (8×1) ↔ [2] Multi-Stream (8×4, PR #56)"
+        echo -e "  ${YELLOW}[1]${NC} 🔗 Выбрать и настроить ссылку для канала (1-8)"
         echo -e "  ${YELLOW}[2]${NC} ⚡ Мастер настройки всех 8 каналов подряд"
         echo -e "  ${YELLOW}[3]${NC} 🔄 Сменить транспорт по умолчанию (vyandex / boards / mailru / yandex)"
         echo -e "  ${YELLOW}[4]${NC} 📦 Сменить кодек сжатия (1: legacy [LZ4], 2: batched [zstd])"
@@ -7355,7 +7386,7 @@ menu_openflux() {
         echo -e "  ${YELLOW}[12]${NC} 🔨 Скомпилировать / переустановить OpenFlux (Яндекс Доски + Multi-Stream)"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-12, T, или c1-c8]: " of_choice
+        read -p "Выберите действие [0-12, M, T, или c1-c8]: " of_choice
 
         case "$of_choice" in
             1|c1|c2|c3|c4|c5|c6|c7|c8|C1|C2|C3|C4|C5|C6|C7|C8)
@@ -7378,8 +7409,16 @@ menu_openflux() {
                 local cur_u=$(get_openflux_channel_prop "$target_ch" "URL" "")
                 echo "Текущая ссылка: ${cur_u:-[не задана]}"
                 echo ""
-                echo "• Введите 1 ссылку на документ ИЛИ до 4 ссылок через запятую для Multi-Stream транкинга."
-                echo "• Поддерживаются: Яндекс Доски (boards.yandex.ru), Яндекс Диск/360, Облако Mail.ru."
+                local cur_pm=$(get_openflux_pool_mode)
+                if [ "$cur_pm" = "multistream" ]; then
+                    echo -e "• ${PURPLE}[Режим 2: Multi-Stream транкинг (8×4, PR #56)]${NC}"
+                    echo "  Введите от 1 до 4 ссылок через запятую (напр.: url1,url2,url3,url4)."
+                    echo "  OpenFlux объединит их в единый транк с балансировкой сессий и failover."
+                else
+                    echo -e "• ${YELLOW}[Режим 1: Классический мультиплекс (8×1)]${NC}"
+                    echo "  Введите 1 ссылку на облачный документ для этого независимого канала."
+                fi
+                echo "• Поддерживаются: Яндекс Доски (boards.yandex.ru), Яндекс Волга, Облако Mail.ru."
                 echo "• Оставьте пустым и нажмите Enter, чтобы очистить ссылку (отключить канал)."
                 echo ""
                 read -rp "Новая ссылка: " new_u
@@ -7442,8 +7481,16 @@ menu_openflux() {
             2)
                 echo ""
                 echo -e "${BOLD}--- МАСТЕР НАСТРОЙКИ ВСЕХ 8 КАНАЛОВ МУЛЬТИПЛЕКСИРОВАНИЯ ---${NC}"
-                echo "Введите по очереди ссылки на 8 документов Яндекс / Mail.ru (с правом редактирования)."
-                echo "Транспорт (vyandex / mailru) определяется автоматически по формату ссылки."
+                local cur_pm=$(get_openflux_pool_mode)
+                if [ "$cur_pm" = "multistream" ]; then
+                    echo -e "• ${PURPLE}[Режим 2: Multi-Stream транкинг (8×4, PR #56)]${NC}"
+                    echo "  Для каждого канала вводите от 1 до 4 ссылок через запятую."
+                else
+                    echo -e "• ${YELLOW}[Режим 1: Классический мультиплекс (8×1)]${NC}"
+                    echo "  Для каждого канала вводите 1 ссылку на облачный документ."
+                fi
+                echo "Введите по очереди ссылки на документы Яндекс / Mail.ru (с правом редактирования)."
+                echo "Транспорт (vyandex / boards / mailru) определяется автоматически по формату ссылки."
                 echo "Нажмите Enter без ввода, чтобы оставить текущую ссылку без изменений."
                 echo ""
                 for m_ch in 1 2 3 4 5 6 7 8; do
@@ -7651,6 +7698,39 @@ menu_openflux() {
             12)
                 rebuild_openflux
                 ;;
+            [MmМм])
+                clear
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${CYAN}║${BOLD}          ВЫБОР АРХИТЕКТУРНОГО РЕЖИМА OPENFLUX                         ${CYAN}║${NC}"
+                echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+                echo -e "${CYAN}║${NC}  Текущий активный режим: $(get_openflux_pool_mode_label)"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                echo ""
+                echo -e "  ${YELLOW}[1]${NC} 🟡 ${BOLD}Режим 1: Классический мультиплекс (Наш способ)${NC}"
+                echo -e "      • 8 независимых каналов связи (openflux@1 .. openflux@8)"
+                echo -e "      • Ровно 1 документ на каждый канал (Яндекс Волга, Доски, Mail.ru)"
+                echo -e "      • Простая отказоустойчивая схема: каждый канал изолирован"
+                echo ""
+                echo -e "  ${PURPLE}[2]${NC} 🟣 ${BOLD}Режим 2: Гибридный Multi-Stream транкинг (Способ из PR #56)${NC}"
+                echo -e "      • 8 транковых каналов (openflux@1 .. openflux@8)"
+                echo -e "      • До 4 облачных документов НА КАЖДЫЙ канал (до 32 документов в пуле!)"
+                echo -e "      • Flow-hashing сессий, сквозная агрегация полосы и мгновенный failover"
+                echo ""
+                read -rp "Выберите режим [1-2, Enter для отмены]: " sel_pm
+                case "$sel_pm" in
+                    1)
+                        set_openflux_prop "POOL_MODE" "classic"
+                        echo -e "${GREEN}✓ Установлен Режим 1: Классический мультиплекс (8×1).${NC}"
+                        sleep 2
+                        ;;
+                    2)
+                        set_openflux_prop "POOL_MODE" "multistream"
+                        echo -e "${GREEN}✓ Установлен Режим 2: Гибридный Multi-Stream транкинг (8×4, PR #56).${NC}"
+                        sleep 2
+                        ;;
+                    *) echo -e "${YELLOW}Без изменений.${NC}"; sleep 1 ;;
+                esac
+                ;;
             [TtТт])
                 test_all_openflux_channels
                 read -rp "Нажмите Enter для возврата..." dummy
@@ -7738,8 +7818,9 @@ main_hub() {
         if is_openflux_installed; then
             local of_cnt=$(get_openflux_counts)
             local of_a=$(echo "$of_cnt" | cut -d':' -f1)
-            echo -e "${CYAN}║${NC}  ${BOLD}[4] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> $(get_openflux_status)"
-            echo -e "${CYAN}║${NC}      Режим: L4 (gVisor)  |  Каналы: 1-8 (Доски/Волга/Mail.ru) | Маршрут: $(get_openflux_routing)"
+            local of_pm=$(get_openflux_pool_mode_label)
+            echo -e "${CYAN}║${NC}  ${BOLD}[4] 📡 OpenFlux${NC} [${of_pm}] -> $(get_openflux_status)"
+            echo -e "${CYAN}║${NC}      Каналы: ${of_a}/8 активных  |  Шлюз: Xray REDIRECT  |  Маршрут: $(get_openflux_routing)"
         else
             echo -e "${CYAN}║${NC}  ${BOLD}[4] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
@@ -7782,7 +7863,7 @@ main_hub() {
         echo -e "  ${GREEN}${BOLD}[1]${NC} 🚀 ${BOLD}Управление Mieru${NC} (Anti-TSPU, Egress, пользователи, порты, фаервол)"
         echo -e "  ${BLUE}${BOLD}[2]${NC} ⚡ ${BOLD}Управление Snell v5${NC} (0-RTT, Egress Xray/Direct, HTTP-obfs, фаервол)"
         echo -e "  ${CYAN}${BOLD}[3]${NC} 📦 ${BOLD}Управление WebDAV Tunnel${NC} (Mail.ru / Selfhosted / Яндекс.Диск • WireTurn)"
-        echo -e "  ${YELLOW}${BOLD}[4]${NC} 📡 ${BOLD}Управление OpenFlux${NC} (Мультиплекс 1-8 • Multi-Stream • Доски/Волга/Mail.ru)"
+        echo -e "  ${YELLOW}${BOLD}[4]${NC} 📡 ${BOLD}Управление OpenFlux${NC} [$(get_openflux_pool_mode_label)]"
         echo -e "  ${YELLOW}${BOLD}[5]${NC} 🌐 ${BOLD}Управление DNS-туннелями${NC} (MasterDnsVPN / CottenDNS, stormdns://, WAN)"
         echo -e "  ${PURPLE}${BOLD}[6]${NC} 🛡️  ${BOLD}Управление WDTT / qwdtt${NC} (Egress в ядро / Прямой выход, клиенты, фаервол)"
         echo -e "  ${CYAN}${BOLD}[7]${NC} 🔒 ${BOLD}Управление CSQTT${NC} (Защита веб-панели, туннель фаервол, логин/пароли)"
