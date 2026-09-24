@@ -148,6 +148,19 @@ set_openflux_channel_prop() {
     else
         echo "${prop}=\"${val}\"" >> "$f"
     fi
+
+    # Изолированная синхронизация в профиль активного архитектурного режима
+    local cur_pm=$(get_openflux_pool_mode)
+    local prof_dir="${OPENFLUX_DIR}/profiles/${cur_pm}"
+    mkdir -p "$prof_dir"
+    local prof_f="${prof_dir}/${ch}.env"
+    [ ! -f "$prof_f" ] && touch "$prof_f"
+    if grep -q "^${prop}=" "$prof_f"; then
+        sed -i "s|^${prop}=.*|${prop}=\"${val}\"|" "$prof_f"
+    else
+        echo "${prop}=\"${val}\"" >> "$prof_f"
+    fi
+
     if [ "$ch" = "1" ]; then
         [ ! -f "$OPENFLUX_ENV" ] && touch "$OPENFLUX_ENV"
         if grep -q "^${prop}=" "$OPENFLUX_ENV"; then
@@ -185,33 +198,116 @@ get_openflux_counts() {
     echo "${active}:${configured}"
 }
 
-get_openflux_pool_mode() {
-    local m=$(get_openflux_prop "POOL_MODE" "")
-    if [ -z "$m" ]; then
-        local has_multi=0
+init_openflux_profiles() {
+    mkdir -p "${OPENFLUX_DIR}/profiles/classic"
+    mkdir -p "${OPENFLUX_DIR}/profiles/multistream"
+    mkdir -p "$OPENFLUX_INSTANCES_DIR"
+
+    if [ ! -f "${OPENFLUX_DIR}/pool.mode" ]; then
+        echo "classic" > "${OPENFLUX_DIR}/pool.mode"
+    fi
+
+    # Инициализация профиля classic если он пуст
+    local cl_count=$(ls -A "${OPENFLUX_DIR}/profiles/classic" 2>/dev/null | grep -E '^[1-8]\.env' | wc -l)
+    if [ "$cl_count" -eq 0 ]; then
         for ch in 1 2 3 4 5 6 7 8; do
-            local u=$(get_openflux_channel_prop "$ch" "URL" "")
-            if [[ "$u" =~ , ]]; then
-                has_multi=1
-                break
+            if [ -f "${OPENFLUX_INSTANCES_DIR}/${ch}.env" ]; then
+                cp -f "${OPENFLUX_INSTANCES_DIR}/${ch}.env" "${OPENFLUX_DIR}/profiles/classic/${ch}.env"
             fi
         done
-        if [ "$has_multi" -eq 1 ]; then
-            m="multistream"
-        else
-            m="classic"
+    fi
+
+    # Инициализация профиля multistream если он пуст
+    local ms_count=$(ls -A "${OPENFLUX_DIR}/profiles/multistream" 2>/dev/null | grep -E '^[1-8]\.env' | wc -l)
+    if [ "$ms_count" -eq 0 ]; then
+        local of_tr="vyandex"
+        [ -f "${OPENFLUX_INSTANCES_DIR}/1.env" ] && of_tr=$(grep -oP '^TRANSPORT=\K.*' "${OPENFLUX_INSTANCES_DIR}/1.env" | tr -d '"' | head -n1)
+        [ -z "$of_tr" ] && of_tr="vyandex"
+        local of_cod="legacy"
+        local of_dbg="1"
+        local of_k=""
+        for ch in 1 2 3 4 5 6 7 8; do
+            cat <<EOF > "${OPENFLUX_DIR}/profiles/multistream/${ch}.env"
+ROLE="exit"
+MODE="l4"
+TRANSPORT="${of_tr}"
+CODEC="${of_cod}"
+DEBUG="${of_dbg}"
+URL=""
+ENCRYPTION_KEY="${of_k}"
+POOL_MODE="multistream"
+EOF
+        done
+    fi
+}
+
+get_openflux_pool_mode() {
+    if [ -f "${OPENFLUX_DIR}/pool.mode" ]; then
+        local m=$(cat "${OPENFLUX_DIR}/pool.mode" 2>/dev/null | tr -d ' \r\n')
+        if [ "$m" = "multistream" ] || [ "$m" = "classic" ]; then
+            echo "$m"
+            return
         fi
     fi
-    echo "$m"
+    echo "classic"
 }
 
 get_openflux_pool_mode_label() {
     local pm=$(get_openflux_pool_mode)
     if [ "$pm" = "multistream" ]; then
-        echo -e "${PURPLE}Multi-Stream Bonding (8×4, PR #56)${NC}"
+        echo -e "${PURPLE}Multi-Stream транкинг (8×4, PR #56)${NC}"
     else
-        echo -e "${YELLOW}Классический мультиплекс (8×1)${NC}"
+        echo -e "${YELLOW}Классический балансир (8×1)${NC}"
     fi
+}
+
+switch_openflux_pool_mode() {
+    local target_mode="$1"
+    [ "$target_mode" != "multistream" ] && target_mode="classic"
+    init_openflux_profiles
+    local cur_mode=$(get_openflux_pool_mode)
+
+    # 1. Сохраняем текущие инстансы в профиль текущего режима
+    if [ -d "$OPENFLUX_INSTANCES_DIR" ]; then
+        for ch in 1 2 3 4 5 6 7 8; do
+            if [ -f "${OPENFLUX_INSTANCES_DIR}/${ch}.env" ]; then
+                cp -f "${OPENFLUX_INSTANCES_DIR}/${ch}.env" "${OPENFLUX_DIR}/profiles/${cur_mode}/${ch}.env"
+            fi
+        done
+    fi
+
+    # 2. Загружаем инстансы из целевого профиля
+    local target_dir="${OPENFLUX_DIR}/profiles/${target_mode}"
+    for ch in 1 2 3 4 5 6 7 8; do
+        if [ -f "${target_dir}/${ch}.env" ]; then
+            cp -f "${target_dir}/${ch}.env" "${OPENFLUX_INSTANCES_DIR}/${ch}.env"
+        fi
+    done
+
+    # 3. Фиксируем новый активный режим
+    echo "$target_mode" > "${OPENFLUX_DIR}/pool.mode"
+    for ch in 1 2 3 4 5 6 7 8; do
+        local f="${OPENFLUX_INSTANCES_DIR}/${ch}.env"
+        if [ -f "$f" ]; then
+            if grep -q "^POOL_MODE=" "$f"; then
+                sed -i "s|^POOL_MODE=.*|POOL_MODE=\"${target_mode}\"|" "$f"
+            else
+                echo "POOL_MODE=\"${target_mode}\"" >> "$f"
+            fi
+        fi
+    done
+
+    # 4. Перезапуск или остановка служб openflux@1..8 согласно ссылкам нового профиля
+    for ch in 1 2 3 4 5 6 7 8; do
+        local u=$(get_openflux_channel_prop "$ch" "URL" "")
+        if [ -n "$u" ]; then
+            systemctl enable "openflux@${ch}" 2>/dev/null || true
+            systemctl restart "openflux@${ch}" 2>/dev/null || true
+        else
+            systemctl stop "openflux@${ch}" 2>/dev/null || true
+            systemctl disable "openflux@${ch}" 2>/dev/null || true
+        fi
+    done
 }
 
 get_openflux_status() {
@@ -7341,6 +7437,8 @@ menu_openflux() {
         fi
     fi
 
+    init_openflux_profiles
+
     while true; do
         show_openflux_header
         local of_transport=$(get_openflux_prop "TRANSPORT" "vyandex")
@@ -7370,7 +7468,7 @@ menu_openflux() {
             printf "   Канал %d: %-22b [%-7s] %b\n" "$ch" "$ch_st" "$ch_tr" "$disp_url"
         done
         echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${PURPLE}[M]${NC} 🔀 ${BOLD}Архитектурный режим:${NC} [1] Классический (8×1) ↔ [2] Multi-Stream (8×4, PR #56)"
+        echo -e "  ${PURPLE}[M]${NC} 🔀 ${BOLD}Архитектурный режим:${NC} [1] Классический балансир (8×1) ↔ [2] Multi-Stream (8×4, PR #56)"
         echo -e "  ${YELLOW}[1]${NC} 🔗 Выбрать и настроить ссылку для канала (1-8)"
         echo -e "  ${YELLOW}[2]${NC} ⚡ Мастер настройки всех 8 каналов подряд"
         echo -e "  ${YELLOW}[3]${NC} 🔄 Сменить транспорт по умолчанию (vyandex / boards / mailru / yandex)"
@@ -7413,10 +7511,11 @@ menu_openflux() {
                 if [ "$cur_pm" = "multistream" ]; then
                     echo -e "• ${PURPLE}[Режим 2: Multi-Stream транкинг (8×4, PR #56)]${NC}"
                     echo "  Введите от 1 до 4 ссылок через запятую (напр.: url1,url2,url3,url4)."
-                    echo "  OpenFlux объединит их в единый транк с балансировкой сессий и failover."
+                    echo "  Ссылки сохраняются изолированно в профиле Multi-Stream."
                 else
-                    echo -e "• ${YELLOW}[Режим 1: Классический мультиплекс (8×1)]${NC}"
+                    echo -e "• ${YELLOW}[Режим 1: Классический балансир (8×1)]${NC}"
                     echo "  Введите 1 ссылку на облачный документ для этого независимого канала."
+                    echo "  Ссылки сохраняются изолированно в профиле Классического балансира."
                 fi
                 echo "• Поддерживаются: Яндекс Доски (boards.yandex.ru), Яндекс Волга, Облако Mail.ru."
                 echo "• Оставьте пустым и нажмите Enter, чтобы очистить ссылку (отключить канал)."
@@ -7486,7 +7585,7 @@ menu_openflux() {
                     echo -e "• ${PURPLE}[Режим 2: Multi-Stream транкинг (8×4, PR #56)]${NC}"
                     echo "  Для каждого канала вводите от 1 до 4 ссылок через запятую."
                 else
-                    echo -e "• ${YELLOW}[Режим 1: Классический мультиплекс (8×1)]${NC}"
+                    echo -e "• ${YELLOW}[Режим 1: Классический балансир (8×1)]${NC}"
                     echo "  Для каждого канала вводите 1 ссылку на облачный документ."
                 fi
                 echo "Введите по очереди ссылки на документы Яндекс / Mail.ru (с правом редактирования)."
@@ -7706,26 +7805,38 @@ menu_openflux() {
                 echo -e "${CYAN}║${NC}  Текущий активный режим: $(get_openflux_pool_mode_label)"
                 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
                 echo ""
-                echo -e "  ${YELLOW}[1]${NC} 🟡 ${BOLD}Режим 1: Классический мультиплекс (Наш способ)${NC}"
+                echo -e "  ${YELLOW}[1]${NC} 🟡 ${BOLD}Режим 1: Классический балансир (8×1)${NC}"
                 echo -e "      • 8 независимых каналов связи (openflux@1 .. openflux@8)"
                 echo -e "      • Ровно 1 документ на каждый канал (Яндекс Волга, Доски, Mail.ru)"
-                echo -e "      • Простая отказоустойчивая схема: каждый канал изолирован"
+                echo -e "      • Изолированный профиль ссылок (не переносится и не смешивается с Multi-Stream)"
                 echo ""
-                echo -e "  ${PURPLE}[2]${NC} 🟣 ${BOLD}Режим 2: Гибридный Multi-Stream транкинг (Способ из PR #56)${NC}"
+                echo -e "  ${PURPLE}[2]${NC} 🟣 ${BOLD}Режим 2: Multi-Stream транкинг (8×4, PR #56)${NC}"
                 echo -e "      • 8 транковых каналов (openflux@1 .. openflux@8)"
-                echo -e "      • До 4 облачных документов НА КАЖДЫЙ канал (до 32 документов в пуле!)"
-                echo -e "      • Flow-hashing сессий, сквозная агрегация полосы и мгновенный failover"
+                echo -e "      • До 4 облачных документов НА КАЖДЫЙ канал (через запятую, до 32 док. в пуле)"
+                echo -e "      • Изолированный профиль ссылок (не переносится и не смешивается с Классическим)"
+                echo -e "      • Flow-hashing сессий, агрегация полосы и мгновенный failover"
                 echo ""
-                read -rp "Выберите режим [1-2, Enter для отмены]: " sel_pm
+                local cur_pm=$(get_openflux_pool_mode)
+                read -rp "Выберите режим [1: Классический балансир, 2: Multi-Stream, Enter для отмены]: " sel_pm
                 case "$sel_pm" in
                     1)
-                        set_openflux_prop "POOL_MODE" "classic"
-                        echo -e "${GREEN}✓ Установлен Режим 1: Классический мультиплекс (8×1).${NC}"
+                        if [ "$cur_pm" = "classic" ]; then
+                            echo -e "${YELLOW}Режим 'Классический балансир' уже активен.${NC}"
+                        else
+                            echo -e "${CYAN}Переключение в Режим 1: Классический балансир (8×1)...${NC}"
+                            switch_openflux_pool_mode "classic"
+                            echo -e "${GREEN}✓ Режим переключен! Ссылки и службы загружены из профиля 'Классический балансир'.${NC}"
+                        fi
                         sleep 2
                         ;;
                     2)
-                        set_openflux_prop "POOL_MODE" "multistream"
-                        echo -e "${GREEN}✓ Установлен Режим 2: Гибридный Multi-Stream транкинг (8×4, PR #56).${NC}"
+                        if [ "$cur_pm" = "multistream" ]; then
+                            echo -e "${YELLOW}Режим 'Multi-Stream' уже активен.${NC}"
+                        else
+                            echo -e "${CYAN}Переключение в Режим 2: Multi-Stream транкинг (8×4, PR #56)...${NC}"
+                            switch_openflux_pool_mode "multistream"
+                            echo -e "${GREEN}✓ Режим переключен! Ссылки и службы загружены из профиля 'Multi-Stream'.${NC}"
+                        fi
                         sleep 2
                         ;;
                     *) echo -e "${YELLOW}Без изменений.${NC}"; sleep 1 ;;
