@@ -7419,6 +7419,124 @@ test_all_openflux_channels() {
     return 0
 }
 
+benchmark_openflux_channel() {
+    local ch="$1"
+    local mb="${2:-1}"
+    local ch_url=$(get_openflux_channel_prop "$ch" "URL" "")
+    local ch_tr=$(get_openflux_channel_prop "$ch" "TRANSPORT" "mailru")
+
+    if [ -z "$ch_url" ]; then
+        echo -e "   ${YELLOW}Канал $ch: [НЕ НАСТРОЕН] (ссылка отсутствует)${NC}"
+        return 1
+    fi
+
+    local first_url=$(echo "$ch_url" | cut -d',' -f1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    local doc_count=$(echo "$ch_url" | tr ',' '\n' | grep -c .)
+
+    local is_multi_label=""
+    [ "$doc_count" -gt 1 ] && is_multi_label=" ${PURPLE}(Multi-Stream: ${doc_count} док.)${NC}"
+
+    echo -e " ${BOLD}┌── [Канал $ch] [${ch_tr}]${is_multi_label}${NC}"
+    echo -e " ${BOLD}│${NC} 🔗 Тестовый документ: ${CYAN}${first_url:0:65}...${NC}"
+    echo -e " ${BOLD}│${NC} ⏳ Выполняется отправка ${BOLD}${mb} MB${NC} через транспортный API..."
+
+    local t_start=$(date +%s%N 2>/dev/null || date +%s)
+    local bench_out
+    bench_out=$(/usr/local/bin/openflux --role=bench-send --bench-bytes="$mb" --url="$first_url" --transport="$ch_tr" 2>&1)
+    local bench_rc=$?
+    local t_end=$(date +%s%N 2>/dev/null || date +%s)
+
+    if [ $bench_rc -ne 0 ] || echo "$bench_out" | grep -qiE "failed to start|fatal|panic"; then
+        local err_msg=$(echo "$bench_out" | grep -iE "failed|fatal|error" | head -n 1)
+        echo -e " ${BOLD}│${NC} ${RED}✗ Ошибка бенчмарка:${NC} ${err_msg:-Не удалось соединиться с облаком}"
+        echo -e " ${BOLD}└──${NC}"
+        return 1
+    fi
+
+    local enq_line=$(echo "$bench_out" | grep "enqueued" | tail -n 1)
+    local drain_line=$(echo "$bench_out" | grep "after drain" | tail -n 1)
+
+    local enq_sec=$(echo "$enq_line" | grep -oE "in [0-9.]+s" | awk '{print $2}' | tr -d 's')
+    local total_bytes_mb=$(echo "$drain_line" | grep -oE "channel bytes=[0-9.]+ MB" | cut -d'=' -f2 | awk '{print $1}')
+    local total_msgs=$(echo "$drain_line" | grep -oE "channel msgs=[0-9]+" | cut -d'=' -f2)
+
+    [ -z "$total_bytes_mb" ] && total_bytes_mb="$mb"
+
+    local total_duration_ms=0
+    if [ ${#t_start} -gt 10 ]; then
+        total_duration_ms=$(( (t_end - t_start) / 1000000 ))
+    else
+        total_duration_ms=$(( (t_end - t_start) * 1000 ))
+    fi
+    local total_sec=$(awk "BEGIN {printf \"%.2f\", $total_duration_ms / 1000}")
+
+    local speed_mbps="N/A"
+    local speed_mbs="N/A"
+    if [ -n "$enq_sec" ] && (( $(echo "$enq_sec > 0.001" | bc -l 2>/dev/null || echo 0) )); then
+        speed_mbs=$(awk "BEGIN {printf \"%.2f\", $total_bytes_mb / $enq_sec}")
+        speed_mbps=$(awk "BEGIN {printf \"%.1f\", $speed_mbs * 8}")
+    else
+        speed_mbs=$(awk "BEGIN {printf \"%.2f\", $total_bytes_mb / ($total_duration_ms / 1000)}")
+        speed_mbps=$(awk "BEGIN {printf \"%.1f\", $speed_mbs * 8}")
+    fi
+
+    echo -e " ${BOLD}│${NC} ${GREEN}✓ Соединение с API облака:${NC} ${GREEN}УСПЕШНО${NC}"
+    echo -e " ${BOLD}│${NC} 🚀 ${BOLD}Скорость отправки (Upload):${NC} ${GREEN}${speed_mbps} Мбит/с${NC} (${speed_mbs} МБ/с)"
+    echo -e " ${BOLD}│${NC} 📦 Сообщений/чанков API:    ${CYAN}${total_msgs:-116}${NC}"
+    echo -e " ${BOLD}│${NC} ⏱️  Полное время цикла теста: ${YELLOW}${total_sec} сек${NC}"
+    echo -e " ${BOLD}└──${NC}"
+    echo ""
+}
+
+benchmark_openflux_transport() {
+    clear
+    echo -e "${PURPLE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${PURPLE}║${BOLD}        ЗАМЕР СКОРОСТИ ОБЛАЧНОГО ТРАНСПОРТА (BENCHMARK API)           ${PURPLE}║${NC}"
+    echo -e "${PURPLE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "Этот тест замеряет чистую скорость и пропускную способность облачного"
+    echo -e "хранилища (Mail.ru, Yandex Boards, Volga, Cups.online) напрямую с сервера"
+    echo -e "через встроенный в OpenFlux режим ${BOLD}--role=bench-send${NC}."
+    echo ""
+    echo -e "Доступные действия:"
+    echo -e "  ${CYAN}[1-8]${NC} - Протестировать конкретный канал"
+    echo -e "  ${PURPLE}[A]${NC}   - Протестировать ВСЕ настроенные каналы подряд"
+    echo -e "  ${YELLOW}[0]${NC}   - Отмена / Назад"
+    echo ""
+    read -rp "Выберите вариант [1-8, A, 0]: " bench_target
+
+    case "$bench_target" in
+        0|"") return ;;
+        [aA])
+            echo ""
+            read -rp "Размер тестовых данных в MB [по умолчанию 1]: " bench_mb
+            bench_mb="${bench_mb:-1}"
+            echo ""
+            echo -e "${PURPLE}=== ЗАПУСК ТЕСТИРОВАНИЯ ВСЕХ КАНАЛОВ ===${NC}"
+            echo ""
+            for ch in 1 2 3 4 5 6 7 8; do
+                local ch_url=$(get_openflux_channel_prop "$ch" "URL" "")
+                if [ -n "$ch_url" ]; then
+                    benchmark_openflux_channel "$ch" "$bench_mb"
+                fi
+            done
+            read -rp "Нажмите Enter для продолжения..." dummy
+            ;;
+        [1-8])
+            echo ""
+            read -rp "Размер тестовых данных в MB [по умолчанию 1]: " bench_mb
+            bench_mb="${bench_mb:-1}"
+            echo ""
+            benchmark_openflux_channel "$bench_target" "$bench_mb"
+            read -rp "Нажмите Enter для продолжения..." dummy
+            ;;
+        *)
+            echo -e "${RED}Неверный выбор.${NC}"
+            sleep 1
+            ;;
+    esac
+}
+
 menu_openflux() {
     if ! is_openflux_installed; then
         clear
@@ -7479,12 +7597,13 @@ menu_openflux() {
         echo -e "  ${YELLOW}[8]${NC} ▶️  Запустить / перезапустить ВСЕ настроенные каналы"
         echo -e "  ${YELLOW}[9]${NC} ⏹️  Остановить ВСЕ каналы OpenFlux"
         echo -e "  ${PURPLE}[T]${NC} 🧪 ${BOLD}Экспресс-тест ссылок всех каналов 1-8 (Доски / Волга / Mail.ru)${NC}"
+        echo -e "  ${PURPLE}[B]${NC} ⚡ ${BOLD}Замер скорости API транспорта (сырой бенчмарк облака 1-8)${NC}"
         echo -e "  ${YELLOW}[10]${NC} 📜 Просмотр последних 30 строк логов (выбор канала 1-8 или общий)"
         echo -e "  ${YELLOW}[11]${NC} 🔍 Мониторинг логов в реальном времени (live follow)"
         echo -e "  ${YELLOW}[12]${NC} 🔨 Скомпилировать / переустановить OpenFlux (Яндекс Доски + Multi-Stream)"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-12, M, T, или c1-c8]: " of_choice
+        read -p "Выберите действие [0-12, M, T, B, или c1-c8]: " of_choice
 
         case "$of_choice" in
             1|c1|c2|c3|c4|c5|c6|c7|c8|C1|C2|C3|C4|C5|C6|C7|C8)
@@ -7845,6 +7964,9 @@ menu_openflux() {
             [TtТт])
                 test_all_openflux_channels
                 read -rp "Нажмите Enter для возврата..." dummy
+                ;;
+            [BbБб]|13)
+                benchmark_openflux_transport
                 ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;

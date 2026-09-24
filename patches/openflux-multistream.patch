@@ -402,10 +402,10 @@ index 173f13a..4b79ebc 100644
  	if err != nil {
 diff --git a/multistream.go b/multistream.go
 new file mode 100644
-index 0000000..70f3de1
+index 0000000..ea8a924
 --- /dev/null
 +++ b/multistream.go
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,104 @@
 +package main
 +
 +import (
@@ -445,7 +445,7 @@ index 0000000..70f3de1
 +// stream. cupsonline carries its rooms inside one URL, oneme has no URL, and
 +// mailru has not been tested with several documents.
 +func supportsMultiStream(transportType string) bool {
-+	return transportType == "yandex" || transportType == "vyandex" || transportType == "boards" || transportType == "mailru"
++	return transportType == "yandex" || transportType == "vyandex" || transportType == "boards" || transportType == "mailru" || transportType == "cupsonline"
 +}
 +
 +// newDocStreams builds the transport for urls: the stream itself for a single
@@ -457,7 +457,10 @@ index 0000000..70f3de1
 +	}
 +	log.Printf("Multi-stream: %d documents", len(urls))
 +	streams := make([]transport.Transport, 0, len(urls))
-+	for _, u := range urls {
++	for i, u := range urls {
++		if i > 0 {
++			time.Sleep(500 * time.Millisecond)
++		}
 +		streams = append(streams, mk(u))
 +	}
 +	return transport.NewMultiStreamTransport(streams)
@@ -1558,6 +1561,78 @@ index a91eade..f21bdd4 100644
  }
  
  func (b *BaseTransport) RecordReconnect() {
+diff --git a/transport/yandex/boards.go b/transport/yandex/boards.go
+index 2cf2ce4..6ef79e8 100644
+--- a/transport/yandex/boards.go
++++ b/transport/yandex/boards.go
+@@ -309,16 +309,18 @@ func (t *BoardsTransport) get(client *http.Client, u, accept, referer string) er
+ }
+ 
+ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, content interface{}) error {
+-	raw, _ := json.Marshal(content)
+-	contentB64 := base64.StdEncoding.EncodeToString(raw)
+-	form := url.Values{}
+-	form.Set("action", action)
+-	form.Set("content", contentB64)
+-
+-	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
+-		strings.NewReader(form.Encode()))
++	bodyMap := map[string]interface{}{
++		"action":  action,
++		"content": content,
++	}
++	raw, err := json.Marshal(bodyMap)
++	if err != nil {
++		return err
++	}
++
++	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(raw))
+ 	req.Header.Set("User-Agent", boardsUA)
+-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
++	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+ 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+ 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+ 	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
+@@ -340,16 +342,18 @@ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, cont
+ }
+ 
+ func (t *BoardsTransport) getWhiteboardInfo(client *http.Client, hash string) (map[string]string, error) {
+-	raw, _ := json.Marshal(map[string]string{"hash": hash})
+-	contentB64 := base64.StdEncoding.EncodeToString(raw)
+-	form := url.Values{}
+-	form.Set("action", "get-whiteboard-info")
+-	form.Set("content", contentB64)
+-
+-	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
+-		strings.NewReader(form.Encode()))
++	bodyMap := map[string]interface{}{
++		"action":  "get-whiteboard-info",
++		"content": map[string]string{"hash": hash},
++	}
++	raw, err := json.Marshal(bodyMap)
++	if err != nil {
++		return nil, err
++	}
++
++	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(raw))
+ 	req.Header.Set("User-Agent", boardsUA)
+-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
++	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+ 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+ 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+ 	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
+diff --git a/transport/yandex/captcha.go b/transport/yandex/captcha.go
+index f202710..445fb88 100644
+--- a/transport/yandex/captcha.go
++++ b/transport/yandex/captcha.go
+@@ -120,6 +120,7 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string,
+ 	form.Set("fingerprint", fpEncoded)
+ 
+ 	utils.Debugf("[CAPTCHA] POST %s", shortStr(formAction, 100))
++	time.Sleep(200 * time.Millisecond)
+ 	req2, _ := http.NewRequest("POST", formAction, strings.NewReader(form.Encode()))
+ 	setBrowserHeaders(req2, userAgent)
+ 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 diff --git a/transport/yandex/lifecycle_test.go b/transport/yandex/lifecycle_test.go
 new file mode 100644
 index 0000000..3e3195d
@@ -1868,10 +1943,39 @@ index 0000000..3e3195d
 +	}
 +}
 diff --git a/transport/yandex/vyandex.go b/transport/yandex/vyandex.go
-index b7d01b7..f29629b 100644
+index b7d01b7..12c5170 100644
 --- a/transport/yandex/vyandex.go
 +++ b/transport/yandex/vyandex.go
-@@ -1042,6 +1042,7 @@ func (t *YandexVolgaTransport) Stats() transport.TransportStats {
+@@ -76,7 +76,7 @@ func DefaultVolgaConfig() VolgaConfig {
+ 	}
+ }
+ 
+-const volgaUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
++const volgaUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+ 
+ var reClientConfig = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
+ 
+@@ -188,11 +188,16 @@ func authorize(docURL string) (*volgaAuth, error) {
+ 
+ 			if strings.Contains(loc, "showcaptchafast") {
+ 				utils.Debugf("[VOLGA] captcha required, solving...")
+-				if _, cerr := solveCaptcha(docURL, jar, volgaUserAgent); cerr != nil {
++				solvedURL, cerr := solveCaptcha(docURL, jar, volgaUserAgent)
++				if cerr != nil {
+ 					return nil, fmt.Errorf("captcha solve: %w", cerr)
+ 				}
+-				utils.Debugf("[VOLGA] captcha solved, retrying from %s", docURL)
+-				currentURL = docURL
++				if solvedURL != "" {
++					currentURL = solvedURL
++				} else {
++					currentURL = docURL
++				}
++				utils.Debugf("[VOLGA] captcha solved, continuing to %s", currentURL)
+ 				continue
+ 			}
+ 
+@@ -1042,6 +1047,7 @@ func (t *YandexVolgaTransport) Stats() transport.TransportStats {
  		Reconnects:    t.stats.WSReconnects.Load(),
  		Connected:     t.IsConnected(),
  		Uptime:        base.Uptime,
@@ -2371,63 +2475,3 @@ index 3155b07..7f0065a 100644
  	if err != nil {
  		t.Fatalf("unexpected error: %v", err)
  	}
-diff --git a/transport/yandex/boards.go b/transport/yandex/boards.go
-index 2cf2ce4..6ef79e8 100644
---- a/transport/yandex/boards.go
-+++ b/transport/yandex/boards.go
-@@ -309,16 +309,18 @@ func (t *BoardsTransport) get(client *http.Client, u, accept, referer string) er
- }
- 
- func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, content interface{}) error {
--	raw, _ := json.Marshal(content)
--	contentB64 := base64.StdEncoding.EncodeToString(raw)
--	form := url.Values{}
--	form.Set("action", action)
--	form.Set("content", contentB64)
--
--	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
--		strings.NewReader(form.Encode()))
-+	bodyMap := map[string]interface{}{
-+		"action":  action,
-+		"content": content,
-+	}
-+	raw, err := json.Marshal(bodyMap)
-+	if err != nil {
-+		return err
-+	}
-+
-+	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(raw))
- 	req.Header.Set("User-Agent", boardsUA)
--	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
- 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
- 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
- 	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
-@@ -340,16 +342,18 @@ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, cont
- }
- 
- func (t *BoardsTransport) getWhiteboardInfo(client *http.Client, hash string) (map[string]string, error) {
--	raw, _ := json.Marshal(map[string]string{"hash": hash})
--	contentB64 := base64.StdEncoding.EncodeToString(raw)
--	form := url.Values{}
--	form.Set("action", "get-whiteboard-info")
--	form.Set("content", contentB64)
--
--	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
--		strings.NewReader(form.Encode()))
-+	bodyMap := map[string]interface{}{
-+		"action":  "get-whiteboard-info",
-+		"content": map[string]string{"hash": hash},
-+	}
-+	raw, err := json.Marshal(bodyMap)
-+	if err != nil {
-+		return nil, err
-+	}
-+
-+	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(raw))
- 	req.Header.Set("User-Agent", boardsUA)
--	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
- 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
- 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
- 	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
