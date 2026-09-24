@@ -5274,12 +5274,17 @@ edit_sub_user() {
         local status_str="🟢 Активен"
         [ "$u_en" != "true" ] && status_str="🔴 Отключен"
 
+        local u_of_en=$(echo "$user_json" | jq -r '.openflux // false')
+        local c_of=$(echo "$user_json" | jq -r '(.counts.openflux // 0)')
+        local of_label="Отключен"
+        [ "$u_of_en" = "true" ] && of_label="Включен (${c_of} групп)"
+
         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${CYAN}║${BOLD}          РЕДАКТИРОВАНИЕ ПОЛЬЗОВАТЕЛЯ ПОДПИСКИ TUNA                   ${CYAN}║${NC}"
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
         echo -e "${CYAN}║${NC}  Пользователь: ${GREEN}${BOLD}${u_nick}${NC} (Статус: ${status_str} | Ревизия: ${u_rev})"
         echo -e "${CYAN}║${NC}  ID:           ${GRAY}${uid}${NC}"
-        echo -e "${CYAN}║${NC}  Всего узлов:  ${YELLOW}${BOLD}${u_tot}${NC}"
+        echo -e "${CYAN}║${NC}  Всего узлов:  ${YELLOW}${BOLD}${u_tot}${NC}  |  OpenFlux: ${BOLD}${of_label}${NC}"
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${YELLOW}[1]${NC} 👤 ${BOLD}Изменить никнейм${NC} (сейчас: ${GREEN}${u_nick}${NC})"
@@ -5289,11 +5294,12 @@ edit_sub_user() {
         echo -e "  ${YELLOW}[5]${NC} 🛡️  ${BOLD}CSQTT${NC} (узлов: ${BOLD}${c_csqtt}${NC})"
         echo -e "  ${YELLOW}[6]${NC} 🌐 ${BOLD}MasterDNS / StormDNS${NC} (узлов: ${BOLD}${c_dns}${NC})"
         echo -e "  ${YELLOW}[7]${NC} 📦 ${BOLD}Дополнительные узлы (VLESS / Trojan / Shadowsocks / TUIC)${NC} (узлов: ${BOLD}${c_custom}${NC})"
-        echo -e "  ${YELLOW}[8]${NC} 🔄 ${BOLD}Пересобрать профиль из активных служб сервера${NC}"
-        echo -e "  ${RED}[9]${NC} 🗑️  ${BOLD}Удалить этого пользователя безвозвратно${NC}"
+        echo -e "  ${YELLOW}[8]${NC} 🌊 ${BOLD}OpenFlux v2 (Группы / Балансировка / Бандл)${NC} [${of_label}]"
+        echo -e "  ${YELLOW}[9]${NC} 🔄 ${BOLD}Пересобрать профиль из активных служб сервера${NC}"
+        echo -e "  ${RED}[10]${NC} 🗑️  ${BOLD}Удалить этого пользователя безвозвратно${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Завершить редактирование"
         echo ""
-        read -p "Выберите действие [0-9]: " e_act
+        read -p "Выберите действие [0-10]: " e_act
         case "$e_act" in
             1)
                 echo ""
@@ -5426,6 +5432,9 @@ ${ul}"
                 esac
                 ;;
             8)
+                edit_user_openflux_sub "$uid" "$u_nick"
+                ;;
+            9)
                 echo ""
                 read -p "Перезаписать профиль ссылками текущих служб сервера? [y/N]: " conf_rebuild
                 if [[ "$conf_rebuild" =~ ^[YyДд]$ ]]; then
@@ -5435,7 +5444,7 @@ ${ul}"
                     sleep 2
                 fi
                 ;;
-            9)
+            10)
                 delete_sub_user_safe "$uid"
                 local ret=$?
                 if [ $ret -eq 0 ]; then
@@ -5443,6 +5452,610 @@ ${ul}"
                     return
                 fi
                 sleep 1.5
+                ;;
+            0) return ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
+}
+
+edit_user_openflux_sub() {
+    local SUB_API="http://127.0.0.1:22217"
+    local uid="$1"
+    local u_nick="$2"
+    [ -z "$uid" ] && return
+
+    while true; do
+        clear
+        local cfg_json=$(curl -s "${SUB_API}/api/users/${uid}/openflux" 2>/dev/null || echo "{}")
+        local u_en=$(echo "$cfg_json" | jq -r '.enabled // false')
+        local conn_id=$(echo "$cfg_json" | jq -r '.connection_id // "N/A"')
+        local b_name=$(echo "$cfg_json" | jq -r '.name // "OpenFlux Bundle"')
+        local b_mode=$(echo "$cfg_json" | jq -r '.mode // "classic"')
+        local b_bal=$(echo "$cfg_json" | jq -r '.balancer_strategy // "roundRobin"')
+        local b_rev=$(echo "$cfg_json" | jq -r '.revision // 1')
+        local sel_ids_len=$(echo "$cfg_json" | jq -r '(.selected_group_ids // []) | length')
+
+        local status_str="🟢 Включен (публикуется в подписке)"
+        [ "$u_en" != "true" ] && status_str="🔴 Отключен"
+
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${BOLD}          НАСТРОЙКА OPENFLUX V2 ДЛЯ ПОЛЬЗОВАТЕЛЯ TUNA                 ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  Пользователь:  ${GREEN}${BOLD}${u_nick}${NC} (ID: ${GRAY}${uid}${NC})"
+        echo -e "${CYAN}║${NC}  Публикация:    ${status_str} | Ревизия: ${b_rev}"
+        echo -e "${CYAN}║${NC}  Имя коннекта:  ${BOLD}${b_name}${NC}"
+        echo -e "${CYAN}║${NC}  Режим:         ${YELLOW}${b_mode}${NC} (classic: 1 URL/гр, multistream: 1-4 URL/гр)"
+        echo -e "${CYAN}║${NC}  Балансировка:  ${MAGENTA}${b_bal}${NC} (roundRobin / leastPing)"
+        echo -e "${CYAN}║${NC}  Connection ID: ${GRAY}${conn_id}${NC}"
+        echo -e "${CYAN}║${NC}  Выбрано групп: ${YELLOW}${BOLD}${sel_ids_len} / 8${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+
+        echo -e "${BOLD}Выбранные группы в порядке балансировки:${NC}"
+        if [ "$sel_ids_len" -eq 0 ]; then
+            echo -e "  ${GRAY}(Ни одной группы не выбрано. Бандл OpenFlux v2 не будет опубликован!)${NC}"
+        else
+            python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    grps = data.get("groups", [])
+    for idx, g in enumerate(grps, 1):
+        gid = g.get("id", "")
+        gnm = g.get("name", "")
+        tr = g.get("transport", "")
+        md = g.get("mode", "")
+        cd = g.get("codec", "legacy")
+        urls = g.get("urls", [])
+        enc = "🔐" if g.get("encryption_key") else "🔓"
+        print(f"  \033[1;33m{idx}.\033[0m \033[1;32m{gnm}\033[0m [\033[36m{gid}\033[0m] — {tr} | {md} | URLs: {len(urls)} | {cd} | {enc}")
+except Exception as e:
+    print(f"  Ошибка вывода групп: {e}")
+' "$cfg_json"
+        fi
+
+        echo ""
+        echo -e "  ${YELLOW}[1]${NC} ⚡ ${BOLD}Включить / отключить OpenFlux v2 в подписке${NC}"
+        echo -e "  ${YELLOW}[2]${NC} 🏷️  ${BOLD}Изменить общее имя подключения${NC} (сейчас: '${GREEN}${b_name}${NC}')"
+        echo -e "  ${YELLOW}[3]${NC} 🔄 ${BOLD}Переключить режим подписки${NC} (classic <-> multistream)"
+        echo -e "  ${YELLOW}[4]${NC} ⚖️  ${BOLD}Переключить стратегию балансировщика${NC} (roundRobin <-> leastPing)"
+        echo -e "  ${YELLOW}[5]${NC} 📑 ${BOLD}Выбрать и упорядочить группы из каталога${NC} (1–8 групп)"
+        echo -e "  ${YELLOW}[6]${NC} 🎲 ${BOLD}Сгенерировать новый connection_id (UUID)${NC}"
+        echo -e "  ${YELLOW}[7]${NC} 👁️  ${BOLD}Предпросмотр бандла v2 (JSON payload и URI)${NC}"
+        echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад к редактированию пользователя"
+        echo ""
+        read -p "Выберите действие [0-7]: " of_act
+        case "$of_act" in
+            1)
+                local new_en="true"
+                [ "$u_en" = "true" ] && new_en="false"
+                if [ "$new_en" = "true" ] && [ "$sel_ids_len" -eq 0 ]; then
+                    echo -e "${YELLOW}Внимание: для формирования бандла выберите минимум 1 группу в пункте [5].${NC}"
+                    sleep 1.5
+                fi
+                curl -s -X PUT "${SUB_API}/api/users/${uid}/openflux" -H "Content-Type: application/json" -d "{\"enabled\": $new_en}" >/dev/null 2>&1
+                echo -e "${GREEN}✓ Публикация OpenFlux v2: $([ "$new_en" = "true" ] && echo "ВКЛЮЧЕНА" || echo "ОТКЛЮЧЕНА")${NC}"
+                sleep 1.2
+                ;;
+            2)
+                echo ""
+                read -p "Новое имя общего подключения в TUNA: " new_bn
+                new_bn=$(echo "$new_bn" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                if [ -n "$new_bn" ]; then
+                    local p_json=$(python3 -c "import json, sys; print(json.dumps({'name': sys.argv[1]}))" "$new_bn")
+                    curl -s -X PUT "${SUB_API}/api/users/${uid}/openflux" -H "Content-Type: application/json" -d "$p_json" >/dev/null 2>&1
+                    echo -e "${GREEN}✓ Имя подключения обновлено!${NC}"
+                    sleep 1
+                fi
+                ;;
+            3)
+                local new_mode="classic"
+                [ "$b_mode" = "classic" ] && new_mode="multistream"
+                local p_json=$(python3 -c "import json, sys; print(json.dumps({'mode': sys.argv[1]}))" "$new_mode")
+                curl -s -X PUT "${SUB_API}/api/users/${uid}/openflux" -H "Content-Type: application/json" -d "$p_json" >/dev/null 2>&1
+                echo -e "${GREEN}✓ Режим переключен на: ${new_mode}!${NC}"
+                sleep 1.2
+                ;;
+            4)
+                local new_bal="leastPing"
+                [ "$b_bal" = "leastPing" ] && new_bal="roundRobin"
+                local p_json=$(python3 -c "import json, sys; print(json.dumps({'balancer_strategy': sys.argv[1]}))" "$new_bal")
+                curl -s -X PUT "${SUB_API}/api/users/${uid}/openflux" -H "Content-Type: application/json" -d "$p_json" >/dev/null 2>&1
+                echo -e "${GREEN}✓ Стратегия балансировки переключена на: ${new_bal}!${NC}"
+                sleep 1.2
+                ;;
+            5)
+                clear
+                echo -e "${CYAN}=== ВЫБОР ГРУПП ИЗ КАТАЛОГА ДЛЯ ПОЛЬЗОВАТЕЛЯ (${b_mode}) ===${NC}\n"
+                local raw_cat=$(curl -s "${SUB_API}/api/openflux/groups" 2>/dev/null || echo "[]")
+                local cat_cnt=$(python3 -c "import json, sys; grps=json.loads(sys.argv[1]) if sys.argv[1].startswith('[') else []; print(len(grps))" "$raw_cat" 2>/dev/null || echo 0)
+                if [ "$cat_cnt" -eq 0 ]; then
+                    echo -e "${YELLOW}Каталог групп пуст. Сначала добавьте или импортируйте группы в каталоге OpenFlux.${NC}"
+                    echo ""
+                    read -p "Нажмите Enter для возврата..."
+                    continue
+                fi
+
+                echo -e "${BOLD}Доступные группы в каталоге:${NC}"
+                python3 -c '
+import json, sys
+grps = json.loads(sys.argv[1])
+user_mode = sys.argv[2]
+for i, g in enumerate(grps, 1):
+    gid = g["id"]
+    gnm = g["name"]
+    tr = g["transport"]
+    md = g["mode"]
+    urls = g.get("urls", [])
+    warn = ""
+    if md != user_mode:
+        warn = f" \033[1;31m(Режим {md} != {user_mode})\033[0m"
+    print(f"  \033[1;33m[{i}]\033[0m \033[1;32m{gnm}\033[0m [\033[36m{gid}\033[0m] — {tr} | {md} | URLs: {len(urls)}{warn}")
+' "$raw_cat" "$b_mode"
+
+                echo ""
+                echo -e "Введите номера групп через пробел в порядке балансировки (от 1 до 8 номеров)."
+                echo -e "Пример: ${CYAN}1 3 2${NC} (или Enter для отмены)"
+                read -p "Номера групп: " sel_order
+                sel_order=$(echo "$sel_order" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                if [ -n "$sel_order" ]; then
+                    local sel_payload=$(python3 -c '
+import json, sys
+raw_cat = json.loads(sys.argv[1])
+user_mode = sys.argv[2]
+raw_sel = sys.argv[3].replace(",", " ").split()
+if not raw_sel:
+    print("EMPTY")
+    sys.exit(0)
+if len(raw_sel) > 8:
+    print("TOO_MANY")
+    sys.exit(0)
+picked_ids = []
+for tok in raw_sel:
+    if not tok.isdigit():
+        print(f"INVALID_{tok}")
+        sys.exit(0)
+    idx = int(tok) - 1
+    if idx < 0 or idx >= len(raw_cat):
+        print(f"OUT_OF_BOUNDS_{tok}")
+        sys.exit(0)
+    gid = raw_cat[idx]["id"]
+    if gid in picked_ids:
+        print(f"DUPLICATE_{gid}")
+        sys.exit(0)
+    if raw_cat[idx].get("mode") != user_mode:
+        print(f"MODE_MISMATCH_{gid}")
+        sys.exit(0)
+    picked_ids.append(gid)
+
+print(json.dumps({"group_ids": picked_ids}))
+' "$raw_cat" "$b_mode" "$sel_order" 2>/dev/null || echo "ERR")
+
+                    if [[ "$sel_payload" =~ ^EMPTY ]]; then
+                        echo -e "${YELLOW}Выбор отменен.${NC}"
+                    elif [[ "$sel_payload" =~ ^TOO_MANY ]]; then
+                        echo -e "${RED}Ошибка: максимум 8 групп на пользователя (контракт v2).${NC}"
+                    elif [[ "$sel_payload" =~ ^DUPLICATE_ ]]; then
+                        echo -e "${RED}Ошибка: группа не может повторяться дважды в одном наборе.${NC}"
+                    elif [[ "$sel_payload" =~ ^MODE_MISMATCH_ ]]; then
+                        echo -e "${RED}Ошибка: все выбранные группы должны иметь режим '\''${b_mode}'\''.${NC}"
+                    elif [[ "$sel_payload" =~ ^INVALID_ ]] || [[ "$sel_payload" =~ ^OUT_OF_BOUNDS_ ]]; then
+                        echo -e "${RED}Ошибка: неверный номер группы в списке.${NC}"
+                    elif [[ "$sel_payload" =~ ^\{ ]]; then
+                        local upd_resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}/openflux" -H "Content-Type: application/json" -d "$sel_payload" 2>/dev/null || echo "")
+                        local err_msg=$(echo "$upd_resp" | jq -r '.error // empty' 2>/dev/null || echo "")
+                        if [ -n "$err_msg" ]; then
+                            echo -e "${RED}Ошибка сохранения: ${err_msg}${NC}"
+                        else
+                            echo -e "${GREEN}✓ Набор групп успешно обновлен!${NC}"
+                        fi
+                    else
+                        echo -e "${RED}Ошибка обработки выбора.${NC}"
+                    fi
+                    sleep 1.8
+                fi
+                ;;
+            6)
+                local new_cid=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
+                curl -s -X PUT "${SUB_API}/api/users/${uid}/openflux" -H "Content-Type: application/json" -d "{\"connection_id\": \"$new_cid\"}" >/dev/null 2>&1
+                echo -e "${GREEN}✓ Сгенерирован новый Connection ID: ${new_cid}${NC}"
+                sleep 1.2
+                ;;
+            7)
+                clear
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${CYAN}║${BOLD}          ПРЕДПРОСМОТР БАНДЛА OPENFLUX V2 ДЛЯ КЛИЕНТА TUNA            ${CYAN}║${NC}"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                python3 -c '
+import json, sys, base64
+
+raw = sys.argv[1]
+try:
+    data = json.loads(raw)
+    groups = data.get("groups", [])
+    if not groups:
+        print("\033[1;33mБандл пуст: ни одной группы не выбрано.\033[0m")
+        sys.exit(0)
+    
+    payload = {
+        "version": 2,
+        "connection_id": data.get("connection_id", ""),
+        "name": data.get("name", "OpenFlux Bundle"),
+        "mode": data.get("mode", "classic"),
+        "balancer_strategy": data.get("balancer_strategy", "roundRobin"),
+        "groups": []
+    }
+    for g in groups:
+        grp_obj = {
+            "id": g["id"],
+            "name": g["name"],
+            "transport": g["transport"],
+            "urls": g.get("urls", []),
+            "codec": g.get("codec", "legacy")
+        }
+        if g.get("encryption_key"):
+            grp_obj["encryption_key"] = g["encryption_key"]
+        payload["groups"].append(grp_obj)
+        
+    canonical_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    b64url = base64.urlsafe_b64encode(canonical_json.encode("utf-8")).decode("ascii").rstrip("=")
+    uri = f"openflux-bundle://v2/{b64url}"
+    
+    print("\033[1;36mРасшифрованный JSON бандла (payload):\033[0m")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print("")
+    print("\033[1;32mГотовая строка подписки v2 (OpenFlux URI):\033[0m")
+    print(f"\033[1;33m{uri}\033[0m")
+    print("")
+    print(f"Размер JSON: {len(canonical_json)} байт | Длина URI: {len(uri)} символов | Групп: {len(payload[\"groups\"])}")
+except Exception as e:
+    print(f"\033[1;31mОшибка формирования предпросмотра: {e}\033[0m")
+' "$cfg_json"
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                ;;
+            0) return ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
+}
+
+menu_openflux_sub_catalog() {
+    local SUB_API="http://127.0.0.1:22217"
+    while true; do
+        clear
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${BOLD}          КАТАЛОГ ГРУПП OPENFLUX V2 ДЛЯ ПОДПИСОК TUNA                  ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  Сервер подписок: ${CYAN}${SUB_API}${NC}"
+        echo -e "${CYAN}║${NC}  Контракт: v2 | Транспорты: mailru, boards, cupsonline (vyandex не поддерживается)"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+
+        local raw_groups=$(curl -s "${SUB_API}/api/openflux/groups" 2>/dev/null || echo "[]")
+        local count_groups=$(python3 -c "import json, sys; grps=json.loads(sys.argv[1]) if sys.argv[1].startswith('[') else []; print(len(grps))" "$raw_groups" 2>/dev/null || echo 0)
+
+        echo -e "${BOLD}Текущие группы в каталоге (${count_groups}):${NC}"
+        if [ "$count_groups" -eq 0 ]; then
+            echo -e "  ${GRAY}(каталог пуст. Импортируйте группы из /etc/openflux или создайте вручную)${NC}"
+        else
+            python3 -c '
+import json, sys
+try:
+    grps = json.loads(sys.argv[1])
+    for i, g in enumerate(grps, 1):
+        gid = g.get("id", "")
+        name = g.get("name", "")
+        mode = g.get("mode", "classic")
+        transport = g.get("transport", "")
+        codec = g.get("codec", "legacy")
+        urls = g.get("urls", [])
+        enc = "🔐 AES" if g.get("encryption_key") else "🔓 Нет"
+        slot = f" (Слот {g.get(\"source_slot\")})" if g.get("source_slot") is not None else ""
+        print(f"  \033[1;33m[{i}]\033[0m \033[1;32m{name}\033[0m [\033[36m{gid}\033[0m]{slot}")
+        print(f"      Транспорт: \033[1m{transport}\033[0m | Режим: \033[1m{mode}\033[0m | Кодек: \033[1m{codec}\033[0m | URLs: \033[1;33m{len(urls)}\033[0m | Шифрование: {enc}")
+except Exception as e:
+    print(f"  Ошибка вывода групп: {e}")
+' "$raw_groups"
+        fi
+
+        echo ""
+        echo -e "  ${YELLOW}[1]${NC} 📥 ${BOLD}Импортировать группы из локального OpenFlux (/etc/openflux)${NC}"
+        echo -e "  ${YELLOW}[2]${NC} ➕ ${BOLD}Создать новую группу вручную${NC}"
+        echo -e "  ${YELLOW}[3]${NC} ✏️  ${BOLD}Редактировать группу из каталога${NC}"
+        echo -e "  ${RED}[4]${NC} 🗑️  ${BOLD}Удалить группу из каталога${NC}"
+        echo -e "  ${YELLOW}[5]${NC} 👁️  ${BOLD}Подробный просмотр группы и URL-адресов${NC}"
+        echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в меню подписок"
+        echo ""
+        read -p "Выберите действие [0-5]: " cat_act
+        case "$cat_act" in
+            1)
+                echo ""
+                echo -e "${CYAN}[*] Запрос импорта локальных групп из /etc/openflux...${NC}"
+                local imp_resp=$(curl -s -X POST "${SUB_API}/api/openflux/import-local" 2>/dev/null || echo "")
+                local imp_status=$(echo "$imp_resp" | jq -r '.status // empty' 2>/dev/null || echo "")
+                if [ "$imp_status" = "ok" ]; then
+                    local imp_count=$(echo "$imp_resp" | jq -r '.count // 0' 2>/dev/null || echo 0)
+                    echo -e "${GREEN}✓ Локальный импорт завершен успешно!${NC}"
+                    echo -e "  Импортировано/синхронизировано групп: ${BOLD}${imp_count}${NC}"
+                    echo -e "  ${GRAY}(Транспорты vyandex пропущены per v2 contract: разрешены только mailru, boards, cupsonline)${NC}"
+                else
+                    local imp_err=$(echo "$imp_resp" | jq -r '.error // "Неизвестная ошибка"' 2>/dev/null || echo "$imp_resp")
+                    echo -e "${RED}Ошибка импорта: ${imp_err}${NC}"
+                fi
+                echo ""
+                read -p "Нажмите Enter для продолжения..."
+                ;;
+            2)
+                clear
+                echo -e "${CYAN}=== СОЗДАНИЕ НОВОЙ ГРУППЫ OPENFLUX V2 ===${NC}\n"
+                local g_id=""
+                while true; do
+                    read -p "ID группы (латиница/цифры/дефис, например 'mailru-fast'): " g_id
+                    g_id=$(echo "$g_id" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                    if [[ "$g_id" =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; then
+                        break
+                    fi
+                    echo -e "${RED}Неверный ID. Допустимы только [a-zA-Z0-9_-] длиной от 1 до 64 символов.${NC}"
+                done
+
+                read -p "Отображаемое имя группы (например 'Mail.Ru Channel 1'): " g_name
+                g_name=$(echo "$g_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                [ -z "$g_name" ] && g_name="$g_id"
+
+                echo ""
+                echo -e "Выберите режим группы:"
+                echo -e "  [1] classic (ровно 1 URL)"
+                echo -e "  [2] multistream (от 1 до 4 URL)"
+                read -p "Режим [1-2, дефолт 1]: " m_choice
+                local g_mode="classic"
+                [ "$m_choice" = "2" ] && g_mode="multistream"
+
+                echo ""
+                echo -e "Выберите транспорт группы (контракт v2):"
+                echo -e "  [1] mailru (Облако Mail.ru)"
+                echo -e "  [2] boards (Miro Boards)"
+                echo -e "  [3] cupsonline (VK Cups Online)"
+                read -p "Транспорт [1-3, дефолт 1]: " tr_choice
+                local g_tr="mailru"
+                case "$tr_choice" in
+                    2) g_tr="boards" ;;
+                    3) g_tr="cupsonline" ;;
+                    *) g_tr="mailru" ;;
+                esac
+
+                echo ""
+                echo -e "Выберите кодек потока:"
+                echo -e "  [1] legacy (стандартный OpenFlux payload)"
+                echo -e "  [2] batched (пакетный кодек)"
+                read -p "Кодек [1-2, дефолт 1]: " cod_choice
+                local g_cod="legacy"
+                [ "$cod_choice" = "2" ] && g_cod="batched"
+
+                echo ""
+                local g_urls=()
+                if [ "$g_mode" = "classic" ]; then
+                    while true; do
+                        read -p "Введите URL для группы (http/https): " single_url
+                        single_url=$(echo "$single_url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                        if [[ "$single_url" =~ ^https?://.+ ]]; then
+                            g_urls+=("$single_url")
+                            break
+                        else
+                            echo -e "${RED}URL должен начинаться с http:// или https://${NC}"
+                        fi
+                    done
+                else
+                    echo -e "Введите от 1 до 4 URL для multistream группы (по одной строке, пустой Enter для завершения):"
+                    local u_idx=1
+                    while [ $u_idx -le 4 ]; do
+                        read -p "  URL #${u_idx} (Enter для завершения): " u_in
+                        u_in=$(echo "$u_in" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                        if [ -z "$u_in" ]; then
+                            [ ${#g_urls[@]} -ge 1 ] && break
+                            echo -e "${RED}Требуется минимум 1 URL!${NC}"
+                            continue
+                        fi
+                        if [[ "$u_in" =~ ^https?://.+ ]]; then
+                            g_urls+=("$u_in")
+                            u_idx=$((u_idx + 1))
+                        else
+                            echo -e "${RED}URL должен начинаться с http:// или https://${NC}"
+                        fi
+                    done
+                fi
+
+                echo ""
+                read -p "Ключ шифрования (AES-GCM base64 или строка, Enter - отключено): " g_key
+                g_key=$(echo "$g_key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+                local payload_json=$(python3 -c '
+import json, sys
+data = {
+    "id": sys.argv[1],
+    "name": sys.argv[2],
+    "mode": sys.argv[3],
+    "transport": sys.argv[4],
+    "codec": sys.argv[5],
+    "urls": [u for u in sys.argv[6].splitlines() if u.strip()],
+    "encryption_key": sys.argv[7] if sys.argv[7] else None
+}
+print(json.dumps(data))
+' "$g_id" "$g_name" "$g_mode" "$g_tr" "$g_cod" "$(printf '%s\n' "${g_urls[@]}")" "$g_key")
+
+                echo -e "${CYAN}[*] Сохранение группы '\''${g_id}'\'' в сервере подписок...${NC}"
+                local create_resp=$(curl -s -X POST "${SUB_API}/api/openflux/groups" -H "Content-Type: application/json" -d "$payload_json" 2>/dev/null || echo "")
+                local create_err=$(echo "$create_resp" | jq -r '.error // empty' 2>/dev/null || echo "")
+                if [ -n "$create_err" ]; then
+                    echo -e "${RED}Ошибка создания группы: ${create_err}${NC}"
+                else
+                    echo -e "${GREEN}✓ Группа '\''${g_name}'\'' [${g_id}] успешно создана!${NC}"
+                fi
+                echo ""
+                read -p "Нажмите Enter для продолжения..."
+                ;;
+            3)
+                if [ "$count_groups" -eq 0 ]; then
+                    echo -e "${YELLOW}Каталог пуст.${NC}"
+                    sleep 1
+                    continue
+                fi
+                echo ""
+                read -p "Введите номер группы для редактирования [1-${count_groups}]: " ed_num
+                if [[ ! "$ed_num" =~ ^[0-9]+$ ]] || [ "$ed_num" -lt 1 ] || [ "$ed_num" -gt "$count_groups" ]; then
+                    echo -e "${RED}Неверный номер.${NC}"
+                    sleep 1
+                    continue
+                fi
+                local target_id=$(python3 -c "import json, sys; grps=json.loads(sys.argv[1]); print(grps[int(sys.argv[2])-1]['id'])" "$raw_groups" "$ed_num")
+                local cur_grp=$(curl -s "${SUB_API}/api/openflux/groups/${target_id}" 2>/dev/null || echo "")
+                if [ -z "$cur_grp" ] || [ "$(echo "$cur_grp" | jq -r '.error // empty')" != "" ]; then
+                    echo -e "${RED}Не удалось загрузить группу ${target_id}${NC}"
+                    sleep 1.5
+                    continue
+                fi
+
+                local g_nm=$(echo "$cur_grp" | jq -r '.name // ""')
+                local g_md=$(echo "$cur_grp" | jq -r '.mode // "classic"')
+                local g_tr=$(echo "$cur_grp" | jq -r '.transport // "mailru"')
+                local g_cd=$(echo "$cur_grp" | jq -r '.codec // "legacy"')
+                local g_ky=$(echo "$cur_grp" | jq -r '.encryption_key // ""')
+                local g_u_cnt=$(echo "$cur_grp" | jq -r '(.urls // []) | length')
+
+                clear
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${CYAN}║${BOLD}          РЕДАКТИРОВАНИЕ ГРУППЫ OPENFLUX: ${target_id}          ${CYAN}║${NC}"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                echo -e "  [1] Имя: ${GREEN}${g_nm}${NC}"
+                echo -e "  [2] Транспорт: ${YELLOW}${g_tr}${NC} (mailru / boards / cupsonline)"
+                echo -e "  [3] Кодек: ${MAGENTA}${g_cd}${NC} (legacy / batched)"
+                echo -e "  [4] Режим: ${CYAN}${g_md}${NC} (classic / multistream)"
+                echo -e "  [5] URLs: ${BOLD}${g_u_cnt}${NC} адресов"
+                echo -e "  [6] Ключ шифрования: $([ -n "$g_ky" ] && echo "${GREEN}Задан${NC}" || echo "${GRAY}Отключен${NC}")"
+                echo -e "  [0] Отмена"
+                echo ""
+                read -p "Что изменить [0-6]: " ed_choice
+                case "$ed_choice" in
+                    1)
+                        read -p "Новое имя (сейчас: '${g_nm}'): " new_nm
+                        new_nm=$(echo "$new_nm" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                        if [ -n "$new_nm" ]; then
+                            curl -s -X PUT "${SUB_API}/api/openflux/groups/${target_id}" -H "Content-Type: application/json" -d "{\"name\": \"$new_nm\"}" >/dev/null 2>&1
+                            echo -e "${GREEN}✓ Имя обновлено!${NC}"
+                            sleep 1
+                        fi
+                        ;;
+                    2)
+                        echo -e "1: mailru, 2: boards, 3: cupsonline"
+                        read -p "Выберите транспорт [1-3]: " n_tr_c
+                        local n_tr="mailru"
+                        [ "$n_tr_c" = "2" ] && n_tr="boards"
+                        [ "$n_tr_c" = "3" ] && n_tr="cupsonline"
+                        curl -s -X PUT "${SUB_API}/api/openflux/groups/${target_id}" -H "Content-Type: application/json" -d "{\"transport\": \"$n_tr\"}" >/dev/null 2>&1
+                        echo -e "${GREEN}✓ Транспорт обновлен на ${n_tr}!${NC}"
+                        sleep 1
+                        ;;
+                    3)
+                        echo -e "1: legacy, 2: batched"
+                        read -p "Выберите кодек [1-2]: " n_cd_c
+                        local n_cd="legacy"
+                        [ "$n_cd_c" = "2" ] && n_cd="batched"
+                        curl -s -X PUT "${SUB_API}/api/openflux/groups/${target_id}" -H "Content-Type: application/json" -d "{\"codec\": \"$n_cd\"}" >/dev/null 2>&1
+                        echo -e "${GREEN}✓ Кодек обновлен на ${n_cd}!${NC}"
+                        sleep 1
+                        ;;
+                    4)
+                        local n_md="classic"
+                        [ "$g_md" = "classic" ] && n_md="multistream"
+                        echo -e "Переключение режима с ${g_md} на ${n_md}..."
+                        curl -s -X PUT "${SUB_API}/api/openflux/groups/${target_id}" -H "Content-Type: application/json" -d "{\"mode\": \"$n_md\"}" >/dev/null 2>&1
+                        echo -e "${GREEN}✓ Режим изменен на ${n_md}!${NC}"
+                        sleep 1
+                        ;;
+                    5)
+                        echo -e "Ввод новых URL для режима ${g_md}:"
+                        local n_urls=()
+                        if [ "$g_md" = "classic" ]; then
+                            read -p "Новый URL (http/https): " s_u
+                            s_u=$(echo "$s_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                            [[ "$s_u" =~ ^https?://.+ ]] && n_urls+=("$s_u")
+                        else
+                            local idx=1
+                            while [ $idx -le 4 ]; do
+                                read -p "URL #${idx} (Enter для завершения): " s_u
+                                s_u=$(echo "$s_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                                [ -z "$s_u" ] && [ ${#n_urls[@]} -ge 1 ] && break
+                                [[ "$s_u" =~ ^https?://.+ ]] && n_urls+=("$s_u") && idx=$((idx + 1))
+                            done
+                        fi
+                        if [ ${#n_urls[@]} -gt 0 ]; then
+                            local u_json=$(python3 -c "import json, sys; print(json.dumps({'urls': [x for x in sys.argv[1].splitlines() if x.strip()]}))" "$(printf '%s\n' "${n_urls[@]}")")
+                            curl -s -X PUT "${SUB_API}/api/openflux/groups/${target_id}" -H "Content-Type: application/json" -d "$u_json" >/dev/null 2>&1
+                            echo -e "${GREEN}✓ Список URL обновлен!${NC}"
+                            sleep 1
+                        fi
+                        ;;
+                    6)
+                        read -p "Новый ключ шифрования (Enter - очистить): " n_ky
+                        n_ky=$(echo "$n_ky" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                        local k_json=$(python3 -c "import json, sys; print(json.dumps({'encryption_key': sys.argv[1] if sys.argv[1] else None}))" "$n_ky")
+                        curl -s -X PUT "${SUB_API}/api/openflux/groups/${target_id}" -H "Content-Type: application/json" -d "$k_json" >/dev/null 2>&1
+                        echo -e "${GREEN}✓ Ключ шифрования обновлен!${NC}"
+                        sleep 1
+                        ;;
+                    *) ;;
+                esac
+                ;;
+            4)
+                if [ "$count_groups" -eq 0 ]; then
+                    echo -e "${YELLOW}Каталог пуст.${NC}"
+                    sleep 1
+                    continue
+                fi
+                echo ""
+                read -p "Введите номер группы для удаления [1-${count_groups}]: " del_num
+                if [[ ! "$del_num" =~ ^[0-9]+$ ]] || [ "$del_num" -lt 1 ] || [ "$del_num" -gt "$count_groups" ]; then
+                    echo -e "${RED}Неверный номер.${NC}"
+                    sleep 1
+                    continue
+                fi
+                local del_id=$(python3 -c "import json, sys; grps=json.loads(sys.argv[1]); print(grps[int(sys.argv[2])-1]['id'])" "$raw_groups" "$del_num")
+                echo -e "Вы действительно хотите удалить группу '${BOLD}${del_id}${NC}' из каталога?"
+                echo -e "${YELLOW}Предупреждение: группа будет исключена из подписок всех пользователей, где она была выбрана.${NC}"
+                read -p "Подтвердите удаление [y/N]: " conf_gdel
+                if [[ "$conf_gdel" =~ ^[YyДд]$ ]]; then
+                    curl -s -X DELETE "${SUB_API}/api/openflux/groups/${del_id}" >/dev/null 2>&1
+                    echo -e "${GREEN}✓ Группа '${del_id}' удалена!${NC}"
+                    sleep 1.5
+                fi
+                ;;
+            5)
+                if [ "$count_groups" -eq 0 ]; then
+                    echo -e "${YELLOW}Каталог пуст.${NC}"
+                    sleep 1
+                    continue
+                fi
+                echo ""
+                read -p "Введите номер группы для подробного просмотра [1-${count_groups}]: " vw_num
+                if [[ ! "$vw_num" =~ ^[0-9]+$ ]] || [ "$vw_num" -lt 1 ] || [ "$vw_num" -gt "$count_groups" ]; then
+                    echo -e "${RED}Неверный номер.${NC}"
+                    sleep 1
+                    continue
+                fi
+                local vw_id=$(python3 -c "import json, sys; grps=json.loads(sys.argv[1]); print(grps[int(sys.argv[2])-1]['id'])" "$raw_groups" "$vw_num")
+                local g_det=$(curl -s "${SUB_API}/api/openflux/groups/${vw_id}" 2>/dev/null || echo "")
+                clear
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${CYAN}║${BOLD}          ПОДРОБНЫЕ ПАРАМЕТРЫ ГРУППЫ: ${vw_id}                      ${CYAN}║${NC}"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+print(json.dumps(data, ensure_ascii=False, indent=2))
+' "$g_det"
+                echo ""
+                read -p "Нажмите Enter для возврата..."
                 ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
@@ -5491,12 +6104,13 @@ menu_subscriptions() {
         echo -e "  ${YELLOW}[5]${NC} 🗑️  ${BOLD}Удалить пользователя из сервера подписок${NC}"
         echo -e "  ${YELLOW}[6]${NC} 🔄 ${BOLD}Ротация токена подписки${NC} (мгновенно отзывает старую ссылку)"
         echo -e "  ${YELLOW}[7]${NC} ⚡ ${BOLD}Включить / отключить подписку пользователя${NC}"
-        echo -e "  ${YELLOW}[8]${NC} 🔄 ${BOLD}Перезапустить службу tuna-subscriptions${NC}"
-        echo -e "  ${YELLOW}[9]${NC} 📜 ${BOLD}Логи службы tuna-subscriptions${NC}"
-        echo -e "  ${YELLOW}[10]${NC} 📥 ${BOLD}Установить / Обновить службу tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[8]${NC} 🌊 ${BOLD}Каталог групп OpenFlux v2 (импорт / редактирование)${NC}"
+        echo -e "  ${YELLOW}[9]${NC} 🔄 ${BOLD}Перезапустить службу tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[10]${NC} 📜 ${BOLD}Логи службы tuna-subscriptions${NC}"
+        echo -e "  ${YELLOW}[11]${NC} 📥 ${BOLD}Установить / Обновить службу tuna-subscriptions${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-10]: " sub_act
+        read -p "Выберите действие [0-11]: " sub_act
         case "$sub_act" in
             1)
                 clear
@@ -5525,6 +6139,8 @@ try:
             v = counts.get(k, 0)
             if v > 0:
                 details.append(f"{label}: {v}")
+        if counts.get("openflux", 0) > 0 or u.get("openflux"):
+            details.append(f"OpenFlux: {counts.get('openflux', 1)} гр.")
         j_details = ", ".join(details)
         detail_str = f" ({j_details})" if details else ""
         sub_url = u.get("subscription_url", "")
@@ -5721,6 +6337,9 @@ print(json.dumps(data))
                 read -p "Нажмите Enter для возврата..."
                 ;;
             8)
+                menu_openflux_sub_catalog
+                ;;
+            9)
                 echo -e "${CYAN}[*] Перезапуск службы tuna-subscriptions...${NC}"
                 systemctl restart tuna-subscriptions 2>/dev/null || true
                 sleep 1
@@ -5732,10 +6351,10 @@ print(json.dumps(data))
                 fi
                 sleep 2
                 ;;
-            9)
+            10)
                 journalctl -u tuna-subscriptions -f -n 50
                 ;;
-            10)
+            11)
                 echo -e "${CYAN}[*] Запуск установки / обновления tuna-subscriptions...${NC}"
                 mkdir -p /tmp/tuna-sub-install
                 curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.py "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/tuna-subscriptions.py?v=$(date +%s)" 2>/dev/null || true

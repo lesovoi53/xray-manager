@@ -168,10 +168,92 @@ curl -X DELETE http://127.0.0.1:22217/api/users/<USER_ID>
 
 ---
 
+### 3. OpenFlux v2 Bundle (Контракт TUNA VPN)
+
+Сервис подписок поддерживает спецификацию **OpenFlux v2** для клиента TUNA VPN:
+* **Формат строки:** `openflux-bundle://v2/<Base64URL-NoPadding(UTF8(JSON_payload))>`
+* **Включение в подписку:** Бандл v2 добавляется отдельной строкой в общий Base64-ответ `GET /sub/<token>`. Клиент TUNA объединяет группы бандла в **одно общее подключение** с балансировкой (`roundRobin` или `leastPing`).
+* **Поддерживаемые транспорты (v2):** Строго `"mailru"`, `"boards"`, `"cupsonline"`. Любые устаревшие/неподдерживаемые транспорты (включая `vyandex`) отклоняются валидатором.
+* **Режимы:**
+  * `classic`: от 1 до 8 групп, в каждой группе ровно 1 URL.
+  * `multistream`: от 1 до 8 групп, в каждой группе от 1 до 4 URL (суммарно до 32 URL на бандл).
+* **Кодеки:** `legacy` (OpenFlux standard) или `batched`.
+* **Шифрование:** Опциональный `encryption_key` (AES-GCM base64 или строка) на уровне каждой отдельной группы.
+* **Синхронизация ETag:** При редактировании группы в каталоге или настроек пользователя автоматически инкрементируется ревизия профиля (`revision`) и инвалидируется `ETag`, гарантируя немедленное получение свежей подписки клиентом.
+
+#### 🔹 Каталог групп: `GET /api/openflux/groups`
+Возвращает список всех групп OpenFlux в каталоге сервера:
+```json
+[
+  {
+    "id": "mailru-pool-1",
+    "name": "Mail.Ru Primary",
+    "mode": "classic",
+    "transport": "mailru",
+    "urls": ["https://cloud.mail.ru/public/abcd/1234"],
+    "codec": "legacy",
+    "encryption_key": null,
+    "source_slot": 1
+  }
+]
+```
+
+#### 🔹 Добавление группы: `POST /api/openflux/groups`
+```bash
+curl -X POST http://127.0.0.1:22217/api/openflux/groups \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "mailru-pool-1",
+    "name": "Mail.Ru Primary",
+    "mode": "classic",
+    "transport": "mailru",
+    "urls": ["https://cloud.mail.ru/public/abcd/1234"],
+    "codec": "legacy"
+  }'
+```
+
+#### 🔹 Импорт локальных групп: `POST /api/openflux/import-local`
+Безопасно считывает экземпляры `/etc/openflux/instances/*.env` и режим `/etc/openflux/pool.mode` на хосте, отфильтровывает несовместимые транспорты (vyandex) и регистрирует группы в каталоге:
+```bash
+curl -X POST http://127.0.0.1:22217/api/openflux/import-local
+```
+
+#### 🔹 Настройка OpenFlux для пользователя: `GET /api/users/<id>/openflux`
+Возвращает конфигурацию бандла пользователя и список выбранных групп:
+```json
+{
+  "user_id": "c1f7a012-...",
+  "enabled": true,
+  "connection_id": "3f90117a-24ea-4c40-bd20-00d9841f3d32",
+  "name": "TUNA Multi-Stream",
+  "mode": "multistream",
+  "balancer_strategy": "leastPing",
+  "revision": 3,
+  "selected_group_ids": ["mailru-pool-1", "boards-pool-2"],
+  "groups": [...]
+}
+```
+
+#### 🔹 Обновление настроек OpenFlux: `PUT /api/users/<id>/openflux`
+Позволяет включить/отключить публикацию бандла, изменить имя подключения, режим, стратегию балансировки и набор выбранных групп (от 1 до 8):
+```bash
+curl -X PUT http://127.0.0.1:22217/api/users/<id>/openflux \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "name": "Office OpenFlux Cluster",
+    "mode": "classic",
+    "balancer_strategy": "roundRobin",
+    "group_ids": ["mailru-pool-1"]
+  }'
+```
+
+---
+
 ## 🧪 Тестирование
 
-Сервис сопровождается полным комплектом из 16 автоматических приемочных тестов, проверяющих:
-1. Создание пользователя и выдачу ссылок.
+Сервис сопровождается полным комплектом из 33 автоматических приемочных тестов, проверяющих:
+1. Создание пользователя и выдачу ссылок базовых протоколов.
 2. Уникальность токенов и изоляцию данных между пользователями.
 3. Жесткий порядок протоколов и фильтрацию пустых записей.
 4. Валидность Base64 и UTF-8 заголовка `Profile-Title`.
@@ -179,6 +261,12 @@ curl -X DELETE http://127.0.0.1:22217/api/users/<USER_ID>
 6. Работу ETag и HTTP 304 Not Modified.
 7. Недоступность деактивированных пользователей.
 8. Маскирование конфиденциальных данных в логах.
+9. Сериализацию и валидацию спецификации OpenFlux v2 Bundle.
+10. Строгую отбраковку неподдерживаемых транспортов (например, vyandex).
+11. Ограничения режимов classic (1 URL) и multistream (1-4 URL, до 8 групп на бандл).
+12. Инвалидацию ETag и ревизии пользователя при изменении групп.
+13. Безопасный импорт локальных конфигураций OpenFlux без shell eval.
+14. Соответствие синтетическим фикстурам контракта TUNA.
 
 Запуск тестов:
 ```bash

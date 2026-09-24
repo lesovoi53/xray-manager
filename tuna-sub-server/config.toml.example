@@ -5,7 +5,7 @@
 # Локальный адрес привязки (доступ разрешен только с localhost)
 bind_address = "127.0.0.1"
 port = 22217
-max_request_body_size = 65536
+max_request_body_size = 2097152
 
 [database]
 # Путь к базе данных SQLite
