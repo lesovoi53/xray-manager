@@ -35,9 +35,11 @@ if [ "$MODE" = "xray" ]; then
     
     # Исключение облачных платформ (Яндекс / Mail.ru / VK / OnlyOffice), чтобы транспортный туннель не зацикливался
     # Яндекс IP подсети
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 5.45.192.0/18 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 77.88.0.0/18 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 87.250.250.0/24 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 93.158.134.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 178.154.131.0/24 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 213.180.193.0/24 -j RETURN 2>/dev/null || true
     
     # Mail.ru / VK IP подсети

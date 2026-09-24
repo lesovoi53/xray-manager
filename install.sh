@@ -765,6 +765,16 @@ if [ "$INSTALL_OPENFLUX" = "yes" ]; then
             rm -rf "$tmp_of"
             echo -e "  -> Клонирование и компиляция p1neappleXpress/OpenFlux..."
             if git clone --depth 1 https://github.com/p1neappleXpress/OpenFlux.git "$tmp_of" >/dev/null 2>&1; then
+                local patch_file=""
+                if [ -f "$SCRIPT_DIR/patches/openflux-multistream.patch" ]; then
+                    patch_file="$SCRIPT_DIR/patches/openflux-multistream.patch"
+                elif [ -f "/usr/local/share/x-manager/patches/openflux-multistream.patch" ]; then
+                    patch_file="/usr/local/share/x-manager/patches/openflux-multistream.patch"
+                fi
+                if [ -n "$patch_file" ] && [ -f "$patch_file" ]; then
+                    echo -e "  -> Применение патча Multi-Stream trunking..."
+                    (cd "$tmp_of" && git apply "$patch_file" 2>/dev/null || patch -p1 < "$patch_file" 2>/dev/null) || true
+                fi
                 (cd "$tmp_of" && CGO_ENABLED=0 go build -v -trimpath -ldflags='-s -w' -o /usr/local/bin/openflux . && chmod +x /usr/local/bin/openflux)
                 rm -rf "$tmp_of"
                 echo -e "  ✓ /usr/local/bin/openflux успешно скомпилирован"
@@ -851,11 +861,11 @@ if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = "yes" ]; then
                 rm -rf "$tmp_wdt"
                 echo -e "  ✓ /usr/local/bin/webdav-tunnel успешно скомпилирован"
             else
-                echo -e "${YELLOW}  ! Не удалось клонировать webdav-tunnel. Установите позже через x-manager [14].${NC}"
+                echo -e "${YELLOW}  ! Не удалось клонировать webdav-tunnel. Установите позже через x-manager [3].${NC}"
                 rm -rf "$tmp_wdt"
             fi
         else
-            echo -e "${YELLOW}  ! Компилятор Go недоступен. Сборку webdav-tunnel можно выполнить позже через x-manager [14].${NC}"
+            echo -e "${YELLOW}  ! Компилятор Go недоступен. Сборку webdav-tunnel можно выполнить позже через x-manager [3].${NC}"
         fi
     else
         echo -e "  ✓ Бинарный файл /usr/local/bin/webdav-tunnel уже установлен"
@@ -911,7 +921,7 @@ EOF_WDAV
     ln -sf /usr/local/bin/x-manager /usr/local/bin/x-wdav 2>/dev/null || true
     systemctl daemon-reload
     echo -e "  ✓ WebDAV Tunnel инициализирован (selfhosted :8443, Xray REDIRECT :${XRAY_REDIRECT_PORT})"
-    echo -e "  ✓ Управление: x-webdav | x-manager → пункт [14]"
+    echo -e "  ✓ Управление: x-webdav | x-manager → пункт [3]"
 fi
 
 # Настройка безопасности (Блокировка шлюзов извне и открытие портов протоколов)
@@ -965,6 +975,11 @@ else
     curl -fL --progress-bar -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/bin/x-manager?v=$(date +%s)" || curl -fsSL -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/bin/x-manager?v=$(date +%s)" 2>/dev/null || true
 fi
 chmod +x /usr/local/bin/x-manager
+
+mkdir -p /usr/local/share/x-manager/patches
+if [ -d "$SCRIPT_DIR/patches" ]; then
+    cp -rf "$SCRIPT_DIR/patches"/* /usr/local/share/x-manager/patches/ 2>/dev/null || true
+fi
 
 echo -e "  -> Создание системных алиасов (x-snell, x-mieru, x-wdtt, x-csqtt, x-dns, x-ssl, x-fw)..."
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-snell

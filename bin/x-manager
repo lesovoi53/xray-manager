@@ -214,10 +214,15 @@ get_openflux_routing() {
 }
 
 detect_transport_from_url() {
-    local u="$1"
+    local raw_u="$1"
     local fallback="${2:-vyandex}"
-    if [[ "$u" =~ cloud\.mail\.ru || "$u" =~ mail\.ru/public ]]; then
+    local u=$(echo "$raw_u" | cut -d',' -f1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [[ "$u" =~ boards\.yandex\.ru || "$u" =~ /whiteboard || "$u" =~ /guest/\?hash= ]]; then
+        echo "boards"
+    elif [[ "$u" =~ cloud\.mail\.ru || "$u" =~ mail\.ru/public ]]; then
         echo "mailru"
+    elif [[ "$u" =~ cups\.online ]]; then
+        echo "cupsonline"
     elif [[ "$u" =~ disk\.yandex\.ru || "$u" =~ docs\.yandex\.ru ]]; then
         if [ "$fallback" = "yandex" ]; then
             echo "yandex"
@@ -3665,16 +3670,15 @@ view_global_status() {
     echo -e "${BOLD}--- Статус служб и маршрутизации ---${NC}"
     printf "  %-22s %-25b [Маршрут: %b]\n" "Mieru (mita):" "$(get_mieru_status)" "$(get_mieru_routing)"
     printf "  %-22s %-25b [Маршрут: %b]\n" "Snell (v5):" "$(get_snell_status)" "$(get_snell_routing)"
-    printf "  %-22s %-25b [Маршрут: %b]\n" "WDTT (qwdtt):" "$(get_wdtt_status)" "$(get_wdtt_routing)"
-    if is_csqtt_installed; then
-        printf "  %-22s %-25b [Панель :%s | %b]\n" "CSQTT (VPN Server):" "$(get_csqtt_status)" "$(get_csqtt_web_port)" "$(get_csqtt_protect_status)"
+    if is_webdav_tunnel_installed; then
+        local w_mode=$(get_wdavtunnel_prop "WEBDAV_MODE" "selfhosted")
+        if [ "$w_mode" = "server" ] || [ "$w_mode" = "external" ] || [ "$w_mode" = "mailru" ] || [ "$w_mode" = "yandex" ]; then
+            printf "  %-22s %-25b [Провайдер: %s | %b]\n" "WebDAV Tunnel:" "$(get_wdavtunnel_status)" "$(get_wdavtunnel_provider_label)" "$(get_wdavtunnel_routing)"
+        else
+            printf "  %-22s %-25b [Порт: :%s/TCP | %b]\n" "WebDAV Tunnel:" "$(get_wdavtunnel_status)" "$(get_wdavtunnel_listen_port)" "$(get_wdavtunnel_routing)"
+        fi
     else
-        printf "  %-22s %-25b\n" "CSQTT (VPN Server):" "$(get_csqtt_status)"
-    fi
-    if is_dns_installed; then
-        printf "  %-22s %-25b [Зона: %s:53 | %b]\n" "DNS-Туннель:" "$(get_dns_status)" "$(get_dns_domain)" "$(get_dns_wan_status)"
-    else
-        printf "  %-22s %-25b\n" "DNS-Туннель:" "$(get_dns_status)"
+        printf "  %-22s %b\n" "WebDAV Tunnel:" "${RED}НЕ УСТАНОВЛЕН${NC}"
     fi
     if is_openflux_installed; then
         local of_cnt=$(get_openflux_counts)
@@ -3683,15 +3687,21 @@ view_global_status() {
     else
         printf "  %-22s %-25b\n" "OpenFlux (L4):" "$(get_openflux_status)"
     fi
-    if is_webdav_tunnel_installed; then
-        local w_mode=$(get_wdavtunnel_prop "WEBDAV_MODE" "selfhosted")
-        if [ "$w_mode" = "server" ] || [ "$w_mode" = "external" ]; then
-            printf "  %-22s %-25b [Режим: Yandex/Cloud | %b]\n" "WebDAV Tunnel:" "$(get_wdavtunnel_status)" "$(get_wdavtunnel_routing)"
-        else
-            printf "  %-22s %-25b [Порт: :%s/TCP | %b]\n" "WebDAV Tunnel:" "$(get_wdavtunnel_status)" "$(get_wdavtunnel_listen_port)" "$(get_wdavtunnel_routing)"
-        fi
+    if is_dns_installed; then
+        printf "  %-22s %-25b [Зона: %s:53 | %b]\n" "DNS-Туннель:" "$(get_dns_status)" "$(get_dns_domain)" "$(get_dns_wan_status)"
     else
-        printf "  %-22s %b\n" "WebDAV Tunnel:" "${RED}НЕ УСТАНОВЛЕН${NC}"
+        printf "  %-22s %-25b\n" "DNS-Туннель:" "$(get_dns_status)"
+    fi
+    printf "  %-22s %-25b [Маршрут: %b]\n" "WDTT (qwdtt):" "$(get_wdtt_status)" "$(get_wdtt_routing)"
+    if is_csqtt_installed; then
+        printf "  %-22s %-25b [Панель :%s | %b]\n" "CSQTT (VPN Server):" "$(get_csqtt_status)" "$(get_csqtt_web_port)" "$(get_csqtt_protect_status)"
+    else
+        printf "  %-22s %-25b\n" "CSQTT (VPN Server):" "$(get_csqtt_status)"
+    fi
+    if is_sub_server_installed; then
+        printf "  %-22s %-25b [API: :22217 🔒]\n" "TUNA Подписки:" "$(get_sub_server_status)"
+    else
+        printf "  %-22s %-25b\n" "TUNA Подписки:" "$(get_sub_server_status)"
     fi
     local xray_st="inactive"
     if systemctl is-active --quiet xray 2>/dev/null; then
@@ -3759,6 +3769,9 @@ restart_all_services() {
     fi
     if is_webdav_tunnel_installed; then
         echo -e "WebDAV Tunnel: $(get_wdavtunnel_status)"
+    fi
+    if is_openflux_installed; then
+        echo -e "OpenFlux:      $(get_openflux_status)"
     fi
     sync_active_firewall_rules
     sleep 2
@@ -5713,6 +5726,28 @@ rebuild_openflux() {
     rm -rf "$tmp_dir"
     echo -e "  -> Клонирование github.com/p1neappleXpress/OpenFlux..."
     if git clone --depth 1 https://github.com/p1neappleXpress/OpenFlux.git "$tmp_dir"; then
+        local patch_file=""
+        if [ -f "/usr/local/share/x-manager/patches/openflux-multistream.patch" ]; then
+            patch_file="/usr/local/share/x-manager/patches/openflux-multistream.patch"
+        elif [ -f "$(dirname "$0")/../patches/openflux-multistream.patch" ]; then
+            patch_file="$(dirname "$0")/../patches/openflux-multistream.patch"
+        elif [ -f "/etc/x-manager/patches/openflux-multistream.patch" ]; then
+            patch_file="/etc/x-manager/patches/openflux-multistream.patch"
+        elif [ -f "/root/x-manager/patches/openflux-multistream.patch" ]; then
+            patch_file="/root/x-manager/patches/openflux-multistream.patch"
+        fi
+
+        if [ -n "$patch_file" ] && [ -f "$patch_file" ]; then
+            echo -e "  -> Применение патча Multi-Stream trunking ($(basename "$patch_file"))..."
+            if (cd "$tmp_dir" && git apply "$patch_file" 2>/dev/null); then
+                echo -e "  ${GREEN}✓ Патч Multi-Stream успешно применен!${NC}"
+            elif (cd "$tmp_dir" && patch -p1 < "$patch_file" 2>/dev/null); then
+                echo -e "  ${GREEN}✓ Патч Multi-Stream применен через patch -p1!${NC}"
+            else
+                echo -e "  ${YELLOW}⚠ Не удалось применить патч Multi-Stream, сборка продолжится из main.${NC}"
+            fi
+        fi
+
         echo -e "  -> Компиляция бинарного файла OpenFlux (CGO_ENABLED=0)..."
         (cd "$tmp_dir" && CGO_ENABLED=0 go build -v -trimpath -ldflags='-s -w' -o /usr/local/bin/openflux . && chmod +x /usr/local/bin/openflux)
         rm -rf "$tmp_dir"
@@ -5779,8 +5814,7 @@ if [ -f "$ENV_FILE" ]; then
     [ -n "$val" ] && XRAY_REDIRECT_PORT="$val"
 fi
 MODE="xray"
-[ -f "$MODE_FILE" ] && MODE=$(cat "$MODE_FILE" | tr -d ' 
-')
+[ -f "$MODE_FILE" ] && MODE=$(cat "$MODE_FILE" | tr -d ' \r\n')
 SERVER_IP=$(ip -4 addr show scope global 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
 
 iptables -w 5 -t nat -D OUTPUT -m owner --uid-owner openflux -j OPENFLUX_OUT 2>/dev/null || true
@@ -5792,8 +5826,12 @@ if [ "$MODE" = "xray" ]; then
     iptables -w 5 -t nat -F OPENFLUX_OUT 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -d 127.0.0.0/8 -j RETURN
     [ -n "$SERVER_IP" ] && iptables -w 5 -t nat -A OPENFLUX_OUT -d "$SERVER_IP" -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 5.45.192.0/18 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 77.88.0.0/18 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 87.250.250.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 93.158.134.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 178.154.131.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 213.180.193.0/24 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 94.100.180.0/24 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 217.69.139.0/24 -j RETURN 2>/dev/null || true
     iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -j REDIRECT --to-ports "${XRAY_REDIRECT_PORT}"
@@ -6481,6 +6519,98 @@ build_webdav_tunnel_binary() {
     fi
 }
 
+# Диагностика и тестирование WebDAV-подключения (RFC 4918 PROPFIND)
+test_webdav_account() {
+    local provider="$1"
+    local u="$2"
+    local p="$3"
+    local ep="$4"
+
+    case "$provider" in
+        mailru)
+            ep="https://webdav.cloud.mail.ru/"
+            ;;
+        yandex)
+            ep="https://webdav.yandex.ru/"
+            ;;
+        selfhosted)
+            local port=$(get_wdavtunnel_prop "SELFHOSTED_PORT" "8443")
+            ep="http://127.0.0.1:${port}/"
+            ;;
+        custom)
+            [ -z "$ep" ] && ep=$(get_wdavtunnel_prop "CUSTOM_URL" "")
+            ;;
+    esac
+
+    if [ -z "$ep" ]; then
+        echo -e "   ${RED}✗ URL эндпоинта не задан${NC}"
+        return 1
+    fi
+    if [ -z "$u" ] || [ -z "$p" ]; then
+        echo -e "   ${RED}✗ Логин или пароль не задан${NC}"
+        return 1
+    fi
+
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" -u "${u}:${p}" -X PROPFIND -H "Depth: 0" --max-time 7 "$ep" 2>/dev/null || echo "000")
+
+    case "$code" in
+        207|200)
+            echo -e "   ${GREEN}✓ [HTTP ${code} Multi-Status] Авторизация успешна, хранилище готово!${NC}"
+            return 0
+            ;;
+        401)
+            echo -e "   ${RED}✗ [HTTP 401 Unauthorized] Неверный логин или пароль (нужен пароль приложения)${NC}"
+            return 1
+            ;;
+        403)
+            echo -e "   ${RED}✗ [HTTP 403 Forbidden] Доступ запрещен (включена 2FA или отключен WebDAV)${NC}"
+            return 1
+            ;;
+        404)
+            echo -e "   ${RED}✗ [HTTP 404 Not Found] Неверный путь к WebDAV каталогу${NC}"
+            return 1
+            ;;
+        000|*)
+            echo -e "   ${RED}✗ [Ошибка связи / HTTP ${code}] Сервер недоступен или тайм-аут${NC}"
+            return 1
+            ;;
+    esac
+}
+
+test_all_webdav_accounts() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ЭКСПРЕСС-ТЕСТИРОВАНИЕ ПОДКЛЮЧЕНИЙ WEBDAV                     ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    local s_port=$(get_wdavtunnel_prop "SELFHOSTED_PORT" "8443")
+    local s_user=$(get_wdavtunnel_prop "SELFHOSTED_LOGIN" "lesovoi")
+    local s_pass=$(get_wdavtunnel_prop "SELFHOSTED_PASSWORD" "")
+    echo -e " ${BOLD}1. Встроенный сервер VPS (Selfhosted :${s_port}):${NC} логин: ${s_user:-[нет]}"
+    test_webdav_account "selfhosted" "$s_user" "$s_pass" "http://127.0.0.1:${s_port}/"
+
+    local m_user=$(get_wdavtunnel_prop "MAILRU_LOGIN" "")
+    local m_pass=$(get_wdavtunnel_prop "MAILRU_PASSWORD" "")
+    echo -e " ${BOLD}2. Облако Mail.ru (webdav.cloud.mail.ru):${NC} логин: ${m_user:-[нет]}"
+    test_webdav_account "mailru" "$m_user" "$m_pass" ""
+
+    local y_user=$(get_wdavtunnel_prop "YANDEX_LOGIN" "")
+    local y_pass=$(get_wdavtunnel_prop "YANDEX_PASSWORD" "")
+    echo -e " ${BOLD}3. Яндекс Диск (webdav.yandex.ru):${NC} логин: ${y_user:-[нет]}"
+    test_webdav_account "yandex" "$y_user" "$y_pass" ""
+
+    local c_url=$(get_wdavtunnel_prop "CUSTOM_URL" "")
+    local c_user=$(get_wdavtunnel_prop "CUSTOM_LOGIN" "")
+    local c_pass=$(get_wdavtunnel_prop "CUSTOM_PASSWORD" "")
+    if [ -n "$c_url" ] || [ -n "$c_user" ]; then
+        echo -e " ${BOLD}4. Пользовательский сервер (Custom):${NC} URL: ${c_url:-[нет]}"
+        test_webdav_account "custom" "$c_user" "$c_pass" "$c_url"
+    fi
+    echo ""
+}
+
 menu_webdav_tunnel() {
     if ! is_webdav_tunnel_installed; then
         clear
@@ -6685,9 +6815,10 @@ EOF_CFG
         echo -e "  ${CYAN}[10]${NC} 📜 Логи службы (journalctl)"
         echo -e "  ${CYAN}[11]${NC} ⚡ Живые логи (journalctl -f)"
         echo -e "  ${CYAN}[12]${NC} 🔨 Пересобрать бинарник из исходников (spkprsnts/webdav-tunnel)"
+        echo -e "  ${PURPLE}[T]${NC} 🧪 ${BOLD}Экспресс-тест авторизации всех WebDAV-аккаунтов (PROPFIND)${NC}"
         echo -e "  ${BOLD}[0]${NC} ← Назад в главное меню"
         echo ""
-        read -p "Выберите действие [0-12]: " wdt_choice
+        read -p "Выберите действие [0-12, T]: " wdt_choice
 
         case "$wdt_choice" in
             1)
@@ -6925,7 +7056,15 @@ EOF_CFG
                     esac
                     chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
                     chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
-                    echo -e "${GREEN}✓ Данные обновлены. Перезапустите туннель для применения.${NC}"
+                    echo -e "${GREEN}✓ Данные сохранены.${NC}"
+                    echo ""
+                    echo -e "${CYAN}→ Экспресс-проверка авторизации...${NC}"
+                    local test_p="$wdt_mode"
+                    [ "$test_p" = "multi" ] && test_p="selfhosted"
+                    local p_u=$(get_wdavtunnel_prop "$(echo ${test_p} | tr '[:lower:]' '[:upper:]')_LOGIN" "")
+                    local p_p=$(get_wdavtunnel_prop "$(echo ${test_p} | tr '[:lower:]' '[:upper:]')_PASSWORD" "")
+                    test_webdav_account "$test_p" "$p_u" "$p_p" ""
+                    echo ""
                     read -p "Нажмите Enter..."
                 fi
                 ;;
@@ -7031,10 +7170,126 @@ EOF_CFG
                 build_webdav_tunnel_binary && systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
                 read -p "Нажмите Enter..."
                 ;;
+            [TtТт])
+                test_all_webdav_accounts
+                read -p "Нажмите Enter для возврата..." dummy
+                ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac
     done
+}
+
+# Тестирование валидности ссылки OpenFlux (Яндекс Документы, Доски, Mail.ru)
+test_openflux_link() {
+    local target_url="$1"
+    local transport="$2"
+
+    if [ -z "$target_url" ]; then
+        echo -e "   ${YELLOW}[НЕ НАСТРОЕН] (ссылка пуста)${NC}"
+        return 1
+    fi
+
+    # Разбор списка URL для Multi-Stream (если несколько через запятую)
+    local urls_to_test=()
+    IFS=',' read -ra ADDR <<< "$target_url"
+    for i in "${ADDR[@]}"; do
+        local clean_u=$(echo "$i" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [ -n "$clean_u" ] && urls_to_test+=("$clean_u")
+    done
+
+    local total=${#urls_to_test[@]}
+    local idx=1
+    for u in "${urls_to_test[@]}"; do
+        local prefix=""
+        [ "$total" -gt 1 ] && prefix="[Док #$idx/$total] "
+        local detected_tr=$(detect_transport_from_url "$u" "$transport")
+        [ -z "$transport" ] && transport="$detected_tr"
+
+        case "$detected_tr" in
+            boards)
+                local hash=""
+                if [[ "$u" =~ hash=([a-zA-Z0-9_\-]+) ]]; then
+                    hash="${BASH_REMATCH[1]}"
+                fi
+                if [ -z "$hash" ]; then
+                    echo -e "   ${prefix}${RED}✗ Неверная ссылка: параметр ?hash= отсутствует${NC}"
+                else
+                    local b_code
+                    b_code=$(curl -s -m 6 -o /dev/null -w "%{http_code}" "https://boards.yandex.ru/whiteboard/?hash=${hash}" 2>/dev/null || echo "000")
+                    if [ "$b_code" = "200" ] || [ "$b_code" = "302" ]; then
+                        echo -e "   ${prefix}${GREEN}✓ [boards.yandex.ru] Доска активна, доступ открыт (hash=${hash:0:8}...)${NC}"
+                    else
+                        echo -e "   ${prefix}${RED}✗ [boards.yandex.ru] Ошибка HTTP ${b_code} (доска не найдена или закрыта)${NC}"
+                    fi
+                fi
+                ;;
+            mailru)
+                local m_code
+                m_code=$(curl -s -L -m 6 -o /dev/null -w "%{http_code}" "$u" 2>/dev/null || echo "000")
+                if [ "$m_code" = "200" ]; then
+                    echo -e "   ${prefix}${GREEN}✓ [cloud.mail.ru] Публичный документ Mail.ru доступен (HTTP 200)${NC}"
+                else
+                    echo -e "   ${prefix}${RED}✗ [cloud.mail.ru] Ошибка доступа к документу (HTTP ${m_code})${NC}"
+                fi
+                ;;
+            cupsonline)
+                echo -e "   ${prefix}${GREEN}✓ [cups.online] Комнаты интервью live-coding${NC}"
+                ;;
+            *)
+                # yandex / vyandex
+                local headers_tmp="/tmp/ycheck_$$.hdr"
+                local body_tmp="/tmp/ycheck_$$.body"
+                curl -s -m 8 -D "$headers_tmp" -o "$body_tmp" "$u" 2>/dev/null || true
+                local final_loc=$(grep -i "^Location:" "$headers_tmp" 2>/dev/null | tail -n 1 | tr -d '\r\n')
+                local http_status=$(head -n 1 "$headers_tmp" 2>/dev/null | awk '{print $2}')
+                rm -f "$headers_tmp" 2>/dev/null || true
+
+                if [[ "$final_loc" =~ passport\.yandex\.ru || "$final_loc" =~ /auth ]]; then
+                    echo -e "   ${prefix}${RED}✗ [ПРИВАТНЫЙ] Документ требует логина! Откройте 'Доступ по ссылке'${NC}"
+                elif [[ "$final_loc" =~ showcaptchafast ]]; then
+                    echo -e "   ${prefix}${YELLOW}⚠ [Капча Яндекса] Сработает авто-обход при запуске туннеля${NC}"
+                elif [ "$http_status" = "404" ] || [ "$http_status" = "410" ]; then
+                    echo -e "   ${prefix}${RED}✗ [HTTP 404] Документ не найден или удален${NC}"
+                elif [ "$http_status" = "200" ] || [ "$http_status" = "302" ]; then
+                    if grep -qi '"canEdit":false' "$body_tmp" 2>/dev/null || grep -qi 'readonly' "$body_tmp" 2>/dev/null; then
+                        echo -e "   ${prefix}${YELLOW}⚠ [ТОЛЬКО ЧТЕНИЕ] Включите в Яндекс Диске права 'С правом редактирования'!${NC}"
+                    else
+                        echo -e "   ${prefix}${GREEN}✓ [Яндекс Документ] Доступен для редактирования и туннелирования!${NC}"
+                    fi
+                else
+                    echo -e "   ${prefix}${RED}✗ Ошибка проверки ссылки (код ${http_status:-000})${NC}"
+                fi
+                rm -f "$body_tmp" 2>/dev/null || true
+                ;;
+        esac
+        idx=$((idx + 1))
+    done
+}
+
+test_all_openflux_channels() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ЭКСПРЕСС-ТЕСТИРОВАНИЕ ССЫЛОК OPENFLUX (КАНАЛЫ 1-8)           ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    for ch in 1 2 3 4 5 6 7 8; do
+        local ch_url=$(get_openflux_channel_prop "$ch" "URL" "")
+        local ch_tr=$(get_openflux_channel_prop "$ch" "TRANSPORT" "vyandex")
+        if [ -n "$ch_url" ]; then
+            local is_multi=""
+            if [[ "$ch_url" =~ , ]]; then
+                is_multi="${PURPLE}[Multi-Stream]${NC}"
+            else
+                is_multi="${CYAN}[Одиночный]${NC}"
+            fi
+            echo -e " ${BOLD}Канал $ch ${is_multi} [${ch_tr}]:${NC}"
+            test_openflux_link "$ch_url" "$ch_tr"
+        else
+            echo -e " ${GRAY}Канал $ch: [НЕ НАСТРОЕН] (ссылка не задана)${NC}"
+        fi
+    done
+    echo ""
 }
 
 menu_openflux() {
@@ -7069,7 +7324,12 @@ menu_openflux() {
             local ch_st="${YELLOW}[НЕ НАСТРОЕН]${NC}"
             local disp_url="${YELLOW}(ссылка не задана)${NC}"
             if [ -n "$ch_url" ]; then
-                disp_url="${CYAN}${ch_url}${NC}"
+                local doc_count=$(echo "$ch_url" | tr ',' '\n' | grep -c .)
+                if [ "$doc_count" -gt 1 ]; then
+                    disp_url="${PURPLE}(Multi-Stream: ${doc_count} док.)${NC} ${CYAN}${ch_url}${NC}"
+                else
+                    disp_url="${CYAN}${ch_url}${NC}"
+                fi
                 if systemctl is-active --quiet "openflux@$ch" 2>/dev/null; then
                     ch_st="${GREEN}[АКТИВЕН]${NC}"
                 else
@@ -7079,21 +7339,22 @@ menu_openflux() {
             printf "   Канал %d: %-22b [%-7s] %b\n" "$ch" "$ch_st" "$ch_tr" "$disp_url"
         done
         echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${YELLOW}[1]${NC} 🔗 Выбрать и настроить ссылку для канала (1-8) (Автоопределение Яндекс/Mail.ru)"
+        echo -e "  ${YELLOW}[1]${NC} 🔗 Выбрать и настроить ссылку для канала (1-8) (Одиночный / Multi-Stream)"
         echo -e "  ${YELLOW}[2]${NC} ⚡ Мастер настройки всех 8 каналов подряд"
-        echo -e "  ${YELLOW}[3]${NC} 🔄 Сменить транспорт по умолчанию (1: vyandex, 2: yandex, 3: mailru)"
+        echo -e "  ${YELLOW}[3]${NC} 🔄 Сменить транспорт по умолчанию (vyandex / boards / mailru / yandex)"
         echo -e "  ${YELLOW}[4]${NC} 📦 Сменить кодек сжатия (1: legacy [LZ4], 2: batched [zstd])"
         echo -e "  ${YELLOW}[5]${NC} 🔐 Управление сквозным ключом шифрования AES-256-GCM"
         echo -e "  ${YELLOW}[6]${NC} 🐞 Переключить режим отладки Debug (вкл/выкл в journalctl)"
         echo -e "  ${YELLOW}[7]${NC} 🌐 Маршрутизация трафика (Xray REDIRECT / Прямой выход)"
         echo -e "  ${YELLOW}[8]${NC} ▶️  Запустить / перезапустить ВСЕ настроенные каналы"
         echo -e "  ${YELLOW}[9]${NC} ⏹️  Остановить ВСЕ каналы OpenFlux"
+        echo -e "  ${PURPLE}[T]${NC} 🧪 ${BOLD}Экспресс-тест ссылок всех каналов 1-8 (Доски / Волга / Mail.ru)${NC}"
         echo -e "  ${YELLOW}[10]${NC} 📜 Просмотр последних 30 строк логов (выбор канала 1-8 или общий)"
         echo -e "  ${YELLOW}[11]${NC} 🔍 Мониторинг логов в реальном времени (live follow)"
-        echo -e "  ${YELLOW}[12]${NC} 🔨 Скомпилировать / переустановить OpenFlux из репозитория"
+        echo -e "  ${YELLOW}[12]${NC} 🔨 Скомпилировать / переустановить OpenFlux (Яндекс Доски + Multi-Stream)"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-12, или c1-c8]: " of_choice
+        read -p "Выберите действие [0-12, T, или c1-c8]: " of_choice
 
         case "$of_choice" in
             1|c1|c2|c3|c4|c5|c6|c7|c8|C1|C2|C3|C4|C5|C6|C7|C8)
@@ -7116,7 +7377,8 @@ menu_openflux() {
                 local cur_u=$(get_openflux_channel_prop "$target_ch" "URL" "")
                 echo "Текущая ссылка: ${cur_u:-[не задана]}"
                 echo ""
-                echo "• Введите ссылку на документ (Яндекс Диск / 360 или Облако Mail.ru) с правом редактирования."
+                echo "• Введите 1 ссылку на документ ИЛИ до 4 ссылок через запятую для Multi-Stream транкинга."
+                echo "• Поддерживаются: Яндекс Доски (boards.yandex.ru), Яндекс Диск/360, Облако Mail.ru."
                 echo "• Оставьте пустым и нажмите Enter, чтобы очистить ссылку (отключить канал)."
                 echo ""
                 read -rp "Новая ссылка: " new_u
@@ -7125,17 +7387,27 @@ menu_openflux() {
                     echo ""
                     echo -e "${CYAN}ℹ Выбор транспорта для Канала ${target_ch}:${NC}"
                     echo " 1) $auto_tr (определен автоматически по ссылке)"
-                    echo " 2) vyandex (Яндекс Волга)"
-                    echo " 3) mailru  (Mail.ru Документы)"
-                    echo " 4) yandex  (Яндекс OnlyOffice)"
-                    read -rp "Транспорт [1-4, Enter для '$auto_tr']: " sel_tr
+                    echo " 2) boards    (Яндекс Доски - boards.yandex.ru)"
+                    echo " 3) vyandex   (Яндекс Волга)"
+                    echo " 4) mailru    (Mail.ru Документы)"
+                    echo " 5) yandex    (Яндекс OnlyOffice)"
+                    echo " 6) oneme     (MAX Messenger / VK Calls)"
+                    echo " 7) cupsonline (Cups.online)"
+                    read -rp "Транспорт [1-7, Enter для '$auto_tr']: " sel_tr
                     local use_tr="$auto_tr"
                     case "$sel_tr" in
-                        2) use_tr="vyandex" ;;
-                        3) use_tr="mailru" ;;
-                        4) use_tr="yandex" ;;
+                        2) use_tr="boards" ;;
+                        3) use_tr="vyandex" ;;
+                        4) use_tr="mailru" ;;
+                        5) use_tr="yandex" ;;
+                        6) use_tr="oneme" ;;
+                        7) use_tr="cupsonline" ;;
                         *) use_tr="$auto_tr" ;;
                     esac
+                    echo ""
+                    echo -e "${CYAN}→ Экспресс-проверка доступности ссылки...${NC}"
+                    test_openflux_link "$new_u" "$use_tr"
+                    echo ""
                     set_openflux_channel_prop "$target_ch" "URL" "$new_u"
                     set_openflux_channel_prop "$target_ch" "ROLE" "exit"
                     set_openflux_channel_prop "$target_ch" "MODE" "l4"
@@ -7202,14 +7474,16 @@ menu_openflux() {
                 echo "Текущий транспорт по умолчанию: ${of_transport}"
                 echo ""
                 echo " 1) Яндекс Волга (vyandex - современный редактор Яндекс 360 / Диск, рекомендуется)"
-                echo " 2) Яндекс.Документы (yandex - классический OnlyOffice редактор)"
+                echo " 2) Яндекс Доски (boards - boards.yandex.ru, интерактивная доска, авто-обход капчи)"
                 echo " 3) Mail.ru Документы (mailru - docs.datacloudmail.ru, Облако Mail.ru)"
-                read -rp "Выберите транспорт [1-3]: " tr_choice
+                echo " 4) Яндекс.Документы (yandex - классический OnlyOffice редактор)"
+                read -rp "Выберите транспорт [1-4]: " tr_choice
                 local new_tr=""
                 case "$tr_choice" in
                     1) new_tr="vyandex" ;;
-                    2) new_tr="yandex" ;;
+                    2) new_tr="boards" ;;
                     3) new_tr="mailru" ;;
+                    4) new_tr="yandex" ;;
                     *) echo -e "${YELLOW}Без изменений.${NC}" ;;
                 esac
                 if [ -n "$new_tr" ]; then
@@ -7376,6 +7650,10 @@ menu_openflux() {
             12)
                 rebuild_openflux
                 ;;
+            [TtТт])
+                test_all_openflux_channels
+                read -rp "Нажмите Enter для возврата..." dummy
+                ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac
@@ -7448,22 +7726,21 @@ main_hub() {
             echo -e "${CYAN}║${NC}  ${BOLD}[2] ⚡ Snell (v5.0.1)${NC}         -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
-        if is_wdtt_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[3] 🛡️ WDTT / qwdtt${NC}          -> $(get_wdtt_status)"
-            echo -e "${CYAN}║${NC}      Порт:   :${BOLD}$(get_wdtt_peer_port)/UDP${NC}   |  Фаервол: $(get_wdtt_fw_status)"
-            echo -e "${CYAN}║${NC}      Профиль: ${BOLD}$(get_wdtt_profile_name)${NC}  |  Пароль: ${GREEN}$(get_wdtt_password)${NC}"
-            echo -e "${CYAN}║${NC}      Маршрут: $(get_wdtt_routing)"
+        if is_webdav_tunnel_installed; then
+            local w_prov=$(get_wdavtunnel_provider_label)
+            echo -e "${CYAN}║${NC}  ${BOLD}[3] 📦 WebDAV Tunnel (WireTurn)${NC}  -> $(get_wdavtunnel_status)"
+            echo -e "${CYAN}║${NC}      Провайдер: ${w_prov} | Маршрут: $(get_wdavtunnel_routing)"
         else
-            echo -e "${CYAN}║${NC}  ${BOLD}[3] 🛡️ WDTT / qwdtt${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+            echo -e "${CYAN}║${NC}  ${BOLD}[3] 📦 WebDAV Tunnel (WireTurn)${NC}  -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
-        if is_csqtt_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[4] 🔒 CSQTT (VPN & Web-панель)${NC}-> $(get_csqtt_status)"
-            echo -e "${CYAN}║${NC}      VPN порт:   :${BOLD}$(get_csqtt_peer_port)/UDP${NC}   |  Фаервол: $(get_csqtt_tunnel_status)"
-            echo -e "${CYAN}║${NC}      Веб-панель: :${BOLD}$(get_csqtt_web_port)/TCP${NC}   |  Защита: $(get_csqtt_protect_status)"
-            echo -e "${CYAN}║${NC}      Веб-вход:   Логин: ${GREEN}$(get_csqtt_user)${NC}  |  Пароль: ${GREEN}$(get_csqtt_pass)${NC}"
+        if is_openflux_installed; then
+            local of_cnt=$(get_openflux_counts)
+            local of_a=$(echo "$of_cnt" | cut -d':' -f1)
+            echo -e "${CYAN}║${NC}  ${BOLD}[4] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> $(get_openflux_status)"
+            echo -e "${CYAN}║${NC}      Режим: L4 (gVisor)  |  Каналы: 1-8 (Доски/Волга/Mail.ru) | Маршрут: $(get_openflux_routing)"
         else
-            echo -e "${CYAN}║${NC}  ${BOLD}[4] 🔒 CSQTT (VPN & Web-панель)${NC}-> ${RED}НЕ УСТАНОВЛЕН${NC}"
+            echo -e "${CYAN}║${NC}  ${BOLD}[4] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
         if is_dns_installed; then
@@ -7474,64 +7751,71 @@ main_hub() {
             echo -e "${CYAN}║${NC}  ${BOLD}[5] 🌐 DNS-Туннель (MasterDnsVPN)${NC}  -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
-        if is_openflux_installed; then
-            local of_cnt=$(get_openflux_counts)
-            local of_a=$(echo "$of_cnt" | cut -d':' -f1)
-            echo -e "${CYAN}║${NC}  ${BOLD}[6] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> $(get_openflux_status)"
-            echo -e "${CYAN}║${NC}      Режим: L4 (gVisor)  |  Каналы: 1-8 (Яндекс/Mail.ru) | Маршрут: $(get_openflux_routing)"
+        if is_wdtt_installed; then
+            echo -e "${CYAN}║${NC}  ${BOLD}[6] 🛡️ WDTT / qwdtt${NC}          -> $(get_wdtt_status)"
+            echo -e "${CYAN}║${NC}      Порт:   :${BOLD}$(get_wdtt_peer_port)/UDP${NC}   |  Фаервол: $(get_wdtt_fw_status)"
+            echo -e "${CYAN}║${NC}      Профиль: ${BOLD}$(get_wdtt_profile_name)${NC}  |  Пароль: ${GREEN}$(get_wdtt_password)${NC}"
+            echo -e "${CYAN}║${NC}      Маршрут: $(get_wdtt_routing)"
         else
-            echo -e "${CYAN}║${NC}  ${BOLD}[6] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+            echo -e "${CYAN}║${NC}  ${BOLD}[6] 🛡️ WDTT / qwdtt${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+        fi
+        echo -e "${CYAN}║${NC}"
+        if is_csqtt_installed; then
+            echo -e "${CYAN}║${NC}  ${BOLD}[7] 🔒 CSQTT (VPN & Web-панель)${NC}-> $(get_csqtt_status)"
+            echo -e "${CYAN}║${NC}      VPN порт:   :${BOLD}$(get_csqtt_peer_port)/UDP${NC}   |  Фаервол: $(get_csqtt_tunnel_status)"
+            echo -e "${CYAN}║${NC}      Веб-панель: :${BOLD}$(get_csqtt_web_port)/TCP${NC}   |  Защита: $(get_csqtt_protect_status)"
+            echo -e "${CYAN}║${NC}      Веб-вход:   Логин: ${GREEN}$(get_csqtt_user)${NC}  |  Пароль: ${GREEN}$(get_csqtt_pass)${NC}"
+        else
+            echo -e "${CYAN}║${NC}  ${BOLD}[7] 🔒 CSQTT (VPN & Web-панель)${NC}-> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
         if is_sub_server_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[13] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
-            echo -e "${CYAN}║${NC}       API: http://127.0.0.1:22217   |  Порт: :22217 [127.0.0.1] 🔒"
+            echo -e "${CYAN}║${NC}  ${BOLD}[8] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
+            echo -e "${CYAN}║${NC}      API: http://127.0.0.1:22217   |  Порт: :22217 [127.0.0.1] 🔒"
         else
-            echo -e "${CYAN}║${NC}  ${BOLD}[13] 📋 Подписки TUNA${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}║${NC}"
-        if is_webdav_tunnel_installed; then
-            local w_prov=$(get_wdavtunnel_provider_label)
-            echo -e "${CYAN}║${NC}  ${BOLD}[14] 📦 WebDAV Tunnel (WireTurn)${NC}  -> $(get_wdavtunnel_status)"
-            echo -e "${CYAN}║${NC}       Провайдер: ${w_prov} | Маршрут: $(get_wdavtunnel_routing)"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[14] 📦 WebDAV Tunnel (WireTurn)${NC}  -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+            echo -e "${CYAN}║${NC}  ${BOLD}[8] 📋 Подписки TUNA${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
+        echo -e "  ${BOLD}─── БЛОК 1: СЕТЕВЫЕ ПРОКСИ И ТУННЕЛИ (L4/L7) ───${NC}"
         echo -e "  ${GREEN}${BOLD}[1]${NC} 🚀 ${BOLD}Управление Mieru${NC} (Anti-TSPU, Egress, пользователи, порты, фаервол)"
         echo -e "  ${BLUE}${BOLD}[2]${NC} ⚡ ${BOLD}Управление Snell v5${NC} (0-RTT, Egress Xray/Direct, HTTP-obfs, фаервол)"
-        echo -e "  ${PURPLE}${BOLD}[3]${NC} 🛡️  ${BOLD}Управление WDTT / qwdtt${NC} (Egress в ядро / Прямой выход, клиенты, фаервол)"
-        echo -e "  ${CYAN}${BOLD}[4]${NC} 🔒 ${BOLD}Управление CSQTT${NC} (Защита веб-панели, туннель фаервол, логин/пароли)"
+        echo -e "  ${CYAN}${BOLD}[3]${NC} 📦 ${BOLD}Управление WebDAV Tunnel${NC} (Mail.ru / Selfhosted / Яндекс.Диск • WireTurn)"
+        echo -e "  ${YELLOW}${BOLD}[4]${NC} 📡 ${BOLD}Управление OpenFlux${NC} (Мультиплекс 1-8 • Multi-Stream • Доски/Волга/Mail.ru)"
         echo -e "  ${YELLOW}${BOLD}[5]${NC} 🌐 ${BOLD}Управление DNS-туннелями${NC} (MasterDnsVPN / CottenDNS, stormdns://, WAN)"
-        echo -e "  ${YELLOW}${BOLD}[6]${NC} 📡 ${BOLD}Управление OpenFlux${NC} (Мультиплекс 1-8 • Яндекс/Mail.ru • Режим L4)"
+        echo -e "  ${PURPLE}${BOLD}[6]${NC} 🛡️  ${BOLD}Управление WDTT / qwdtt${NC} (Egress в ядро / Прямой выход, клиенты, фаервол)"
+        echo -e "  ${CYAN}${BOLD}[7]${NC} 🔒 ${BOLD}Управление CSQTT${NC} (Защита веб-панели, туннель фаервол, логин/пароли)"
         echo ""
-        echo -e "  ${RED}${BOLD}[7]${NC} 🛡️  ${BOLD}Центр управления фаерволом портов${NC} (Включение/Выключение протоколов, Локдаун)"
-        echo -e "  ${BOLD}[8]${NC} 📊 Сводный статус всех служб и портов сервера"
-        echo -e "  ${BOLD}[9]${NC} 🔄 Перезапустить все сервисы (Mieru + Snell + WDTT + CSQTT + DNS + OpenFlux + WebDAV)"
-        echo -e "  ${BOLD}[10]${NC} 🔍 ${BOLD}Пересканировать и подхватить протоколы${NC} (Автоопределение установленных служб)"
+        echo -e "  ${BOLD}─── БЛОК 2: КЛИЕНТСКИЕ ПОДПИСКИ ───${NC}"
+        echo -e "  ${CYAN}${BOLD}[8]${NC} 📋 ${BOLD}Сервер подписок TUNA${NC} (Профили, выдача Base64-ссылок, ротация токенов)"
+        echo ""
+        echo -e "  ${BOLD}─── БЛОК 3: БЕЗОПАСНОСТЬ И ОПТИМИЗАЦИЯ СЕРВЕРА ───${NC}"
+        echo -e "  ${RED}${BOLD}[9]${NC} 🛡️  ${BOLD}Центр управления фаерволом портов${NC} (Включение/Выключение протоколов, Локдаун)"
+        echo -e "  ${PURPLE}${BOLD}[10]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
         echo -e "  ${GREEN}${BOLD}[11]${NC} ⚙️  ${BOLD}Оптимизация и безопасность${NC} (DNS с пингом, BBR/буферы под RAM, Swap 2/4G, Fail2ban)"
-        echo -e "  ${PURPLE}${BOLD}[12]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
-        echo -e "  ${CYAN}${BOLD}[13]${NC} 📋 ${BOLD}Сервер подписок TUNA${NC} (Профили, выдача Base64-ссылок, ротация токенов)"
-        echo -e "  ${CYAN}${BOLD}[14]${NC} 📦 ${BOLD}Управление WebDAV Tunnel${NC} (Mail.ru / Selfhosted / Яндекс.Диск • WireTurn)"
+        echo ""
+        echo -e "  ${BOLD}─── БЛОК 4: СЕРВИС, ДИАГНОСТИКА И ОБСЛУЖИВАНИЕ ───${NC}"
+        echo -e "  ${BOLD}[12]${NC} 📊 Сводный статус всех служб и портов сервера"
+        echo -e "  ${BOLD}[13]${NC} 🔍 ${BOLD}Пересканировать и подхватить протоколы${NC} (Автоопределение установленных служб)"
+        echo -e "  ${BOLD}[14]${NC} 🔄 Перезапустить все сервисы (Mieru + Snell + WebDAV + OpenFlux + DNS + WDTT + CSQTT)"
         echo -e "  ${BOLD}[0]${NC} 🚪 Выход"
         echo ""
         read -p "Выберите раздел [0-14]: " top_choice
         case "$top_choice" in
             1) menu_mieru ;;
             2) menu_snell ;;
-            3) menu_wdtt ;;
-            4) menu_csqtt ;;
+            3) menu_webdav_tunnel ;;
+            4) menu_openflux ;;
             5) menu_dns ;;
-            6) menu_openflux ;;
-            7) menu_firewall ;;
-            8) view_global_status ;;
-            9) restart_all_services ;;
-            10) rescan_and_adopt_protocols ;;
+            6) menu_wdtt ;;
+            7) menu_csqtt ;;
+            8) menu_subscriptions ;;
+            9) menu_firewall ;;
+            10) menu_ssl ;;
             11) menu_system_opt ;;
-            12) menu_ssl ;;
-            13) menu_subscriptions ;;
-            14) menu_webdav_tunnel ;;
+            12) view_global_status ;;
+            13) rescan_and_adopt_protocols ;;
+            14) restart_all_services ;;
             0) clear; exit 0 ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac

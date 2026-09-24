@@ -1,0 +1,2373 @@
+diff --git a/README.md b/README.md
+index 90eab77..9edaec2 100644
+--- a/README.md
++++ b/README.md
+@@ -150,6 +150,7 @@ the kernel rule above is only needed for kernel-generated RSTs.
+ ```
+ OpenFlux/
+   main.go                          # CLI entry (client / exit / benches)
++  multistream.go                   # --url list parsing, multi-stream status log
+   bench.go                         # Benchmark helpers
+   tun_darwin.go                    # macOS utun L3 client
+   tun_watch.go                     # Socket watcher for bypass routes
+@@ -161,6 +162,8 @@ OpenFlux/
+     framing.go                     # Wire framing for batched frames
+     compressor.go                  # Legacy per-packet LZ4 codec
+     encrypted.go                   # Optional AES-256-GCM wrapper
++    multistream.go                 # One tunnel over several documents
++    flowhash.go                    # Per-connection hash for multi-stream
+     yandex/                        # Yandex.Docs + Volga backends
+     oneme/                         # MAX Messenger backend
+     cupsonline/                    # Cups.online backend
+@@ -278,6 +281,51 @@ format. Client and exit node must both use the same codec (both new, or both
+ Both peers must use the same secret file. AES-256-GCM, directional keys.
+ Unset means unencrypted, unchanged behavior.
+ 
++### Multi-stream (several documents)
++
++Pass a comma-separated list to `--url` (`yandex`, `vyandex`) to run one tunnel
++over several documents at once. If one document dies, or the relay stops
++delivering on it, the tunnel keeps working over the others (issue #50).
++
++```
++# exit node
++./openflux --role=exit --mode=l3 \
++    --url="https://disk.yandex.ru/i/AAA,https://disk.yandex.ru/i/BBB" \
++    --multistream-status=10s
++
++# client: the same documents, in any order
++./openflux --role=client \
++    --url="https://disk.yandex.ru/i/BBB,https://disk.yandex.ru/i/AAA" \
++    --multistream-status=10s
++```
++
++How it works:
++
++- Every document is a complete stream of its own (transport, codec,
++  encryption), so each one carries the single-document wire format.
++- Each TCP connection is pinned to one document; different connections spread
++  over the documents. Spreading the packets of one connection over documents
++  would reorder them and collapse its throughput.
++- A document is preferred while the peer's keepalives arrive on it. A
++  disconnected document stops getting traffic immediately; so does one whose
++  participant list shows nobody but us (the peer left). One that is connected
++  but silent for another reason (e.g. the peer landed on another document
++  backend) is dropped after 25s.
++- A connection's packets are sent over the document its packets last arrived
++  on. When one side moves a connection to another document, the other side
++  follows at once instead of sending its ACKs into the lost document.
++- A single URL keeps the exact single-document behavior.
++
++`--multistream-status` logs one line per interval:
++
++```
++[MULTI] connected=2/2 peer=1/2 s0[AAA]=UP(peer=3s,rx=812,tx=790,rc=0) s1[BBB]=NOPEER(peer=41s,rx=15,tx=9,rc=2)
++```
++
++`UP`: connected and the peer was heard from recently; `NOPEER`: connected but
++the peer is silent; `DOWN`: not connected. On iOS, enter the comma-separated
++list in the URL field.
++
+ ### Benchmarks
+ 
+ Measure raw goodput through the transport, without touching the host network:
+@@ -320,7 +368,8 @@ Measure raw goodput through the transport, without touching the host network:
+ | `--transport` | `-t` | `yandex` | `yandex` \| `vyandex` \| `oneme` \| `cupsonline` \| `mailru` |
+ | `--mode` | `-m` | `l3` | Exit-node mode: `l3` \| `l4` |
+ | `--codec` | `-c` | `batched` | `batched` \| `legacy` |
+-| `--url` | `-u` | `http://#` | Document URL |
++| `--url` | `-u` | `http://#` | Document URL; comma-separated list for multi-stream |
++| `--multistream-status` | | `0` | Log per-document state on this interval (e.g. `10s`) |
+ | `--socks5` | `-s` | `:1080` | SOCKS5 listen address |
+ | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
+ | `--debug` | `-d` | `false` | Verbose per-packet logging |
+diff --git a/README.ru.md b/README.ru.md
+index f7711cf..5b88d94 100644
+--- a/README.ru.md
++++ b/README.ru.md
+@@ -154,6 +154,7 @@ sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
+ ```
+ OpenFlux/
+   main.go                          # Точка входа CLI (клиент / exit / бенчи)
++  multistream.go                   # Разбор списка --url, статус мульти-стрима
+   bench.go                         # Хелперы бенчмарка
+   tun_darwin.go                    # macOS utun L3-клиент
+   tun_watch.go                     # Watcher сокетов для bypass-маршрутов
+@@ -165,6 +166,8 @@ OpenFlux/
+     framing.go                     # Wire-формат батчированных кадров
+     compressor.go                  # Legacy per-packet LZ4-кодек
+     encrypted.go                   # Опциональная AES-256-GCM обёртка
++    multistream.go                 # Один туннель через несколько документов
++    flowhash.go                    # Хеш соединения для мульти-стрима
+     yandex/                        # Бэкенды Yandex.Docs + Volga
+     oneme/                         # Бэкенд MAX Messenger
+     cupsonline/                    # Бэкенд Cups.online
+@@ -282,6 +285,52 @@ LZ4-кодека передайте `--codec=legacy`:
+ Обе стороны должны использовать один и тот же файл-секрет. AES-256-GCM,
+ направленные ключи. Без флага - без шифрования, поведение не меняется.
+ 
++### Мульти-стрим (несколько документов)
++
++Передайте в `--url` список через запятую (`yandex`, `vyandex`), и один туннель
++пойдёт сразу через несколько документов. Если документ умер или relay перестал
++по нему доставлять, туннель продолжает работать через остальные (issue #50).
++
++```
++# выходная нода
++./openflux --role=exit --mode=l3 \
++    --url="https://disk.yandex.ru/i/AAA,https://disk.yandex.ru/i/BBB" \
++    --multistream-status=10s
++
++# клиент: те же документы, в любом порядке
++./openflux --role=client \
++    --url="https://disk.yandex.ru/i/BBB,https://disk.yandex.ru/i/AAA" \
++    --multistream-status=10s
++```
++
++Как это работает:
++
++- Каждый документ - полноценный отдельный стрим (транспорт, кодек,
++  шифрование), поэтому по каждому идёт тот же wire-формат, что и с одним
++  документом.
++- Каждое TCP-соединение закреплено за одним документом, разные соединения
++  распределяются по документам. Если размазать пакеты одного соединения по
++  документам, они перемешаются, и скорость соединения обвалится.
++- Документ считается рабочим, пока по нему приходят keepalive пира.
++  Отключённый документ перестаёт получать трафик сразу; так же и документ, в
++  списке участников которого остались только мы (пир вышел). Подключённый, но
++  молчащий по другой причине (например, пир попал на другой backend документа) -
++  через 25 с.
++- Пакеты соединения отправляются через тот документ, по которому последний раз
++  пришли его пакеты. Когда одна сторона переносит соединение на другой
++  документ, вторая переезжает следом сразу, а не шлёт ACK-и в потерянный
++  документ.
++- С одним URL поведение в точности как раньше.
++
++`--multistream-status` пишет одну строку за интервал:
++
++```
++[MULTI] connected=2/2 peer=1/2 s0[AAA]=UP(peer=3s,rx=812,tx=790,rc=0) s1[BBB]=NOPEER(peer=41s,rx=15,tx=9,rc=2)
++```
++
++`UP`: подключён, пир недавно был слышен; `NOPEER`: подключён, но пир молчит;
++`DOWN`: не подключён. В iOS-клиенте впишите список через запятую в поле URL.
++
+ ### Бенчмарки
+ 
+ Измерьте чистый goodput через транспорт, не задевая сеть хоста:
+@@ -324,7 +373,8 @@ LZ4-кодека передайте `--codec=legacy`:
+ | `--transport` | `-t` | `yandex` | `yandex` \| `vyandex` \| `oneme` \| `cupsonline` \| `mailru` |
+ | `--mode` | `-m` | `l3` | Режим выходной ноды: `l3` \| `l4` |
+ | `--codec` | `-c` | `batched` | `batched` \| `legacy` |
+-| `--url` | `-u` | `http://#` | URL документа |
++| `--url` | `-u` | `http://#` | URL документа; список через запятую для мульти-стрима |
++| `--multistream-status` | | `0` | Логировать состояние документов с этим интервалом (например, `10s`) |
+ | `--socks5` | `-s` | `:1080` | Адрес SOCKS5-прокси |
+ | `--local-ip` | `-l` | (авто) | Egress IP для l3 SNAT / фильтра RST |
+ | `--debug` | `-d` | `false` | Подробное per-packet логирование |
+diff --git a/export_ios.go b/export_ios.go
+index 91f193a..fbb1e1a 100644
+--- a/export_ios.go
++++ b/export_ios.go
+@@ -122,10 +122,22 @@ const (
+ 	startPanic          = 5
+ )
+ 
++// newBridgeDocStreams builds the iOS client transport for one or several
++// comma-separated documents: one legacy-codec stream per document, combined
++// into a MultiStreamTransport when there is more than one.
++func newBridgeDocStreams(transportType, docURL string, config transport.TransportConfig) transport.Transport {
++	return newDocStreams(splitURLs(docURL), func(u string) transport.Transport {
++		if transportType == "vyandex" {
++			return transport.NewCompressedTransport(yandex.NewYandexVolgaTransport(u, config))
++		}
++		return transport.NewCompressedTransport(yandex.NewYandexDocsTransport(u, config))
++	})
++}
++
+ // OpenFluxStartClient starts the SOCKS5 client tunnel.
+ //
+-// transportType: "yandex" or "oneme".
+-// url:           Yandex.Docs document URL (yandex transport).
++// transportType: "yandex", "vyandex", or "oneme".
++// url:           Yandex.Docs document URL(s). Comma-separated for multi-stream.
+ // socksAddr:     e.g. "127.0.0.1:1080".
+ // maxToken/maxUid: credentials for the "oneme" (MAX) transport; pass "" for yandex.
+ //
+@@ -166,8 +178,8 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
+ 	config := transport.DefaultConfig()
+ 	var t transport.Transport
+ 	switch tt {
+-	case "yandex", "":
+-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
++	case "yandex", "", "vyandex":
++		t = newBridgeDocStreams(tt, docURL, config)
+ 	case "oneme":
+ 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
+ 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+diff --git a/export_ios_packet.go b/export_ios_packet.go
+index ac9b110..4c84224 100644
+--- a/export_ios_packet.go
++++ b/export_ios_packet.go
+@@ -22,7 +22,6 @@ import (
+ 	"openflux/network"
+ 	"openflux/transport"
+ 	"openflux/transport/oneme"
+-	"openflux/transport/yandex"
+ 	"openflux/utils"
+ )
+ 
+@@ -75,8 +74,8 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
+ 	config := transport.DefaultConfig()
+ 	var t transport.Transport
+ 	switch tt {
+-	case "yandex", "":
+-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
++	case "yandex", "", "vyandex":
++		t = newBridgeDocStreams(tt, docURL, config)
+ 	case "oneme":
+ 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
+ 		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+diff --git a/main.go b/main.go
+index 173f13a..4b79ebc 100644
+--- a/main.go
++++ b/main.go
+@@ -95,7 +95,10 @@ func main() {
+ 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
+ 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
+ 
+-	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
++	flag.StringVar(&globalDocUrl, "url", "http://#",
++		"Document URL. A comma-separated list (yandex, vyandex) runs the tunnel over several documents at once")
++	statusEvery := flag.Duration("multistream-status", 0,
++		"With several --url documents: log per-document state on this interval (e.g. 10s)")
+ 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
+ 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
+ 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
+@@ -137,7 +140,10 @@ TRANSPORT
+   -t, --transport=cupsonline   Cups.online interview rooms.
+   -t, --transport=mailru       Mail.ru Docs over WebSocket.
+ 
+-  -u, --url=<URL>              Document URL.
++  -u, --url=<URL>[,<URL>...]   Document URL. Several (yandex, vyandex): multi-stream,
++                               each connection pinned to one document, failover
++                               to the others. Both peers list the same documents.
++      --multistream-status=<d> Log per-document state every <d> (e.g. 10s).
+       --maxToken=<token>       MAX auth token (--transport=oneme).
+       --maxUid=<uid>           MAX user id   (--transport=oneme).
+ 
+@@ -279,59 +285,37 @@ DEPRECATED (removed in v2)
+ 	}
+ 
+ 	config := transport.DefaultConfig()
+-	var inner transport.Transport
+ 
+-	switch *transportType {
+-        case "boards":
+-    		inner = yandex.NewBoardsTransport(globalDocUrl, config)
+-	case "vyandex":
+-		inner = yandex.NewYandexVolgaTransport(globalDocUrl, config)
+-	case "yandex":
+-		inner = yandex.NewYandexDocsTransport(globalDocUrl, config)
+-	case "oneme":
+-		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
+-		inner = oneme.NewOneMeTransport(*role == roleExit, maxToken, uidint, config)
+-	case "cupsonline":
+-		inner = cupsonline.NewCupsonlineTransport(globalDocUrl, config, *role != roleExit)
+-	case "mailru":
+-		inner = mailru.NewMailruDocsTransport(globalDocUrl, config)
+-	default:
+-		log.Fatalf("Unknown transport type: %s", *transportType)
++	// Optional AES-256-GCM secret. Both peers must use the same one.
++	var secret string
++	if *encryptionKeyFile != "" {
++		secretBytes, err := os.ReadFile(*encryptionKeyFile)
++		if err != nil {
++			log.Fatalf("Read encryption key file: %v", err)
++		}
++		secret = strings.TrimSpace(string(secretBytes))
+ 	}
+ 
+-	// App-layer codec, outermost. Default is the new batching+zstd layer;
+-	// --codec=legacy selects the old per-packet LZ4 path so the two can be
+-	// compared over the same channel. Client and exit node must use the same one.
+ 	switch *codec {
+ 	case codecBatched:
+ 		log.Printf("Codec: batched (zstd + coalescing)")
+-		inner = transport.NewBatchedTransport(inner)
+ 	case codecLegacy:
+ 		log.Printf("Codec: legacy (per-packet LZ4, no batching)")
+-		inner = transport.NewCompressedTransport(inner)
+ 	}
+ 
+-	// Optional AES-256-GCM encryption sits closest to the raw transport, so on
+-	// send we batch/compress first and encrypt the result (ciphertext would not
+-	// compress). Both peers must use the same secret.
+-	if *encryptionKeyFile != "" {
+-		secretBytes, err := os.ReadFile(*encryptionKeyFile)
+-		if err != nil {
+-			log.Fatalf("Read encryption key file: %v", err)
+-		}
+-		context := *transportType
+-		if globalDocUrl != "" {
+-			context = globalDocUrl
+-		}
+-		encrypted, err := transport.NewEncryptedTransport(inner, strings.TrimSpace(string(secretBytes)), context, *role == roleExit)
+-		if err != nil {
+-			log.Fatalf("Configure encrypted transport: %v", err)
+-		}
+-		inner = encrypted
+-		log.Printf("Transport encryption: AES-256-GCM enabled")
++	urls := splitURLs(globalDocUrl)
++	if len(urls) > 1 && !supportsMultiStream(*transportType) {
++		log.Fatalf("--url: several documents are supported with --transport=yandex or vyandex, not %s", *transportType)
+ 	}
+ 
+-	trans := inner
++	// Every document gets a complete stream of its own (transport, codec,
++	// encryption), so each carries exactly the single-document wire format.
++	trans := newDocStreams(urls, func(docURL string) transport.Transport {
++		return newStream(*transportType, docURL, *role, *codec, secret, config)
++	})
++	if secret != "" {
++		log.Printf("Transport encryption: AES-256-GCM enabled")
++	}
+ 
+ 	// Benchmark modes run the transport directly with no tunnel / raw socket,
+ 	// so they never touch the host network.
+@@ -350,6 +334,9 @@ DEPRECATED (removed in v2)
+ 	if err := trans.Start(); err != nil {
+ 		log.Fatalf("Failed to start transport: %v", err)
+ 	}
++	if ms, ok := trans.(*transport.MultiStreamTransport); ok && *statusEvery > 0 {
++		go multistreamStatusLoop(ms, urls, *statusEvery)
++	}
+ 
+ 	switch *role {
+ 	case roleExit:
+@@ -361,6 +348,54 @@ DEPRECATED (removed in v2)
+ 	}
+ }
+ 
++// newStream builds the transport stack for one document: the raw transport,
++// the app-layer codec on top of it, and optional encryption outermost.
++func newStream(transportType, docURL, role, codec, secret string, config transport.TransportConfig) transport.Transport {
++	var inner transport.Transport
++	switch transportType {
++	case "boards":
++		inner = yandex.NewBoardsTransport(docURL, config)
++	case "vyandex":
++		inner = yandex.NewYandexVolgaTransport(docURL, config)
++	case "yandex":
++		inner = yandex.NewYandexDocsTransport(docURL, config)
++	case "oneme":
++		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
++		inner = oneme.NewOneMeTransport(role == roleExit, maxToken, uidint, config)
++	case "cupsonline":
++		inner = cupsonline.NewCupsonlineTransport(docURL, config, role != roleExit)
++	case "mailru":
++		inner = mailru.NewMailruDocsTransport(docURL, config)
++	default:
++		log.Fatalf("Unknown transport type: %s", transportType)
++	}
++
++	// App-layer codec. Default is the batching+zstd layer; --codec=legacy
++	// selects the old per-packet LZ4 path so the two can be compared over the
++	// same channel. Client and exit node must use the same one.
++	switch codec {
++	case codecBatched:
++		inner = transport.NewBatchedTransport(inner)
++	case codecLegacy:
++		inner = transport.NewCompressedTransport(inner)
++	}
++
++	// Optional AES-256-GCM encryption. The document URL is the public KDF
++	// context, so each document of a multi-stream tunnel has its own keys.
++	if secret != "" {
++		context := transportType
++		if docURL != "" {
++			context = docURL
++		}
++		encrypted, err := transport.NewEncryptedTransport(inner, secret, context, role == roleExit)
++		if err != nil {
++			log.Fatalf("Configure encrypted transport: %v", err)
++		}
++		inner = encrypted
++	}
++	return inner
++}
++
+ func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
+ 	ex, err := tunnel.NewExitNode(trans, exitMode.String())
+ 	if err != nil {
+diff --git a/multistream.go b/multistream.go
+new file mode 100644
+index 0000000..70f3de1
+--- /dev/null
++++ b/multistream.go
+@@ -0,0 +1,101 @@
++package main
++
++import (
++	"fmt"
++	"log"
++	"sort"
++	"strings"
++	"time"
++
++	"openflux/transport"
++)
++
++// splitURLs splits a comma-separated --url value into document URLs, trimmed,
++// de-duplicated and sorted. Sorting gives both peers the same stream order
++// whatever order the URLs were typed in, so they route a connection over the
++// same document. Duplicates must go: two sessions of one peer in the same
++// document would receive each other's packets. An empty value yields [""] so
++// callers can always use urls[0].
++func splitURLs(raw string) []string {
++	seen := make(map[string]bool)
++	var out []string
++	for _, p := range strings.Split(raw, ",") {
++		p = strings.TrimSpace(p)
++		if p != "" && !seen[p] {
++			seen[p] = true
++			out = append(out, p)
++		}
++	}
++	if len(out) == 0 {
++		return []string{""}
++	}
++	sort.Strings(out)
++	return out
++}
++
++// supportsMultiStream reports whether a transport takes one document per
++// stream. cupsonline carries its rooms inside one URL, oneme has no URL, and
++// mailru has not been tested with several documents.
++func supportsMultiStream(transportType string) bool {
++	return transportType == "yandex" || transportType == "vyandex" || transportType == "boards" || transportType == "mailru"
++}
++
++// newDocStreams builds the transport for urls: the stream itself for a single
++// URL (exactly the single-document behavior), or a MultiStreamTransport over
++// one complete stream per document. mk builds the stream for one URL.
++func newDocStreams(urls []string, mk func(url string) transport.Transport) transport.Transport {
++	if len(urls) <= 1 {
++		return mk(urls[0])
++	}
++	log.Printf("Multi-stream: %d documents", len(urls))
++	streams := make([]transport.Transport, 0, len(urls))
++	for _, u := range urls {
++		streams = append(streams, mk(u))
++	}
++	return transport.NewMultiStreamTransport(streams)
++}
++
++// multistreamStatusLoop logs one line per interval with each document's state:
++// UP (connected, peer heard from recently), NOPEER (connected, peer silent)
++// or DOWN.
++func multistreamStatusLoop(ms *transport.MultiStreamTransport, urls []string, every time.Duration) {
++	tick := time.NewTicker(every)
++	defer tick.Stop()
++	for range tick.C {
++		streams := ms.Streams()
++		parts := make([]string, 0, len(streams))
++		up, alive := 0, 0
++		for i, s := range streams {
++			st := s.Stats()
++			state := "DOWN"
++			if st.Connected {
++				up++
++				state = "NOPEER"
++				if ms.PeerAlive(i) {
++					alive++
++					state = "UP"
++				}
++			}
++			peer := "never"
++			if !st.LastRecv.IsZero() {
++				peer = time.Since(st.LastRecv).Round(time.Second).String()
++			}
++			parts = append(parts, fmt.Sprintf("s%d[%s]=%s(peer=%s,rx=%d,tx=%d,rc=%d)",
++				i, docLabel(urls[i]), state, peer, st.PacketsRecv, st.PacketsSent, st.Reconnects))
++		}
++		log.Printf("[MULTI] connected=%d/%d peer=%d/%d %s",
++			up, len(streams), alive, len(streams), strings.Join(parts, " "))
++	}
++}
++
++// docLabel shortens a document URL to its last path segment for logs.
++func docLabel(u string) string {
++	u = strings.TrimRight(u, "/")
++	if i := strings.LastIndex(u, "/"); i >= 0 {
++		u = u[i+1:]
++	}
++	if len(u) > 8 {
++		u = u[:8]
++	}
++	return u
++}
+diff --git a/transport/batched.go b/transport/batched.go
+index 0e46f48..b76c490 100644
+--- a/transport/batched.go
++++ b/transport/batched.go
+@@ -36,6 +36,9 @@ type BatchedTransport struct {
+ 	maxBatchCount int
+ 
+ 	running atomic.Bool
++	stop    chan struct{}
++	stopMu  sync.Mutex
++	flushWG sync.WaitGroup
+ 
+ 	mu     sync.RWMutex
+ 	userCb func([]byte)
+@@ -54,6 +57,7 @@ func NewBatchedTransport(inner Transport) *BatchedTransport {
+ 	return &BatchedTransport{
+ 		Transport:     inner,
+ 		queue:         make(chan []byte, batchQueueDepth),
++		stop:          make(chan struct{}),
+ 		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
+ 		maxBatchBytes: envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes),
+ 		maxBatchCount: envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount),
+@@ -65,12 +69,27 @@ func (b *BatchedTransport) Start() error {
+ 		return err
+ 	}
+ 	b.running.Store(true)
+-	go b.flushLoop()
++	b.flushWG.Add(1)
++	go func() {
++		defer b.flushWG.Done()
++		b.flushLoop()
++	}()
+ 	return nil
+ }
+ 
++// Stop ends the flush loop and waits for it before stopping the inner
++// transport, so no goroutine outlives the transport. Packets still queued are
++// dropped; the tunnel is going away.
+ func (b *BatchedTransport) Stop() error {
+ 	b.running.Store(false)
++	b.stopMu.Lock()
++	select {
++	case <-b.stop:
++	default:
++		close(b.stop)
++	}
++	b.stopMu.Unlock()
++	b.flushWG.Wait()
+ 	return b.Transport.Stop()
+ }
+ 
+@@ -113,8 +132,10 @@ func (b *BatchedTransport) Receive(callback func([]byte)) {
+ 
+ func (b *BatchedTransport) flushLoop() {
+ 	for b.running.Load() {
+-		first, ok := <-b.queue
+-		if !ok {
++		var first []byte
++		select {
++		case first = <-b.queue:
++		case <-b.stop:
+ 			return
+ 		}
+ 		batch := [][]byte{first}
+@@ -155,6 +176,9 @@ func (b *BatchedTransport) flushLoop() {
+ 					size += 2 + len(p)
+ 				case <-timer.C:
+ 					break linger
++				case <-b.stop:
++					timer.Stop()
++					return
+ 				}
+ 			}
+ 			timer.Stop()
+diff --git a/transport/batched_test.go b/transport/batched_test.go
+index 66c47b9..2da8621 100644
+--- a/transport/batched_test.go
++++ b/transport/batched_test.go
+@@ -2,6 +2,8 @@ package transport
+ 
+ import (
+ 	"bytes"
++	"runtime"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -123,3 +125,34 @@ func TestBatchedTransportCoalescesBurstIntoOneMessage(t *testing.T) {
+ 		t.Fatalf("expected %d packets in the batch, got %d", n, len(pkts))
+ 	}
+ }
++
++// goroutinesRunning counts live goroutines whose stack mentions fn.
++func goroutinesRunning(fn string) int {
++	buf := make([]byte, 1<<20)
++	buf = buf[:runtime.Stack(buf, true)]
++	return strings.Count(string(buf), fn)
++}
++
++// Stop must end the flush loop instead of leaving it blocked on the queue.
++func TestBatchedTransportStopEndsFlushLoop(t *testing.T) {
++	const fn = "(*BatchedTransport).flushLoop"
++	before := goroutinesRunning(fn)
++	bt := NewBatchedTransport(&fakeTransport{})
++	if err := bt.Start(); err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	bt.Send([]byte("pkt"))
++	time.Sleep(20 * time.Millisecond)
++	if goroutinesRunning(fn) != before+1 {
++		t.Fatal("flush loop not running after Start")
++	}
++	if err := bt.Stop(); err != nil {
++		t.Fatalf("Stop: %v", err)
++	}
++	if n := goroutinesRunning(fn); n != before {
++		t.Fatalf("flush loop still running after Stop (%d goroutines)", n-before)
++	}
++	if err := bt.Stop(); err != nil {
++		t.Fatalf("second Stop: %v", err)
++	}
++}
+diff --git a/transport/flowhash.go b/transport/flowhash.go
+new file mode 100644
+index 0000000..610ab2d
+--- /dev/null
++++ b/transport/flowhash.go
+@@ -0,0 +1,96 @@
++package transport
++
++import (
++	"bytes"
++	"encoding/binary"
++)
++
++// FlowHash identifies the flow an IP packet belongs to, so MultiStreamTransport
++// can keep every packet of one connection on the same inner stream. It returns
++// false when data is not an IPv4/IPv6 packet.
++//
++// The hash is symmetric: both directions of a connection hash the same, so the
++// client and the exit node pick the same document for it (when they list the
++// same documents). A connection then depends on one document instead of two.
++//
++// Ports are used for TCP and UDP only, and never for IPv4 fragments: a
++// non-first fragment carries no port numbers, and all fragments of a datagram
++// have to hash the same.
++func FlowHash(pkt []byte) (uint64, bool) {
++	if len(pkt) == 0 {
++		return 0, false
++	}
++
++	var (
++		proto    byte
++		src, dst []byte
++		l4       []byte
++	)
++	switch pkt[0] >> 4 {
++	case 4:
++		if len(pkt) < 20 {
++			return 0, false
++		}
++		ihl := int(pkt[0]&0x0f) * 4
++		if ihl < 20 || len(pkt) < ihl {
++			return 0, false
++		}
++		proto = pkt[9]
++		src, dst = pkt[12:16], pkt[16:20]
++		// MF flag or a non-zero fragment offset.
++		if binary.BigEndian.Uint16(pkt[6:8])&0x3fff == 0 {
++			l4 = pkt[ihl:]
++		}
++	case 6:
++		if len(pkt) < 40 {
++			return 0, false
++		}
++		proto = pkt[6]
++		src, dst = pkt[8:24], pkt[24:40]
++		l4 = pkt[40:]
++	default:
++		return 0, false
++	}
++
++	var sport, dport uint16
++	if (proto == 6 || proto == 17) && len(l4) >= 4 {
++		sport = binary.BigEndian.Uint16(l4[0:2])
++		dport = binary.BigEndian.Uint16(l4[2:4])
++	}
++
++	// Canonical endpoint order makes the hash direction-independent.
++	if c := bytes.Compare(src, dst); c > 0 || (c == 0 && sport > dport) {
++		src, dst = dst, src
++		sport, dport = dport, sport
++	}
++
++	const (
++		fnvOffset = 14695981039346656037
++		fnvPrime  = 1099511628211
++	)
++	h := uint64(fnvOffset)
++	mixByte := func(b byte) {
++		h ^= uint64(b)
++		h *= fnvPrime
++	}
++	mixByte(proto)
++	for _, b := range src {
++		mixByte(b)
++	}
++	mixByte(byte(sport >> 8))
++	mixByte(byte(sport))
++	for _, b := range dst {
++		mixByte(b)
++	}
++	mixByte(byte(dport >> 8))
++	mixByte(byte(dport))
++
++	// splitmix64 finalizer: FNV's low bits are weak, and the caller takes the
++	// hash modulo a small stream count.
++	h ^= h >> 30
++	h *= 0xbf58476d1ce4e5b9
++	h ^= h >> 27
++	h *= 0x94d049bb133111eb
++	h ^= h >> 31
++	return h, true
++}
+diff --git a/transport/flowhash_test.go b/transport/flowhash_test.go
+new file mode 100644
+index 0000000..685bec9
+--- /dev/null
++++ b/transport/flowhash_test.go
+@@ -0,0 +1,60 @@
++package transport
++
++import (
++	"encoding/binary"
++	"testing"
++)
++
++func TestFlowHashSymmetric(t *testing.T) {
++	out := tcpPacket(clientIP, serverIP, 40001, 443, 0)
++	back := tcpPacket(serverIP, clientIP, 443, 40001, 0)
++	h1, ok1 := FlowHash(out)
++	h2, ok2 := FlowHash(back)
++	if !ok1 || !ok2 || h1 != h2 {
++		t.Fatalf("directions hash differently: %x/%v vs %x/%v", h1, ok1, h2, ok2)
++	}
++	other, _ := FlowHash(tcpPacket(clientIP, serverIP, 40002, 443, 0))
++	if other == h1 {
++		t.Fatal("different ports hash the same")
++	}
++}
++
++// All fragments of one datagram must hash the same, although only the first
++// one carries the ports.
++func TestFlowHashIPv4FragmentsIgnorePorts(t *testing.T) {
++	first := tcpPacket(clientIP, serverIP, 40001, 443, 0)
++	binary.BigEndian.PutUint16(first[6:8], 0x2000)            // MF
++	later := tcpPacket(clientIP, serverIP, 0xdead, 0xbeef, 0) // garbage where ports would be
++	binary.BigEndian.PutUint16(later[6:8], 185)               // offset, no MF
++	h1, _ := FlowHash(first)
++	h2, _ := FlowHash(later)
++	if h1 != h2 {
++		t.Fatal("fragments of one datagram hash differently")
++	}
++}
++
++func TestFlowHashIPv6(t *testing.T) {
++	pkt := func(src, dst byte, sport, dport uint16) []byte {
++		p := make([]byte, 60)
++		p[0] = 0x60
++		p[6] = 6
++		p[8+15] = src
++		p[24+15] = dst
++		binary.BigEndian.PutUint16(p[40:42], sport)
++		binary.BigEndian.PutUint16(p[42:44], dport)
++		return p
++	}
++	h1, ok1 := FlowHash(pkt(1, 2, 5000, 443))
++	h2, ok2 := FlowHash(pkt(2, 1, 443, 5000))
++	if !ok1 || !ok2 || h1 != h2 {
++		t.Fatal("IPv6 flow directions hash differently")
++	}
++}
++
++func TestFlowHashRejectsNonIP(t *testing.T) {
++	for _, p := range [][]byte{nil, {0x00}, {0x45, 0, 0}, make([]byte, 30)} {
++		if _, ok := FlowHash(p); ok {
++			t.Errorf("FlowHash accepted %x", p)
++		}
++	}
++}
+diff --git a/transport/multistream.go b/transport/multistream.go
+new file mode 100644
+index 0000000..7c5502d
+--- /dev/null
++++ b/transport/multistream.go
+@@ -0,0 +1,272 @@
++package transport
++
++import (
++	"errors"
++	"fmt"
++	"log"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// DefaultPeerTimeout is how long a stream may go without hearing from the peer
++// before MultiStreamTransport stops routing new traffic to it. Yandex peers
++// exchange a keepalive every 10s, so this tolerates one lost keepalive.
++const DefaultPeerTimeout = 25 * time.Second
++
++// followSlots is the size of the table that remembers, per flow, the stream a
++// packet of the flow last arrived on. A power of two; two flows sharing a slot
++// only cost one of them its hint.
++const followSlots = 1 << 12
++
++// MultiStreamTransport fans a single logical tunnel out over N inner
++// transports (issue #50), one per document. Each inner transport is a complete
++// stack of its own (codec, optional encryption, relay), so every document
++// carries exactly the wire format a single-document tunnel would.
++//
++// Routing is per flow, not per packet. Packets of one TCP connection all go
++// over the same document: spreading them round-robin over documents with
++// different relay latency makes the inner TCP see constant reordering and
++// collapse its window (measured: a single download dropped ~8x with two
++// documents). Different connections spread over the documents by hash.
++//
++// A stream is used only while it is healthy, in this order of preference:
++//
++//  1. connected, and the peer was heard from within the peer timeout;
++//  2. connected (startup before the first keepalive, or every peer silent).
++//
++// "Connected" alone is not enough: a Yandex session can be up while the peer
++// is on another document backend, or has dropped out of the document, and
++// then everything sent on it is lost. The peer's keepalives are the signal
++// that the document actually reaches the other side.
++//
++// A flow follows the peer: it is sent over the stream its packets last
++// arrived on (while that stream is usable), and only a flow with no recent
++// inbound packet is placed by hash. When one side loses a document it moves
++// its flows to another one at once, but the other side may not notice the loss
++// until the keepalive timeout; without following, it would keep sending the
++// flow's ACKs into the lost document and stall the connection. A move costs
++// the inner TCP one reordering event, not a stall.
++type MultiStreamTransport struct {
++	streams     []Transport
++	peerTimeout time.Duration
++	now         func() time.Time
++
++	// follow[h & (followSlots-1)] = tag(32) | stream+1 (8) | unix seconds (24)
++	// of the last packet of flow h received. Lock-free: one atomic word per
++	// slot.
++	follow [followSlots]atomic.Uint64
++
++	// Round-robin cursor for packets that are not IP (no flow to pin).
++	rr      atomic.Uint64
++	running atomic.Bool
++
++	mu     sync.RWMutex
++	userCb func([]byte)
++
++	startTime atomic.Int64 // unix nanos
++}
++
++// NewMultiStreamTransport wraps inners into a single logical transport. A
++// length-1 slice is legal but pointless (main.go uses the inner transport
++// directly for a single URL).
++func NewMultiStreamTransport(inners []Transport) *MultiStreamTransport {
++	streams := make([]Transport, len(inners))
++	copy(streams, inners)
++	m := &MultiStreamTransport{
++		streams:     streams,
++		peerTimeout: DefaultPeerTimeout,
++		now:         time.Now,
++	}
++	m.startTime.Store(time.Now().UnixNano())
++	return m
++}
++
++// Start brings every inner transport up. A stream that fails to start is left
++// out (it stays disconnected and gets no traffic); Start fails only when no
++// stream starts at all, since one dead document must not take the tunnel down.
++func (m *MultiStreamTransport) Start() error {
++	if len(m.streams) == 0 {
++		return fmt.Errorf("multistream: no inner streams")
++	}
++	m.startTime.Store(time.Now().UnixNano())
++	m.running.Store(true)
++
++	var errs []error
++	for i, s := range m.streams {
++		if err := s.Start(); err != nil {
++			log.Printf("multistream: stream %d failed to start: %v", i, err)
++			errs = append(errs, fmt.Errorf("stream %d: %w", i, err))
++		}
++	}
++	if len(errs) == len(m.streams) {
++		_ = m.Stop()
++		return fmt.Errorf("multistream: no stream started: %w", errors.Join(errs...))
++	}
++	return nil
++}
++
++// Stop stops every inner transport concurrently and waits for all of them, so
++// the total shutdown time is that of the slowest stream, not the sum.
++func (m *MultiStreamTransport) Stop() error {
++	m.running.Store(false)
++	errs := make([]error, len(m.streams))
++	var wg sync.WaitGroup
++	for i, s := range m.streams {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			errs[i] = s.Stop()
++		}()
++	}
++	wg.Wait()
++	return errors.Join(errs...)
++}
++
++// Send routes one packet to its flow's stream, falling over to the next usable
++// stream when that one is down or refuses the packet. It fails only when no
++// stream takes the packet; the inner TCP then retransmits.
++func (m *MultiStreamTransport) Send(data []byte) error {
++	if !m.running.Load() {
++		return fmt.Errorf("multistream: not running")
++	}
++	n := uint64(len(m.streams))
++	if n == 0 {
++		return fmt.Errorf("multistream: no inner streams")
++	}
++
++	now := m.now()
++	var start uint64
++	hint := -1
++	if h, ok := FlowHash(data); ok {
++		start = h % n
++		hint = m.followHint(h, now)
++	} else {
++		start = (m.rr.Add(1) - 1) % n
++	}
++
++	// Pass 0 takes streams that reach the peer, pass 1 the ones that are only
++	// connected. Within a pass the stream the flow last arrived on goes first
++	// (i == -1), then the hash order.
++	for pass := 0; pass < 2; pass++ {
++		for i := -1; i < int(n); i++ {
++			var idx int
++			if i < 0 {
++				if hint < 0 {
++					continue
++				}
++				idx = hint
++			} else {
++				idx = int((start + uint64(i)) % n)
++				if idx == hint {
++					continue
++				}
++			}
++			s := m.streams[idx]
++			st := s.Stats()
++			if !st.Connected || m.peerAlive(st, now) != (pass == 0) {
++				continue
++			}
++			if s.Send(data) == nil {
++				return nil
++			}
++		}
++	}
++	return fmt.Errorf("multistream: no usable stream (of %d)", n)
++}
++
++// noteArrival records that a packet of pkt's flow arrived on stream idx.
++func (m *MultiStreamTransport) noteArrival(idx int, pkt []byte) {
++	h, ok := FlowHash(pkt)
++	if !ok {
++		return
++	}
++	v := h>>32<<32 | uint64(idx+1)<<24 | uint64(m.now().Unix())&0xffffff
++	m.follow[h&(followSlots-1)].Store(v)
++}
++
++// followHint returns the stream flow h last arrived on within the peer
++// timeout, or -1.
++func (m *MultiStreamTransport) followHint(h uint64, now time.Time) int {
++	v := m.follow[h&(followSlots-1)].Load()
++	if v == 0 || v>>32 != h>>32 {
++		return -1
++	}
++	age := (uint64(now.Unix()) - v) & 0xffffff
++	if time.Duration(age)*time.Second > m.peerTimeout {
++		return -1
++	}
++	idx := int(v>>24&0xff) - 1
++	if idx < 0 || idx >= len(m.streams) {
++		return -1
++	}
++	return idx
++}
++
++func (m *MultiStreamTransport) peerAlive(st TransportStats, now time.Time) bool {
++	return !st.LastRecv.IsZero() && now.Sub(st.LastRecv) <= m.peerTimeout
++}
++
++// PeerAlive reports whether stream i is connected and has heard from the peer
++// within the peer timeout, i.e. whether it gets first-choice traffic.
++func (m *MultiStreamTransport) PeerAlive(i int) bool {
++	st := m.streams[i].Stats()
++	return st.Connected && m.peerAlive(st, m.now())
++}
++
++// Receive registers cb for the union of all inner streams.
++func (m *MultiStreamTransport) Receive(cb func([]byte)) {
++	m.mu.Lock()
++	m.userCb = cb
++	m.mu.Unlock()
++	for i, s := range m.streams {
++		s.Receive(func(data []byte) {
++			m.noteArrival(i, data)
++			m.mu.RLock()
++			u := m.userCb
++			m.mu.RUnlock()
++			if u != nil {
++				u(data)
++			}
++		})
++	}
++}
++
++// IsConnected reports true when at least one inner stream is up.
++func (m *MultiStreamTransport) IsConnected() bool {
++	for _, s := range m.streams {
++		if s.IsConnected() {
++			return true
++		}
++	}
++	return false
++}
++
++// Stats aggregates counters across inner streams. Connected is the OR and
++// LastRecv the latest over the streams; Uptime runs from the MultiStream's own
++// Start.
++func (m *MultiStreamTransport) Stats() TransportStats {
++	var agg TransportStats
++	for _, s := range m.streams {
++		st := s.Stats()
++		agg.BytesSent += st.BytesSent
++		agg.BytesReceived += st.BytesReceived
++		agg.PacketsSent += st.PacketsSent
++		agg.PacketsRecv += st.PacketsRecv
++		agg.Reconnects += st.Reconnects
++		agg.Connected = agg.Connected || st.Connected
++		if st.LastRecv.After(agg.LastRecv) {
++			agg.LastRecv = st.LastRecv
++		}
++	}
++	agg.Uptime = time.Since(time.Unix(0, m.startTime.Load()))
++	return agg
++}
++
++// Streams exposes the inner transports for a status printer or a test. The
++// slice is a copy; the elements are the live inner transports.
++func (m *MultiStreamTransport) Streams() []Transport {
++	out := make([]Transport, len(m.streams))
++	copy(out, m.streams)
++	return out
++}
+diff --git a/transport/multistream_test.go b/transport/multistream_test.go
+new file mode 100644
+index 0000000..a872a0e
+--- /dev/null
++++ b/transport/multistream_test.go
+@@ -0,0 +1,412 @@
++package transport
++
++import (
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// mockStream is a Transport we can flip up/down and inspect. Deliberately
++// separate from batched_test.go's fakeTransport because the multi-stream tests
++// need per-stream state (connectivity, peer liveness, send failures).
++type mockStream struct {
++	mu        sync.Mutex
++	connected atomic.Bool
++	lastRecv  atomic.Int64 // unix nanos; 0 = peer never heard from
++	failSend  atomic.Bool
++	stopped   atomic.Bool
++	startErr  error
++	sent      [][]byte
++	cb        func([]byte)
++}
++
++// newAlive returns a connected stream whose peer was just heard from.
++func newAlive() *mockStream {
++	m := &mockStream{}
++	m.connected.Store(true)
++	m.lastRecv.Store(time.Now().UnixNano())
++	return m
++}
++
++func (m *mockStream) Start() error {
++	if m.startErr != nil {
++		return m.startErr
++	}
++	return nil
++}
++func (m *mockStream) Stop() error { m.stopped.Store(true); m.connected.Store(false); return nil }
++func (m *mockStream) Send(data []byte) error {
++	if m.failSend.Load() {
++		return fmt.Errorf("mock: send failure")
++	}
++	cp := append([]byte(nil), data...)
++	m.mu.Lock()
++	m.sent = append(m.sent, cp)
++	m.mu.Unlock()
++	return nil
++}
++func (m *mockStream) Receive(cb func([]byte)) {
++	m.mu.Lock()
++	m.cb = cb
++	m.mu.Unlock()
++}
++func (m *mockStream) IsConnected() bool { return m.connected.Load() }
++func (m *mockStream) Stats() TransportStats {
++	st := TransportStats{Connected: m.IsConnected(), PacketsSent: uint64(m.sentCount())}
++	if ns := m.lastRecv.Load(); ns != 0 {
++		st.LastRecv = time.Unix(0, ns)
++	}
++	return st
++}
++func (m *mockStream) inject(data []byte) {
++	m.mu.Lock()
++	cb := m.cb
++	m.mu.Unlock()
++	if cb != nil {
++		cb(data)
++	}
++}
++func (m *mockStream) sentCount() int {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return len(m.sent)
++}
++
++// tcpPacket builds a minimal IPv4/TCP packet for flow a:ap -> b:bp.
++func tcpPacket(a, b [4]byte, ap, bp uint16, payload byte) []byte {
++	pkt := make([]byte, 41)
++	pkt[0] = 0x45
++	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
++	pkt[8] = 64
++	pkt[9] = 6
++	copy(pkt[12:16], a[:])
++	copy(pkt[16:20], b[:])
++	binary.BigEndian.PutUint16(pkt[20:22], ap)
++	binary.BigEndian.PutUint16(pkt[22:24], bp)
++	pkt[40] = payload
++	return pkt
++}
++
++var (
++	clientIP = [4]byte{10, 10, 10, 2}
++	serverIP = [4]byte{93, 184, 216, 34}
++)
++
++func startMS(t *testing.T, streams ...*mockStream) *MultiStreamTransport {
++	t.Helper()
++	inners := make([]Transport, len(streams))
++	for i, s := range streams {
++		inners[i] = s
++	}
++	ms := NewMultiStreamTransport(inners)
++	if err := ms.Start(); err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	t.Cleanup(func() { ms.Stop() })
++	return ms
++}
++
++// whichStream returns the index of the only stream that got packets since the
++// given per-stream counts, failing if the packets were split.
++func whichStream(t *testing.T, streams []*mockStream, before []int) int {
++	t.Helper()
++	got := -1
++	for i, s := range streams {
++		if s.sentCount() != before[i] {
++			if got != -1 {
++				t.Fatalf("flow split across streams %d and %d", got, i)
++			}
++			got = i
++		}
++	}
++	if got == -1 {
++		t.Fatal("no stream got the packets")
++	}
++	return got
++}
++
++func counts(streams []*mockStream) []int {
++	out := make([]int, len(streams))
++	for i, s := range streams {
++		out[i] = s.sentCount()
++	}
++	return out
++}
++
++// Every packet of one connection, in both directions, must use one stream:
++// spreading a connection over documents reorders its packets.
++func TestMultiStreamPinsFlowToOneStream(t *testing.T) {
++	streams := []*mockStream{newAlive(), newAlive(), newAlive()}
++	ms := startMS(t, streams...)
++
++	for port := uint16(40000); port < 40050; port++ {
++		before := counts(streams)
++		for i := 0; i < 20; i++ {
++			if err := ms.Send(tcpPacket(clientIP, serverIP, port, 443, byte(i))); err != nil {
++				t.Fatalf("Send: %v", err)
++			}
++			if err := ms.Send(tcpPacket(serverIP, clientIP, 443, port, byte(i))); err != nil {
++				t.Fatalf("Send reverse: %v", err)
++			}
++		}
++		whichStream(t, streams, before)
++	}
++}
++
++// Many connections spread over all streams.
++func TestMultiStreamSpreadsFlows(t *testing.T) {
++	streams := []*mockStream{newAlive(), newAlive(), newAlive()}
++	ms := startMS(t, streams...)
++
++	const flows = 3000
++	for port := 0; port < flows; port++ {
++		if err := ms.Send(tcpPacket(clientIP, serverIP, uint16(20000+port), 443, 0)); err != nil {
++			t.Fatalf("Send: %v", err)
++		}
++	}
++	for i, s := range streams {
++		if n := s.sentCount(); n < flows/5 || n > flows/2 {
++			t.Errorf("stream %d got %d of %d flows; want roughly a third", i, n, flows)
++		}
++	}
++}
++
++// A flow whose stream goes down moves to another stream, and comes back when
++// the stream recovers.
++func TestMultiStreamFlowFailsOverAndReturns(t *testing.T) {
++	streams := []*mockStream{newAlive(), newAlive()}
++	ms := startMS(t, streams...)
++	pkt := tcpPacket(clientIP, serverIP, 51000, 443, 1)
++
++	before := counts(streams)
++	ms.Send(pkt)
++	home := whichStream(t, streams, before)
++	other := 1 - home
++
++	streams[home].connected.Store(false)
++	before = counts(streams)
++	for i := 0; i < 10; i++ {
++		if err := ms.Send(pkt); err != nil {
++			t.Fatalf("Send with home stream down: %v", err)
++		}
++	}
++	if got := whichStream(t, streams, before); got != other {
++		t.Fatalf("flow went to stream %d while its home %d was down", got, home)
++	}
++
++	streams[home].connected.Store(true)
++	before = counts(streams)
++	ms.Send(pkt)
++	if got := whichStream(t, streams, before); got != home {
++		t.Fatalf("flow did not return home after recovery: went to %d", got)
++	}
++}
++
++// A connected stream whose peer has gone silent (the peer dropped out of the
++// document, or sits on another backend) must not get traffic while a stream
++// with a live peer exists.
++func TestMultiStreamAvoidsStreamWithSilentPeer(t *testing.T) {
++	streams := []*mockStream{newAlive(), newAlive()}
++	ms := startMS(t, streams...)
++	now := time.Now()
++	ms.now = func() time.Time { return now }
++
++	streams[0].lastRecv.Store(now.Add(-2 * DefaultPeerTimeout).UnixNano())
++	for port := uint16(1000); port < 1100; port++ {
++		ms.Send(tcpPacket(clientIP, serverIP, port, 443, 0))
++	}
++	if n := streams[0].sentCount(); n != 0 {
++		t.Fatalf("stream with a silent peer got %d packets", n)
++	}
++	if !ms.PeerAlive(1) || ms.PeerAlive(0) {
++		t.Fatalf("PeerAlive = %v,%v; want false,true", ms.PeerAlive(0), ms.PeerAlive(1))
++	}
++}
++
++// Before any peer is heard from (startup), connected streams are used anyway,
++// still pinned per flow.
++func TestMultiStreamUsesConnectedStreamsBeforePeerIsHeard(t *testing.T) {
++	a, b := &mockStream{}, &mockStream{}
++	a.connected.Store(true)
++	b.connected.Store(true)
++	streams := []*mockStream{a, b}
++	ms := startMS(t, a, b)
++
++	for port := uint16(2000); port < 2200; port++ {
++		before := counts(streams)
++		if err := ms.Send(tcpPacket(clientIP, serverIP, port, 443, 0)); err != nil {
++			t.Fatalf("Send: %v", err)
++		}
++		ms.Send(tcpPacket(clientIP, serverIP, port, 443, 1))
++		whichStream(t, streams, before)
++	}
++	if a.sentCount() == 0 || b.sentCount() == 0 {
++		t.Fatalf("flows not spread before peer liveness is known: a=%d b=%d", a.sentCount(), b.sentCount())
++	}
++}
++
++// A failed Send on the flow's stream goes to the next stream: the packet is
++// not lost.
++func TestMultiStreamFailoverOnSendError(t *testing.T) {
++	streams := []*mockStream{newAlive(), newAlive()}
++	ms := startMS(t, streams...)
++	pkt := tcpPacket(clientIP, serverIP, 52000, 443, 1)
++
++	before := counts(streams)
++	ms.Send(pkt)
++	home := whichStream(t, streams, before)
++
++	streams[home].failSend.Store(true)
++	before = counts(streams)
++	if err := ms.Send(pkt); err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	if got := whichStream(t, streams, before); got == home {
++		t.Fatal("packet stayed on the failing stream")
++	}
++}
++
++func TestMultiStreamAllDown(t *testing.T) {
++	a, b := &mockStream{}, &mockStream{}
++	ms := startMS(t, a, b)
++	if err := ms.Send(tcpPacket(clientIP, serverIP, 1, 2, 0)); err == nil {
++		t.Fatal("Send succeeded with every stream down")
++	}
++}
++
++// Non-IP payloads have no flow; they rotate over the streams.
++func TestMultiStreamNonIPRoundRobin(t *testing.T) {
++	a, b, c := newAlive(), newAlive(), newAlive()
++	ms := startMS(t, a, b, c)
++	for i := 0; i < 30; i++ {
++		if err := ms.Send([]byte{0x00, byte(i)}); err != nil {
++			t.Fatalf("Send %d: %v", i, err)
++		}
++	}
++	if a.sentCount() != 10 || b.sentCount() != 10 || c.sentCount() != 10 {
++		t.Fatalf("uneven rotation: a=%d b=%d c=%d", a.sentCount(), b.sentCount(), c.sentCount())
++	}
++}
++
++func TestMultiStreamReceiveFanIn(t *testing.T) {
++	a, b := newAlive(), newAlive()
++	ms := startMS(t, a, b)
++
++	var mu sync.Mutex
++	var got [][]byte
++	ms.Receive(func(data []byte) {
++		mu.Lock()
++		got = append(got, append([]byte(nil), data...))
++		mu.Unlock()
++	})
++	a.inject([]byte("from-a"))
++	b.inject([]byte("from-b"))
++
++	mu.Lock()
++	defer mu.Unlock()
++	if len(got) != 2 || !bytes.Equal(got[0], []byte("from-a")) || !bytes.Equal(got[1], []byte("from-b")) {
++		t.Fatalf("fan-in got %q", got)
++	}
++}
++
++func TestMultiStreamStatsAggregation(t *testing.T) {
++	a, b := newAlive(), &mockStream{}
++	older := time.Now().Add(-time.Minute)
++	b.lastRecv.Store(older.UnixNano())
++	ms := startMS(t, a, b)
++
++	st := ms.Stats()
++	if !st.Connected {
++		t.Error("Connected should be true while one stream is up")
++	}
++	if !st.LastRecv.Equal(time.Unix(0, a.lastRecv.Load())) {
++		t.Errorf("LastRecv = %v, want the latest stream's", st.LastRecv)
++	}
++	a.connected.Store(false)
++	if ms.Stats().Connected || ms.IsConnected() {
++		t.Error("Connected should be false with every stream down")
++	}
++}
++
++// One document failing to start must not take the tunnel down; all of them
++// failing must.
++func TestMultiStreamStartToleratesPartialFailure(t *testing.T) {
++	good, bad := newAlive(), &mockStream{startErr: fmt.Errorf("doc gone")}
++	ms := NewMultiStreamTransport([]Transport{bad, good})
++	if err := ms.Start(); err != nil {
++		t.Fatalf("Start with one good stream: %v", err)
++	}
++	if err := ms.Send(tcpPacket(clientIP, serverIP, 1, 2, 0)); err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	ms.Stop()
++
++	b1, b2 := &mockStream{startErr: fmt.Errorf("x")}, &mockStream{startErr: fmt.Errorf("y")}
++	ms = NewMultiStreamTransport([]Transport{b1, b2})
++	if err := ms.Start(); err == nil {
++		t.Fatal("Start succeeded with no stream started")
++	}
++}
++
++func TestMultiStreamStopStopsEveryStream(t *testing.T) {
++	a, b := newAlive(), newAlive()
++	ms := startMS(t, a, b)
++	if err := ms.Stop(); err != nil {
++		t.Fatalf("Stop: %v", err)
++	}
++	if !a.stopped.Load() || !b.stopped.Load() {
++		t.Fatal("Stop did not stop every inner stream")
++	}
++	if err := ms.Send(tcpPacket(clientIP, serverIP, 1, 2, 0)); err == nil {
++		t.Fatal("Send succeeded after Stop")
++	}
++}
++
++// A flow is sent back over the stream its packets arrive on, so when the peer
++// moves a connection to another document the replies follow at once instead of
++// going into the document the peer just lost.
++func TestMultiStreamFlowFollowsPeer(t *testing.T) {
++	streams := []*mockStream{newAlive(), newAlive()}
++	ms := startMS(t, streams...)
++	ms.Receive(func([]byte) {})
++	now := time.Now()
++	ms.now = func() time.Time { return now }
++	out := tcpPacket(clientIP, serverIP, 53000, 443, 1)
++	in := tcpPacket(serverIP, clientIP, 443, 53000, 2)
++
++	before := counts(streams)
++	ms.Send(out)
++	home := whichStream(t, streams, before)
++	other := 1 - home
++
++	// The peer switched the flow to the other stream.
++	streams[other].inject(in)
++	before = counts(streams)
++	ms.Send(out)
++	if got := whichStream(t, streams, before); got != other {
++		t.Fatalf("reply went to stream %d, want %d where the flow arrived", got, other)
++	}
++
++	// The followed stream goes down: back to the hash choice.
++	streams[other].connected.Store(false)
++	before = counts(streams)
++	ms.Send(out)
++	if got := whichStream(t, streams, before); got != home {
++		t.Fatalf("with the followed stream down, went to %d, want %d", got, home)
++	}
++	streams[other].connected.Store(true)
++
++	// A stale arrival no longer steers the flow.
++	now = now.Add(2 * DefaultPeerTimeout)
++	streams[0].lastRecv.Store(now.UnixNano())
++	streams[1].lastRecv.Store(now.UnixNano())
++	before = counts(streams)
++	ms.Send(out)
++	if got := whichStream(t, streams, before); got != home {
++		t.Fatalf("stale arrival still steered the flow to %d", got)
++	}
++}
+diff --git a/transport/transport.go b/transport/transport.go
+index a91eade..f21bdd4 100644
+--- a/transport/transport.go
++++ b/transport/transport.go
+@@ -31,6 +31,12 @@ type TransportStats struct {
+ 	Reconnects    uint64
+ 	Connected     bool
+ 	Uptime        time.Duration
++	// LastRecv is when anything last arrived from the remote peer: a data
++	// frame or a transport-level keepalive. Zero if nothing has arrived yet,
++	// or since the transport learned that the peer left.
++	// MultiStreamTransport uses it to tell a stream that is merely connected
++	// to its relay from one that actually reaches the peer.
++	LastRecv time.Time
+ }
+ 
+ func DefaultConfig() TransportConfig {
+@@ -54,6 +60,7 @@ type BaseTransport struct {
+ 	Mu              sync.RWMutex
+ 
+ 	reconnectAttempts atomic.Int32
++	lastRecv          atomic.Int64 // unix nanos; 0 = never
+ }
+ 
+ func NewBaseTransport(config TransportConfig) *BaseTransport {
+@@ -121,9 +128,19 @@ func (b *BaseTransport) Stats() TransportStats {
+ 		Reconnects:    uint64(b.reconnectAttempts.Load()),
+ 		Connected:     b.IsConnected(),
+ 		Uptime:        time.Since(b.startTime),
++		LastRecv:      b.LastRecv(),
+ 	}
+ }
+ 
++// LastRecv reports when the peer was last heard from (see TransportStats).
++func (b *BaseTransport) LastRecv() time.Time {
++	ns := b.lastRecv.Load()
++	if ns == 0 {
++		return time.Time{}
++	}
++	return time.Unix(0, ns)
++}
++
+ func (b *BaseTransport) RecordSend(bytes int) {
+ 	atomic.AddUint64(&b.stats.BytesSent, uint64(bytes))
+ 	atomic.AddUint64(&b.stats.PacketsSent, 1)
+@@ -132,6 +149,19 @@ func (b *BaseTransport) RecordSend(bytes int) {
+ func (b *BaseTransport) RecordReceive(bytes int) {
+ 	atomic.AddUint64(&b.stats.BytesReceived, uint64(bytes))
+ 	atomic.AddUint64(&b.stats.PacketsRecv, 1)
++	b.RecordPeerActivity()
++}
++
++// RecordPeerActivity marks the peer as heard from without counting a data
++// frame, for transport-level keepalives that carry no tunnel payload.
++func (b *BaseTransport) RecordPeerActivity() {
++	b.lastRecv.Store(time.Now().UnixNano())
++}
++
++// ForgetPeer clears LastRecv when the transport learns that the peer has left,
++// so the peer counts as not heard from until it sends again.
++func (b *BaseTransport) ForgetPeer() {
++	b.lastRecv.Store(0)
+ }
+ 
+ func (b *BaseTransport) RecordReconnect() {
+diff --git a/transport/yandex/lifecycle_test.go b/transport/yandex/lifecycle_test.go
+new file mode 100644
+index 0000000..3e3195d
+--- /dev/null
++++ b/transport/yandex/lifecycle_test.go
+@@ -0,0 +1,303 @@
++package yandex
++
++import (
++	"crypto/tls"
++	"encoding/base64"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/gorilla/websocket"
++
++	"openflux/transport"
++)
++
++// fakeDocServer imitates the two Yandex endpoints the transport talks to: the
++// document page carrying client-config, and the TLS WebSocket balancer.
++type fakeDocServer struct {
++	pageURL string
++
++	mu    sync.Mutex
++	conns []*websocket.Conn
++	recv  []string
++}
++
++func newFakeDocServer(t *testing.T) *fakeDocServer {
++	t.Helper()
++	f := &fakeDocServer{}
++
++	upgrader := websocket.Upgrader{}
++	ws := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, err := upgrader.Upgrade(w, r, nil)
++		if err != nil {
++			return
++		}
++		f.mu.Lock()
++		f.conns = append(f.conns, conn)
++		f.mu.Unlock()
++		for {
++			_, msg, err := conn.ReadMessage()
++			if err != nil {
++				return
++			}
++			f.mu.Lock()
++			f.recv = append(f.recv, string(msg))
++			f.mu.Unlock()
++		}
++	}))
++	t.Cleanup(ws.Close)
++
++	config := fmt.Sprintf(`{"officeActionData":{"balancer_url":%q,"editor_config":{"token":"jwt",`+
++		`"document":{"key":"docKey","fileType":"xlsx","url":"u","title":"t"}}}}`, ws.URL)
++	f.pageURL = serveConfig(t, clientConfigPage(config))
++	return f
++}
++
++func (f *fakeDocServer) connCount() int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return len(f.conns)
++}
++
++// push sends a server message on the latest connection.
++func (f *fakeDocServer) push(t *testing.T, msg string) {
++	t.Helper()
++	f.mu.Lock()
++	conn := f.conns[len(f.conns)-1]
++	f.mu.Unlock()
++	if err := conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
++		t.Fatalf("server push: %v", err)
++	}
++}
++
++func (f *fakeDocServer) countReceived(sub string) int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	n := 0
++	for _, m := range f.recv {
++		if strings.Contains(m, sub) {
++			n++
++		}
++	}
++	return n
++}
++
++func (f *fakeDocServer) received(sub string) bool {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	for _, m := range f.recv {
++		if strings.Contains(m, sub) {
++			return true
++		}
++	}
++	return false
++}
++
++func newTestTransport(url string) *YandexDocsTransport {
++	cfg := transport.DefaultConfig()
++	cfg.KeepAliveInterval = 50 * time.Millisecond
++	tr := NewYandexDocsTransport(url, cfg)
++	tr.tlsConfig = &tls.Config{InsecureSkipVerify: true}
++	return tr
++}
++
++// transportGoroutines counts live goroutines running YandexDocsTransport code.
++func transportGoroutines() int {
++	buf := make([]byte, 1<<20)
++	buf = buf[:runtime.Stack(buf, true)]
++	n := 0
++	for _, g := range strings.Split(string(buf), "\n\n") {
++		if strings.Contains(g, "(*YandexDocsTransport)") {
++			n++
++		}
++	}
++	return n
++}
++
++func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(d)
++	for !cond() {
++		if time.Now().After(deadline) {
++			t.Fatalf("timed out waiting for %s", what)
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++}
++
++// stopQuickly stops tr and checks that Stop returns promptly and leaves no
++// transport goroutine behind.
++func stopQuickly(t *testing.T, tr *YandexDocsTransport) {
++	t.Helper()
++	start := time.Now()
++	if err := tr.Stop(); err != nil {
++		t.Fatalf("Stop: %v", err)
++	}
++	if d := time.Since(start); d > time.Second {
++		t.Fatalf("Stop took %v", d)
++	}
++	if n := transportGoroutines(); n != 0 {
++		t.Fatalf("%d transport goroutines still running after Stop", n)
++	}
++}
++
++func TestYandexDocsTransportDataKeepaliveAndStop(t *testing.T) {
++	srv := newFakeDocServer(t)
++	tr := newTestTransport(srv.pageURL)
++
++	got := make(chan []byte, 1)
++	tr.Receive(func(b []byte) { got <- b })
++	if err := tr.Start(); err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	waitFor(t, "connect", 5*time.Second, func() bool { return tr.IsConnected() && srv.connCount() == 1 })
++
++	// Outbound packet and our own keepalive reach the server.
++	if err := tr.Send([]byte("hello")); err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	b64 := base64.StdEncoding.EncodeToString([]byte("hello"))
++	waitFor(t, "outbound packet", 2*time.Second, func() bool { return srv.received(b64) })
++	waitFor(t, "keepalive", 2*time.Second, func() bool { return srv.received("---KA---") })
++
++	// The peer's keepalive marks the peer as heard from without delivering data.
++	if !tr.Stats().LastRecv.IsZero() {
++		t.Fatal("LastRecv set before anything arrived from the peer")
++	}
++	srv.push(t, `42["message",{"type":"cursor","messages":[{"cursor":"18;---KA---"}]}]`)
++	waitFor(t, "peer keepalive", 2*time.Second, func() bool { return !tr.Stats().LastRecv.IsZero() })
++
++	// Inbound packet reaches the callback.
++	srv.push(t, `42["message",{"type":"cursor","messages":[{"cursor":"18;`+
++		base64.StdEncoding.EncodeToString([]byte("world"))+`"}]}]`)
++	select {
++	case b := <-got:
++		if string(b) != "world" {
++			t.Fatalf("callback got %q", b)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("inbound packet not delivered")
++	}
++
++	stopQuickly(t, tr)
++}
++
++// A server-side drop (disconnectReason + close) is followed by a reconnect.
++func TestYandexDocsTransportReconnectsAfterServerDrop(t *testing.T) {
++	srv := newFakeDocServer(t)
++	tr := newTestTransport(srv.pageURL)
++	if err := tr.Start(); err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	waitFor(t, "connect", 5*time.Second, func() bool { return tr.IsConnected() && srv.connCount() == 1 })
++
++	srv.push(t, `42["message",{"type":"disconnectReason","code":4007,"description":"drop"}]`)
++	srv.mu.Lock()
++	srv.conns[0].Close()
++	srv.mu.Unlock()
++
++	waitFor(t, "disconnect", 2*time.Second, func() bool { return !tr.IsConnected() })
++	waitFor(t, "reconnect", 6*time.Second, func() bool { return tr.IsConnected() && srv.connCount() == 2 })
++	stopQuickly(t, tr)
++}
++
++// Stop must not wait out a reconnect backoff.
++func TestYandexDocsTransportStopInterruptsBackoff(t *testing.T) {
++	url := serveConfig(t, "<html>no config here</html>")
++	tr := newTestTransport(url)
++	if err := tr.Start(); err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	time.Sleep(200 * time.Millisecond) // fetch failed, now in a >=1.5s backoff
++	stopQuickly(t, tr)
++}
++
++// Stop must not wait for a document page that never answers.
++func TestYandexDocsTransportStopInterruptsHangingFetch(t *testing.T) {
++	release := make(chan struct{})
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		<-release
++	}))
++	t.Cleanup(srv.Close)
++	t.Cleanup(func() { close(release) })
++
++	tr := newTestTransport(srv.URL)
++	if err := tr.Start(); err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	time.Sleep(200 * time.Millisecond)
++	stopQuickly(t, tr)
++}
++
++// A participant list with nobody but us means the peer left the document: it
++// no longer counts as heard from until it sends again.
++func TestYandexDocsTransportForgetsPeerWhenAlone(t *testing.T) {
++	srv := newFakeDocServer(t)
++	tr := newTestTransport(srv.pageURL)
++	if err := tr.Start(); err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	defer tr.Stop()
++	waitFor(t, "connect", 5*time.Second, func() bool { return tr.IsConnected() && srv.connCount() == 1 })
++
++	heard := func() bool { return !tr.Stats().LastRecv.IsZero() }
++	const ka = `42["message",{"type":"cursor","messages":[{"cursor":"18;---KA---"}]}]`
++	srv.push(t, `40{"sid":"me"}`)
++	srv.push(t, ka)
++	waitFor(t, "peer keepalive", 2*time.Second, heard)
++
++	// Someone else is still listed: nothing changes.
++	srv.push(t, `42["message",{"type":"connectState","participants":[{"connectionId":"me"},{"connectionId":"peer"}]}]`)
++	srv.push(t, `42["message",{"type":"auth","sessionId":"me","participants":[{"connectionId":"peer"}]}]`)
++	time.Sleep(100 * time.Millisecond)
++	if !heard() {
++		t.Fatal("peer forgotten while still listed")
++	}
++
++	// Only us left.
++	srv.push(t, `42["message",{"type":"connectState","participants":[{"connectionId":"me"}]}]`)
++	waitFor(t, "peer forgotten", 2*time.Second, func() bool { return !heard() })
++
++	srv.push(t, ka)
++	waitFor(t, "peer heard again", 2*time.Second, heard)
++	srv.push(t, `42["message",{"type":"auth","sessionId":"me","participants":[]}]`)
++	waitFor(t, "peer forgotten on empty list", 2*time.Second, func() bool { return !heard() })
++}
++
++// Whenever a participant list shows someone else (our auth reply with the peer
++// already in the document, or a peer that just joined), the peer hears us
++// without waiting for the keepalive tick. Nothing is sent before the server
++// answers our auth.
++func TestYandexDocsTransportGreetsPeer(t *testing.T) {
++	srv := newFakeDocServer(t)
++	tr := newTestTransport(srv.pageURL)
++	tr.BaseTransport = transport.NewBaseTransport(transport.TransportConfig{
++		MaxReconnectAttempts: 10, MaxQueueSize: 16, KeepAliveInterval: time.Hour,
++	})
++	if err := tr.Start(); err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	defer tr.Stop()
++	waitFor(t, "connect", 5*time.Second, func() bool { return tr.IsConnected() && srv.connCount() == 1 })
++	time.Sleep(100 * time.Millisecond)
++	if n := srv.countReceived("---KA---"); n != 0 {
++		t.Fatalf("keepalive sent before the auth reply (%d)", n)
++	}
++
++	srv.push(t, `40{"sid":"me"}`)
++	srv.push(t, `42["message",{"type":"auth","sessionId":"me","participants":[{"connectionId":"me"},{"connectionId":"peer"}]}]`)
++	waitFor(t, "keepalive for peer in auth reply", 2*time.Second, func() bool { return srv.countReceived("---KA---") == 1 })
++	srv.push(t, `42["message",{"type":"connectState","participants":[{"connectionId":"me"},{"connectionId":"peer2"}]}]`)
++	waitFor(t, "keepalive for new participant", 2*time.Second, func() bool { return srv.countReceived("---KA---") == 2 })
++
++	srv.push(t, `42["message",{"type":"connectState","participants":[{"connectionId":"me"}]}]`)
++	time.Sleep(100 * time.Millisecond)
++	if n := srv.countReceived("---KA---"); n != 2 {
++		t.Fatalf("keepalive sent with nobody else in the document (%d total)", n)
++	}
++}
+diff --git a/transport/yandex/vyandex.go b/transport/yandex/vyandex.go
+index b7d01b7..f29629b 100644
+--- a/transport/yandex/vyandex.go
++++ b/transport/yandex/vyandex.go
+@@ -1042,6 +1042,7 @@ func (t *YandexVolgaTransport) Stats() transport.TransportStats {
+ 		Reconnects:    t.stats.WSReconnects.Load(),
+ 		Connected:     t.IsConnected(),
+ 		Uptime:        base.Uptime,
++		LastRecv:      base.LastRecv,
+ 	}
+ }
+ 
+diff --git a/transport/yandex/yandex.go b/transport/yandex/yandex.go
+index b1e87fc..60e77b8 100644
+--- a/transport/yandex/yandex.go
++++ b/transport/yandex/yandex.go
+@@ -1,6 +1,8 @@
+ package yandex
+ 
+ import (
++	"context"
++	"crypto/tls"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
+@@ -48,6 +50,10 @@ type DocSession struct {
+ 	WriteQueue chan []byte
+ 	UserID     string
+ 	writeMu    sync.Mutex
++
++	// connID is this connection's id on the server (the Socket.IO sid), as
++	// listed in participant lists. Read loop only.
++	connID string
+ }
+ 
+ func (s *DocSession) safeWrite(messageType int, data []byte) error {
+@@ -64,8 +70,23 @@ type YandexDocsTransport struct {
+ 
+ 	userCounter atomic.Int32
+ 	baseUserID  string
++
++	// Lifecycle. Every goroutine the transport starts is tracked by wg and
++	// watches ctx, so Stop can end them all (including a pending reconnect
++	// backoff or an in-flight dial) and wait for them.
++	ctx    context.Context
++	cancel context.CancelFunc
++	wg     sync.WaitGroup
++
++	// tlsConfig overrides the WebSocket TLS settings; tests only.
++	tlsConfig *tls.Config
+ }
+ 
++// stopWaitTimeout bounds how long Stop waits for the transport's goroutines.
++// They all exit within milliseconds once cancelled; the bound only protects
++// callers (such as the iOS bridge, which holds a lock) from a stuck one.
++const stopWaitTimeout = 5 * time.Second
++
+ func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
+ 	t := &YandexDocsTransport{
+ 		BaseTransport: transport.NewBaseTransport(config),
+@@ -82,12 +103,78 @@ func (t *YandexDocsTransport) Start() error {
+ 	}
+ 
+ 	t.baseUserID = randUserID()
+-	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
++	t.Mu.Lock()
++	t.ctx, t.cancel = context.WithCancel(context.Background())
++	t.session = nil
++	t.Mu.Unlock()
++
++	t.spawn("yandex.keepAlive", t.keepAliveLoop)
+ 	t.connectToDoc(0)
+ 
+ 	return nil
+ }
+ 
++// Stop cancels every background goroutine, closes the live WebSocket so a
++// blocked read returns, and waits for the goroutines to exit.
++func (t *YandexDocsTransport) Stop() error {
++	err := t.BaseTransport.Stop()
++
++	t.Mu.Lock()
++	cancel := t.cancel
++	session := t.session
++	t.Mu.Unlock()
++
++	if cancel != nil {
++		cancel()
++	}
++	if session != nil && session.Conn != nil {
++		session.Conn.Close()
++	}
++
++	done := make(chan struct{})
++	go func() {
++		t.wg.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(stopWaitTimeout):
++		utils.Debugf("[YDOCS] Stop: goroutines still running after %v", stopWaitTimeout)
++	}
++	return err
++}
++
++// spawn runs fn in a tracked, panic-safe goroutine.
++func (t *YandexDocsTransport) spawn(name string, fn func()) {
++	t.wg.Add(1)
++	utils.SafeGo(name, func() {
++		defer t.wg.Done()
++		fn()
++	})
++}
++
++// runCtx is the context of the current Start; Background before any Start.
++func (t *YandexDocsTransport) runCtx() context.Context {
++	t.Mu.RLock()
++	defer t.Mu.RUnlock()
++	if t.ctx == nil {
++		return context.Background()
++	}
++	return t.ctx
++}
++
++// sleepCtx sleeps for d and reports false if ctx was cancelled first.
++func sleepCtx(ctx context.Context, d time.Duration) bool {
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++		return true
++	case <-ctx.Done():
++		return false
++	}
++}
++
+ func (t *YandexDocsTransport) Send(data []byte) error {
+ 	if !t.IsConnected() {
+ 		return fmt.Errorf("transport not connected")
+@@ -117,12 +204,8 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
+ 
+ 	utils.Debugf("[YDOCS] connectToDoc attempt ...")
+ 
+-	go func() {
+-		defer func() {
+-			if r := recover(); r != nil {
+-				utils.Debugf("[PANIC] recovered in yandex.connect: %v", r)
+-			}
+-		}()
++	t.spawn("yandex.connect", func() {
++		ctx := t.runCtx()
+ 		t.Mu.Lock()
+ 		existingSession := t.session
+ 		t.Mu.Unlock()
+@@ -135,7 +218,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
+ 			userID = t.baseUserID + suffix
+ 		}
+ 
+-		info, err := t.fetchDocInfo(t.url, userID)
++		info, err := t.fetchDocInfo(ctx, t.url, userID)
+ 		if err != nil {
+ 			utils.Debugf("[YDOCS] fetchDocInfo failed: %v", err)
+ 			t.scheduleReconnect(attempt)
+@@ -151,6 +234,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
+ 				Timeout:   10 * time.Second,
+ 				KeepAlive: 30 * time.Second,
+ 			}).DialContext,
++			TLSClientConfig: t.tlsConfig,
+ 		}
+ 		headers := http.Header{}
+ 		headers.Set("User-Agent", "Mozilla/5.0")
+@@ -159,7 +243,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
+ 		headers.Set("Host", info.Host)
+ 
+ 		utils.Debugf("[YDOCS] WebSocket dial %s", info.WsURL)
+-		conn, resp, err := dialer.Dial(info.WsURL, headers)
++		conn, resp, err := dialer.DialContext(ctx, info.WsURL, headers)
+ 		if err != nil {
+ 			status := 0
+ 			if resp != nil {
+@@ -188,8 +272,15 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
+ 		t.SetConnected(true)
+ 		t.Mu.Unlock()
+ 
++		// Stop may have run while we were dialing and missed this conn.
++		if !t.IsRunning() {
++			t.SetConnected(false)
++			conn.Close()
++			return
++		}
++
+ 		if existingSession == nil {
+-			utils.SafeGo("yandex.writer", t.writerLoop)
++			t.spawn("yandex.writer", t.writerLoop)
+ 		}
+ 
+ 		// Auth - use safeWrite
+@@ -224,7 +315,8 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
+ 			}
+ 			t.handleMessage(session, message)
+ 		}
+-	}()
++		conn.Close()
++	})
+ }
+ 
+ func (t *YandexDocsTransport) writerLoop() {
+@@ -232,6 +324,7 @@ func (t *YandexDocsTransport) writerLoop() {
+ 	// capture it and block on it instead of polling with a 10ms sleep. The old
+ 	// poll added up to 10ms of latency to every send and woke the CPU 100x/sec
+ 	// while idle.
++	ctx := t.runCtx()
+ 	var queue chan []byte
+ 	for t.IsRunning() && queue == nil {
+ 		t.Mu.Lock()
+@@ -239,8 +332,8 @@ func (t *YandexDocsTransport) writerLoop() {
+ 			queue = t.session.WriteQueue
+ 		}
+ 		t.Mu.Unlock()
+-		if queue == nil {
+-			time.Sleep(5 * time.Millisecond)
++		if queue == nil && !sleepCtx(ctx, 5*time.Millisecond) {
++			return
+ 		}
+ 	}
+ 	if queue == nil {
+@@ -250,11 +343,15 @@ func (t *YandexDocsTransport) writerLoop() {
+ 	var pending []byte
+ 	for t.IsRunning() {
+ 		if pending == nil {
+-			packet, ok := <-queue
+-			if !ok {
++			select {
++			case packet, ok := <-queue:
++				if !ok {
++					return
++				}
++				pending = packet
++			case <-ctx.Done():
+ 				return
+ 			}
+-			pending = packet
+ 		}
+ 
+ 		t.Mu.RLock()
+@@ -262,7 +359,9 @@ func (t *YandexDocsTransport) writerLoop() {
+ 		t.Mu.RUnlock()
+ 		if session == nil || session.Conn == nil {
+ 			// Mid-reconnect: hold the packet and retry rather than drop it.
+-			time.Sleep(15 * time.Millisecond)
++			if !sleepCtx(ctx, 15*time.Millisecond) {
++				return
++			}
+ 			continue
+ 		}
+ 
+@@ -270,28 +369,48 @@ func (t *YandexDocsTransport) writerLoop() {
+ 		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+ 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+ 			utils.Debugf("[YDOCS] Write error: %v", err)
+-			time.Sleep(15 * time.Millisecond)
++			if !sleepCtx(ctx, 15*time.Millisecond) {
++				return
++			}
+ 			continue // keep pending; the reconnect will bring up a new conn
+ 		}
+ 		pending = nil
+ 	}
+ }
+ 
++// keepAliveFrame is a cursor message the peer recognizes and drops; it keeps
++// the session warm and tells the peer this document reaches us.
++const keepAliveFrame = `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
++
+ func (t *YandexDocsTransport) keepAliveLoop() {
+ 	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
+ 	defer ticker.Stop()
+-	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
+ 
++	ctx := t.runCtx()
+ 	for t.IsRunning() {
+-		<-ticker.C
++		select {
++		case <-ticker.C:
++		case <-ctx.Done():
++			return
++		}
+ 		t.Mu.Lock()
+ 		session := t.session
+ 		t.Mu.Unlock()
+ 
+ 		if session != nil && session.Conn != nil {
+-			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
++			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveFrame)); err != nil {
+ 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
+-				t.SetConnected(false)
++				// A failed write leaves the conn unusable for writes while
++				// reads may still block for a long time. Close it so the read
++				// loop fails and reconnects, instead of the stream sitting
++				// disconnected forever. Only mark the transport down if this
++				// session has not been replaced meanwhile.
++				t.Mu.Lock()
++				if t.session == session {
++					t.SetConnected(false)
++				}
++				t.Mu.Unlock()
++				session.Conn.Close()
+ 			}
+ 		}
+ 	}
+@@ -301,6 +420,28 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
+ 	text := string(data)
+ 
+ 	if strings.Contains(text, "---KA---") {
++		// The server never echoes our own cursor messages back, so this is
++		// the peer's keepalive: proof that this document reaches it.
++		t.RecordPeerActivity()
++		return
++	}
++
++	// The server says why it is about to drop us, e.g.
++	// {"type":"disconnectReason","code":4007,"description":"drop"}. 4007 is
++	// not a ban: on live documents it arrived when another participant left,
++	// and the document accepted new sessions right away. So it gets no special
++	// backoff; the log is for diagnosis.
++	if strings.Contains(text, `"disconnectReason"`) {
++		utils.Debugf("[YDOCS] server disconnect: %s", text)
++		return
++	}
++
++	// Participant lists: the server's Socket.IO connect frame gives our
++	// connection id, the auth reply and connectState pushes list who is in
++	// the document.
++	if strings.HasPrefix(text, "40{") ||
++		strings.Contains(text, `"type":"auth"`) || strings.Contains(text, `"type":"connectState"`) {
++		t.handleParticipants(session, text)
+ 		return
+ 	}
+ 
+@@ -332,6 +473,51 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
+ 	}
+ }
+ 
++// handleParticipants tracks our connection id and reacts to participant
++// lists. A list with nobody but us means the peer has left this document (or
++// sits on another document backend, where nothing reaches it): forget that it
++// was heard from, so a multi-stream tunnel stops routing here at once instead
++// of after the keepalive timeout. A longer list proves nothing (stale
++// participants linger for a while), so only the peer's traffic marks it back;
++// we just send a keepalive so a newly joined peer hears us right away.
++func (t *YandexDocsTransport) handleParticipants(session *DocSession, text string) {
++	if session == nil {
++		return
++	}
++	if strings.HasPrefix(text, "40{") {
++		var connect struct {
++			Sid string `json:"sid"`
++		}
++		if json.Unmarshal([]byte(text[2:]), &connect) == nil {
++			session.connID = connect.Sid
++		}
++		return
++	}
++
++	var frame []json.RawMessage
++	if !strings.HasPrefix(text, "42") || json.Unmarshal([]byte(text[2:]), &frame) != nil || len(frame) < 2 {
++		return
++	}
++	var msg struct {
++		Participants []struct {
++			ConnectionID string `json:"connectionId"`
++		} `json:"participants"`
++	}
++	if json.Unmarshal(frame[1], &msg) != nil || msg.Participants == nil || session.connID == "" {
++		return
++	}
++	for _, p := range msg.Participants {
++		if p.ConnectionID != session.connID {
++			// Someone else is here, possibly the peer that just (re)joined:
++			// greet it so it hears us without waiting for our next tick.
++			session.safeWrite(websocket.TextMessage, []byte(keepAliveFrame))
++			return
++		}
++	}
++	utils.Debugf("[YDOCS] no other participant in the document")
++	t.ForgetPeer()
++}
++
+ func (t *YandexDocsTransport) extractBase64String(response string) string {
+ 	if strings.Contains(response, "saveChanges") {
+ 		marker := `"excelAdditionalInfo":"`
+@@ -363,8 +549,7 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
+ 	// turn into a tight connect/close loop (previously reconnect was instant).
+ 	d := reconnectBackoff(next)
+ 	utils.Debugf("[YDOCS] reconnecting in %v (attempt %d)", d, next)
+-	time.Sleep(d)
+-	if !t.IsRunning() {
++	if !sleepCtx(t.runCtx(), d) || !t.IsRunning() {
+ 		return
+ 	}
+ 
+@@ -398,7 +583,7 @@ func reconnectBackoff(n int) time.Duration {
+ 	return d
+ }
+ 
+-func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
++func (t *YandexDocsTransport) fetchDocInfo(ctx context.Context, url, userID string) (YandexDocsInfo, error) {
+ 	jar, _ := cookiejar.New(nil)
+ 	client := &http.Client{
+ 		Jar: jar,
+@@ -419,7 +604,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo,
+ 	for hop := 0; hop < 10; hop++ {
+ 		utils.Debugf("[YDOCS] hop %d: GET %s", hop, shortStr(currentURL, 120))
+ 
+-		req, _ := http.NewRequest("GET", currentURL, nil)
++		req, _ := http.NewRequestWithContext(ctx, "GET", currentURL, nil)
+ 		req.Header.Set("User-Agent", ua)
+ 		resp, err = client.Do(req)
+ 		if err != nil {
+diff --git a/transport/yandex/yandex_test.go b/transport/yandex/yandex_test.go
+index 3155b07..7f0065a 100644
+--- a/transport/yandex/yandex_test.go
++++ b/transport/yandex/yandex_test.go
+@@ -1,6 +1,7 @@
+ package yandex
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -32,7 +33,7 @@ func TestFetchDocInfoVolgaConfigReturnsError(t *testing.T) {
+ 
+ 	url := serveConfig(t, clientConfigPage(config))
+ 
+-	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
++	info, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001")
+ 	if err == nil {
+ 		t.Fatalf("expected an error for a config without balancer_url, got info %+v", info)
+ 	}
+@@ -44,7 +45,7 @@ func TestFetchDocInfoVolgaConfigReturnsError(t *testing.T) {
+ func TestFetchDocInfoMissingOfficeActionDataReturnsError(t *testing.T) {
+ 	url := serveConfig(t, clientConfigPage(`{"somethingElse":true}`))
+ 
+-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
++	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
+ 		t.Fatal("expected an error when officeActionData is absent")
+ 	}
+ }
+@@ -55,7 +56,7 @@ func TestFetchDocInfoMissingDocumentReturnsError(t *testing.T) {
+ 
+ 	url := serveConfig(t, clientConfigPage(config))
+ 
+-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
++	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
+ 		t.Fatal("expected an error when editor_config.document is absent")
+ 	}
+ }
+@@ -66,7 +67,7 @@ func TestFetchDocInfoMissingTokenReturnsError(t *testing.T) {
+ 
+ 	url := serveConfig(t, clientConfigPage(config))
+ 
+-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
++	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
+ 		t.Fatal("expected an error when editor_config.token is absent")
+ 	}
+ }
+@@ -74,7 +75,7 @@ func TestFetchDocInfoMissingTokenReturnsError(t *testing.T) {
+ func TestFetchDocInfoInvalidJSONReturnsError(t *testing.T) {
+ 	url := serveConfig(t, clientConfigPage(`{not valid json`))
+ 
+-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
++	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
+ 		t.Fatal("expected an error when client-config is not valid JSON")
+ 	}
+ }
+@@ -82,7 +83,7 @@ func TestFetchDocInfoInvalidJSONReturnsError(t *testing.T) {
+ func TestFetchDocInfoMissingConfigReturnsError(t *testing.T) {
+ 	url := serveConfig(t, `<!DOCTYPE html><html><body>no config here</body></html>`)
+ 
+-	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
++	if _, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001"); err == nil {
+ 		t.Fatal("expected an error when client-config is absent")
+ 	}
+ }
+@@ -95,7 +96,7 @@ func TestFetchDocInfoValidConfig(t *testing.T) {
+ 
+ 	url := serveConfig(t, clientConfigPage(config))
+ 
+-	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
++	info, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001")
+ 	if err != nil {
+ 		t.Fatalf("unexpected error: %v", err)
+ 	}
+@@ -135,7 +136,7 @@ func TestFetchDocInfoMissingPermissionsFallsBack(t *testing.T) {
+ 
+ 	url := serveConfig(t, clientConfigPage(config))
+ 
+-	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
++	info, err := (&YandexDocsTransport{}).fetchDocInfo(context.Background(), url, "0000000001")
+ 	if err != nil {
+ 		t.Fatalf("unexpected error: %v", err)
+ 	}
