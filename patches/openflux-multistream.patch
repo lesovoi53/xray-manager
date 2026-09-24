@@ -2371,3 +2371,63 @@ index 3155b07..7f0065a 100644
  	if err != nil {
  		t.Fatalf("unexpected error: %v", err)
  	}
+diff --git a/transport/yandex/boards.go b/transport/yandex/boards.go
+index 2cf2ce4..6ef79e8 100644
+--- a/transport/yandex/boards.go
++++ b/transport/yandex/boards.go
+@@ -309,16 +309,18 @@ func (t *BoardsTransport) get(client *http.Client, u, accept, referer string) er
+ }
+ 
+ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, content interface{}) error {
+-	raw, _ := json.Marshal(content)
+-	contentB64 := base64.StdEncoding.EncodeToString(raw)
+-	form := url.Values{}
+-	form.Set("action", action)
+-	form.Set("content", contentB64)
+-
+-	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
+-		strings.NewReader(form.Encode()))
++	bodyMap := map[string]interface{}{
++		"action":  action,
++		"content": content,
++	}
++	raw, err := json.Marshal(bodyMap)
++	if err != nil {
++		return err
++	}
++
++	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(raw))
+ 	req.Header.Set("User-Agent", boardsUA)
+-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
++	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+ 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+ 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+ 	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
+@@ -340,16 +342,18 @@ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, cont
+ }
+ 
+ func (t *BoardsTransport) getWhiteboardInfo(client *http.Client, hash string) (map[string]string, error) {
+-	raw, _ := json.Marshal(map[string]string{"hash": hash})
+-	contentB64 := base64.StdEncoding.EncodeToString(raw)
+-	form := url.Values{}
+-	form.Set("action", "get-whiteboard-info")
+-	form.Set("content", contentB64)
+-
+-	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
+-		strings.NewReader(form.Encode()))
++	bodyMap := map[string]interface{}{
++		"action":  "get-whiteboard-info",
++		"content": map[string]string{"hash": hash},
++	}
++	raw, err := json.Marshal(bodyMap)
++	if err != nil {
++		return nil, err
++	}
++
++	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api", bytes.NewReader(raw))
+ 	req.Header.Set("User-Agent", boardsUA)
+-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
++	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+ 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+ 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+ 	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)

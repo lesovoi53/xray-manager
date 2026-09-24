@@ -124,7 +124,12 @@
 - В блоке 1 `main_hub()`: `[4] 📡 Управление OpenFlux [Классический балансир (8×1) / Multi-Stream (8×4)]`.
 - В заголовке меню OpenFlux: строка `Архитектура: ...`.
 - В пункте меню `[M] 🔀 Архитектурный режим: [1] Классический балансир (8×1) ↔ [2] Multi-Stream (8×4, PR #56)`.
-- В интерактивных мастерах настройки каналов `[1]` и `[2]`.
+#### 2.5. Исправление протокола Яндекс Досок (Yandex Boards HTTP 415 -> JSON API)
+В сентябре 2026 года Яндекс обновил внутренний API Яндекс Досок (`https://boards.yandex.ru/api`):
+- Старый протокол `application/x-www-form-urlencoded` с base64-пейлоадом стал возвращать ошибку `HTTP 415: Request body must use a JSON Content-Type`.
+- Функции `postAPI` и `getWhiteboardInfo` в `transport/yandex/boards.go` обновлены на строгий `Content-Type: application/json; charset=utf-8` с передачей нативного JSON-объекта `{"action": "...", "content": {...}}`.
+- Изменение интегрировано в патч `patches/openflux-multistream.patch` и собрано в бинарник `/usr/local/bin/openflux`.
+- Результат: Канал 3 (Яндекс Доски в режиме Multi-Stream на 4 документа) успешно авторизуется через WebSocket и работает в статусе `[АКТИВЕН]`.
 
 ---
 
