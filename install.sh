@@ -891,8 +891,10 @@ if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = "yes" ]; then
     if [ ! -f "$WDAVTUNNEL_DIR/config.env" ]; then
         wdav_pass=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 24 2>/dev/null || date +%s | sha256sum | head -c 24)
         cat > "$WDAVTUNNEL_DIR/config.env" <<EOF_WDAV
+WEBDAV_MODE="selfhosted"
 WEBDAV_LISTEN=":8443"
 WEBDAV_STORAGE="${WDAVTUNNEL_STORAGE}"
+WEBDAV_URL="https://webdav.yandex.ru"
 WEBDAV_LOGIN="wdav"
 WEBDAV_PASSWORD="${wdav_pass}"
 WEBDAV_ENC="false"

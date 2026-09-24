@@ -29,6 +29,12 @@ if [ -f "$CONFIG_FILE" ]; then
 
     raw_listen=$(grep -oP '^WEBDAV_LISTEN=\K.*' "$CONFIG_FILE" | tr -d '"' | head -n 1 || true)
     WEBDAV_LISTEN_PORT=$(echo "$raw_listen" | grep -oP ':\K[0-9]+$' || true)
+
+    m_val=$(grep -oP '^WEBDAV_MODE=\K.*' "$CONFIG_FILE" | tr -d '"' | tr -d "'" | head -n 1 || true)
+    [ -n "$m_val" ] && WEBDAV_MODE="$m_val"
+
+    u_val=$(grep -oP '^WEBDAV_URL=\K.*' "$CONFIG_FILE" | tr -d '"' | tr -d "'" | head -n 1 || true)
+    [ -n "$u_val" ] && WEBDAV_URL="$u_val"
 fi
 
 WDAV_UID=$(id -u "$WDAV_USER" 2>/dev/null || echo "")
@@ -67,9 +73,32 @@ add_rules() {
         iptables -w 5 -t nat -A "$CHAIN" -p tcp --dport "$WEBDAV_LISTEN_PORT" -j RETURN
     fi
 
+    # Исключения для внешних WebDAV облаков (Яндекс, Mail.ru и др.),
+    # чтобы управляющий трафик туннеля к удаленному диску не перенаправлялся в Xray
+    # Яндекс IP подсети
+    iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 77.88.0.0/18 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 87.250.250.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 93.158.134.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 213.180.193.0/24 -j RETURN 2>/dev/null || true
+
+    # Mail.ru / VK IP подсети
+    iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 94.100.180.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 217.69.139.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A "$CHAIN" -p tcp -m multiport --dports 80,443 -d 128.140.168.0/21 -j RETURN 2>/dev/null || true
+
+    # Разрешение доменного имени внешнего WebDAV URL при наличии
+    if [ -n "${WEBDAV_URL:-}" ]; then
+        wdav_host=$(echo "$WEBDAV_URL" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:.*$||')
+        if [ -n "$wdav_host" ]; then
+            for ip in $(getent ahosts "$wdav_host" 2>/dev/null | awk '{print $1}' | sort -u); do
+                [ -n "$ip" ] && iptables -w 5 -t nat -A "$CHAIN" -d "$ip/32" -j RETURN 2>/dev/null || true
+            done
+        fi
+    fi
+
     # Перенаправление в Xray
     iptables -w 5 -t nat -A "$CHAIN" -p tcp -j REDIRECT --to-ports "$XRAY_REDIRECT_PORT"
-    iptables -w 5 -t nat -C OUTPUT -m owner --uid-owner "$WDAV_UID" -j "$CHAIN" 2>/dev/null || \
+    iptables -w 5 -t nat -C OUTPUT -m owner --uid-owner "$WDAV_UID" 2>/dev/null || \
         iptables -w 5 -t nat -I OUTPUT 1 -m owner --uid-owner "$WDAV_UID" -j "$CHAIN"
 
     echo "[webdav-tunnel-routing] UP: UID=$WDAV_UID → TCP → :$XRAY_REDIRECT_PORT"

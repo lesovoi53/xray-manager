@@ -3684,7 +3684,12 @@ view_global_status() {
         printf "  %-22s %-25b\n" "OpenFlux (L4):" "$(get_openflux_status)"
     fi
     if is_webdav_tunnel_installed; then
-        printf "  %-22s %-25b [Порт: :%s/TCP | %b]\n" "WebDAV Tunnel:" "$(get_wdavtunnel_status)" "$(get_wdavtunnel_listen_port)" "$(get_wdavtunnel_routing)"
+        local w_mode=$(get_wdavtunnel_prop "WEBDAV_MODE" "selfhosted")
+        if [ "$w_mode" = "server" ] || [ "$w_mode" = "external" ]; then
+            printf "  %-22s %-25b [Режим: Yandex/Cloud | %b]\n" "WebDAV Tunnel:" "$(get_wdavtunnel_status)" "$(get_wdavtunnel_routing)"
+        else
+            printf "  %-22s %-25b [Порт: :%s/TCP | %b]\n" "WebDAV Tunnel:" "$(get_wdavtunnel_status)" "$(get_wdavtunnel_listen_port)" "$(get_wdavtunnel_routing)"
+        fi
     else
         printf "  %-22s %b\n" "WebDAV Tunnel:" "${RED}НЕ УСТАНОВЛЕН${NC}"
     fi
@@ -5870,26 +5875,62 @@ get_wdavtunnel_routing() {
     fi
 }
 
+get_wdavtunnel_mode() {
+    local mode
+    mode=$(get_wdavtunnel_prop "WEBDAV_MODE" "selfhosted")
+    if [ "$mode" = "server" ] || [ "$mode" = "external" ]; then
+        echo "server"
+    else
+        echo "selfhosted"
+    fi
+}
+
 get_wdavtunnel_listen_port() {
     local listen=$(get_wdavtunnel_prop "WEBDAV_LISTEN" ":8443")
     echo "$listen" | grep -oP ':\K[0-9]+$' || echo "8443"
 }
 
 get_wdavtunnel_client_uri() {
-    local port=$(get_wdavtunnel_listen_port)
-    local login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "")
-    local pass=$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "")
-    local enc=$(get_wdavtunnel_prop "WEBDAV_ENC" "false")
-    local srv="${SERVER_IP:-YOUR_SERVER_IP}"
+    local mode
+    mode=$(get_wdavtunnel_mode)
+    local login
+    login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "")
+    local pass
+    pass=$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "")
+    local enc
+    enc=$(get_wdavtunnel_prop "WEBDAV_ENC" "false")
+
     if [ -z "$login" ] || [ -z "$pass" ]; then
         echo "(не настроен — укажите логин и пароль)"
         return
     fi
-    local uri="webdav://${login}:${pass}@${srv}:${port}"
-    if [ "$enc" = "true" ] || [ "$enc" = "1" ]; then
-        uri="${uri}?enc=1"
+
+    if [ "$mode" = "server" ]; then
+        local url
+        url=$(get_wdavtunnel_prop "WEBDAV_URL" "https://webdav.yandex.ru")
+        local scheme="webdavs"
+        if [[ "$url" =~ ^http:// ]]; then
+            scheme="webdav"
+        fi
+        local host_part
+        host_part=$(echo "$url" | sed -e 's|^https\?://||' -e 's|/$||')
+        local uri="${scheme}://${login}:${pass}@${host_part}?chunk-size=131071&coalesce=10ms&poll-max=500ms&poll-min=200ms&puts=8&read-max=8&read-min=3&timeout=60s"
+        if [ "$enc" = "true" ] || [ "$enc" = "1" ]; then
+            uri="${uri}&enc=1"
+        fi
+        uri="${uri}#Yandex-WebDAV"
+        echo "$uri"
+    else
+        local port
+        port=$(get_wdavtunnel_listen_port)
+        local srv="${SERVER_IP:-YOUR_SERVER_IP}"
+        local uri="webdav://${login}:${pass}@${srv}:${port}?chunk-size=131071&coalesce=5ms&poll-max=200ms&poll-min=50ms&puts=8&read-max=8&read-min=3&timeout=60s"
+        if [ "$enc" = "true" ] || [ "$enc" = "1" ]; then
+            uri="${uri}&enc=1"
+        fi
+        uri="${uri}#WebDAV-Tunnel"
+        echo "$uri"
     fi
-    echo "$uri"
 }
 
 # Сборка webdav-tunnel из исходников
@@ -5927,8 +5968,8 @@ menu_webdav_tunnel() {
         echo -e "${YELLOW}║${BOLD}   WebDAV Tunnel — НЕ УСТАНОВЛЕН                                     ${YELLOW}║${NC}"
         echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        echo -e "  WebDAV Tunnel — TCP-туннель поверх WebDAV (selfhosted-режим)."
-        echo -e "  Трафик маскируется под WebDAV-запросы к встроенному серверу."
+        echo -e "  WebDAV Tunnel — TCP-туннель поверх WebDAV (Selfhosted и Яндекс.Диск)."
+        echo -e "  Трафик маскируется под WebDAV-запросы к хранилищу."
         echo ""
         echo -e "  ${YELLOW}[1]${NC} 📦 Установить WebDAV Tunnel (скачать + собрать из исходников)"
         echo -e "  ${BOLD}[0]${NC} ← Назад"
@@ -5956,8 +5997,10 @@ menu_webdav_tunnel() {
                         local rnd_pass
                         rnd_pass=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 24 2>/dev/null || date +%s | sha256sum | head -c 24)
                         cat > "$WDAVTUNNEL_CONFIG_ENV" <<EOF_CFG
+WEBDAV_MODE="selfhosted"
 WEBDAV_LISTEN=":8443"
 WEBDAV_STORAGE="${WDAVTUNNEL_STORAGE}"
+WEBDAV_URL="https://webdav.yandex.ru"
 WEBDAV_LOGIN="wdav"
 WEBDAV_PASSWORD="${rnd_pass}"
 WEBDAV_ENC="false"
@@ -6005,8 +6048,12 @@ EOF_CFG
         clear
         local wdt_status
         wdt_status=$(get_wdavtunnel_status)
+        local wdt_mode
+        wdt_mode=$(get_wdavtunnel_mode)
         local wdt_port
         wdt_port=$(get_wdavtunnel_listen_port)
+        local wdt_url
+        wdt_url=$(get_wdavtunnel_prop "WEBDAV_URL" "https://webdav.yandex.ru")
         local wdt_login
         wdt_login=$(get_wdavtunnel_prop "WEBDAV_LOGIN" "(не задан)")
         local wdt_pass
@@ -6019,32 +6066,48 @@ EOF_CFG
         wdt_uri=$(get_wdavtunnel_client_uri)
 
         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — TCP over WebDAV (selfhosted)                       ${CYAN}║${NC}"
+        if [ "$wdt_mode" = "server" ]; then
+            echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — Cloud Relay (Внешний Яндекс.Диск / WebDAV)        ${CYAN}║${NC}"
+        else
+            echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — TCP over WebDAV (Встроенный Selfhosted)            ${CYAN}║${NC}"
+        fi
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
         echo -e "${CYAN}║${NC}  Статус: ${wdt_status}"
-        echo -e "${CYAN}║${NC}  Порт WebDAV (встроенный сервер): ${BOLD}:${wdt_port}/TCP${NC}"
-        echo -e "${CYAN}║${NC}  Логин: ${BOLD}${wdt_login}${NC}  |  Пароль: ${GREEN}${wdt_pass}${NC}"
+        if [ "$wdt_mode" = "server" ]; then
+            echo -e "${CYAN}║${NC}  Режим: ${GREEN}Внешнее хранилище (External Cloud WebDAV)${NC}"
+            echo -e "${CYAN}║${NC}  WebDAV URL: ${BOLD}${wdt_url}${NC}"
+            echo -e "${CYAN}║${NC}  Логин: ${BOLD}${wdt_login}${NC}  |  Пароль приложения: ${GREEN}${wdt_pass}${NC}"
+        else
+            echo -e "${CYAN}║${NC}  Режим: ${CYAN}Встроенный сервер (Selfhosted)${NC}"
+            echo -e "${CYAN}║${NC}  Порт WebDAV: ${BOLD}:${wdt_port}/TCP${NC}"
+            echo -e "${CYAN}║${NC}  Логин: ${BOLD}${wdt_login}${NC}  |  Пароль: ${GREEN}${wdt_pass}${NC}"
+        fi
         echo -e "${CYAN}║${NC}  Шифрование чанков (AES-256-GCM): ${BOLD}${wdt_enc}${NC}"
         echo -e "${CYAN}║${NC}  Маршрутизация: ${wdt_routing}"
         echo -e "${CYAN}║${NC}"
-        echo -e "${CYAN}║${NC}  URI для клиента (вставить в клиент):"
+        echo -e "${CYAN}║${NC}  Ссылка для WireTurn (вставить в приложение):"
         echo -e "${CYAN}║${NC}  ${GREEN}${wdt_uri}${NC}"
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${GREEN}[1]${NC} ▶  Запустить WebDAV Tunnel"
         echo -e "  ${RED}[2]${NC} ■  Остановить WebDAV Tunnel"
         echo -e "  ${YELLOW}[3]${NC} 🔄 Перезапустить WebDAV Tunnel"
-        echo -e "  ${CYAN}[4]${NC} 🔑 Сменить логин/пароль WebDAV"
-        echo -e "  ${CYAN}[5]${NC} 🔌 Сменить порт WebDAV-сервера (текущий: :${wdt_port})"
-        echo -e "  ${CYAN}[6]${NC} 🔒 Включить / выключить AES-256-GCM шифрование чанков"
-        echo -e "  ${CYAN}[7]${NC} 🌐 Переключить маршрутизацию (Xray REDIRECT / Прямой WAN)"
-        echo -e "  ${CYAN}[8]${NC} 📋 Показать URI клиента (для вставки в приложение)"
-        echo -e "  ${CYAN}[9]${NC} 📜 Логи службы (journalctl)"
-        echo -e "  ${CYAN}[10]${NC} ⚡ Живые логи (journalctl -f)"
-        echo -e "  ${CYAN}[11]${NC} 🔨 Пересобрать бинарник из исходников (spkprsnts/webdav-tunnel)"
+        echo -e "  ${CYAN}[4]${NC} 🔀 Переключить режим (Selfhosted ⟷ Внешний Яндекс.Диск)"
+        echo -e "  ${CYAN}[5]${NC} 🔑 Сменить логин / пароль (пароль приложения для Яндекс)"
+        if [ "$wdt_mode" = "server" ]; then
+            echo -e "  ${CYAN}[6]${NC} 🌐 Сменить URL WebDAV-хранилища (текущий: ${wdt_url})"
+        else
+            echo -e "  ${CYAN}[6]${NC} 🔌 Сменить порт WebDAV-сервера (текущий: :${wdt_port})"
+        fi
+        echo -e "  ${CYAN}[7]${NC} 🔒 Включить / выключить AES-256-GCM шифрование чанков"
+        echo -e "  ${CYAN}[8]${NC} 🧭 Переключить маршрутизацию (Xray REDIRECT / Прямой WAN)"
+        echo -e "  ${CYAN}[9]${NC} 📋 Показать ссылку и QR-код для WireTurn"
+        echo -e "  ${CYAN}[10]${NC} 📜 Логи службы (journalctl)"
+        echo -e "  ${CYAN}[11]${NC} ⚡ Живые логи (journalctl -f)"
+        echo -e "  ${CYAN}[12]${NC} 🔨 Пересобрать бинарник из исходников (spkprsnts/webdav-tunnel)"
         echo -e "  ${BOLD}[0]${NC} ← Назад в главное меню"
         echo ""
-        read -p "Выберите действие [0-11]: " wdt_choice
+        read -p "Выберите действие [0-12]: " wdt_choice
 
         case "$wdt_choice" in
             1)
@@ -6066,9 +6129,78 @@ EOF_CFG
                 sleep 1
                 ;;
             4)
+                clear
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${CYAN}║${BOLD}   Выбор режима работы WebDAV Tunnel                                  ${CYAN}║${NC}"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
                 echo ""
-                read -p "  Новый логин WebDAV [${wdt_login}]: " new_login
-                read -p "  Новый пароль WebDAV: " new_pass
+                echo -e "  ${CYAN}[1]${NC} 🖥  Встроенный сервер (Selfhosted) — туннель слушает порт на VPS (например :8443)."
+                echo -e "       Клиент WireTurn подключается напрямую к вашему VPS по IP:порт."
+                echo ""
+                echo -e "  ${CYAN}[2]${NC} ☁️  Внешнее WebDAV-хранилище (Яндекс.Диск и др.)."
+                echo -e "       Трафик передается через файлы на Яндекс.Диске."
+                echo -e "       VPS не открывает входящих портов, работает скрытно через облако."
+                echo ""
+                read -p "  Выберите режим [1-2, 0 для отмены]: " new_m_ch
+                case "$new_m_ch" in
+                    1)
+                        set_wdavtunnel_prop "WEBDAV_MODE" "selfhosted"
+                        echo -e "${GREEN}✓ Режим переключен на Selfhosted (встроенный сервер).${NC}"
+                        if systemctl is-active --quiet "$WDAVTUNNEL_SERVICE" 2>/dev/null; then
+                            systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
+                            echo -e "${GREEN}✓ Служба перезапущена.${NC}"
+                        fi
+                        sleep 1
+                        ;;
+                    2)
+                        set_wdavtunnel_prop "WEBDAV_MODE" "server"
+                        local cur_u
+                        cur_u=$(get_wdavtunnel_prop "WEBDAV_URL" "")
+                        [ -z "$cur_u" ] && set_wdavtunnel_prop "WEBDAV_URL" "https://webdav.yandex.ru"
+
+                        echo ""
+                        echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+                        echo -e "${YELLOW}║${BOLD}  ИНСТРУКЦИЯ ПО НАСТРОЙКЕ ЯНДЕКС.ДИСКА:                               ${YELLOW}║${NC}"
+                        echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+                        echo -e "  1. Перейдите в браузере: ${BOLD}https://id.yandex.ru/security${NC}"
+                        echo -e "  2. Прокрутите до блока ${CYAN}«Пароли приложений»${NC} → ${BOLD}«Создать пароль»${NC}"
+                        echo -e "  3. Выберите тип приложения: ${BOLD}«Файлы (Диск)»${NC}"
+                        echo -e "  4. Задайте имя (например: ${BOLD}wireturn${NC}) и нажмите «Создать»"
+                        echo -e "  5. Скопируйте сгенерированный пароль приложения (16 символов)"
+                        echo ""
+                        read -p "  Логин Яндекс (email или логин) [${wdt_login}]: " in_y_login
+                        [ -n "$in_y_login" ] && set_wdavtunnel_prop "WEBDAV_LOGIN" "$in_y_login"
+                        read -p "  Пароль приложения Яндекс: " in_y_pass
+                        [ -n "$in_y_pass" ] && set_wdavtunnel_prop "WEBDAV_PASSWORD" "$in_y_pass"
+                        read -p "  URL WebDAV [${wdt_url:-https://webdav.yandex.ru}]: " in_y_url
+                        [ -n "$in_y_url" ] && set_wdavtunnel_prop "WEBDAV_URL" "$in_y_url"
+
+                        chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+                        chmod 640 "$WDAVTUNNEL_CONFIG_ENV" 2>/dev/null || true
+
+                        # Обновить iptables маршрутизацию
+                        if [ "$(get_wdavtunnel_prop "ROUTING_MODE" "xray")" = "xray" ] && [ -x "$WDAVTUNNEL_ROUTING" ]; then
+                            "$WDAVTUNNEL_ROUTING" up 2>/dev/null || true
+                        fi
+
+                        if systemctl is-active --quiet "$WDAVTUNNEL_SERVICE" 2>/dev/null; then
+                            systemctl restart "$WDAVTUNNEL_SERVICE" 2>/dev/null || true
+                            echo -e "${GREEN}✓ Режим переключен на Яндекс.Диск и служба перезапущена.${NC}"
+                        else
+                            echo -e "${GREEN}✓ Режим переключен на Яндекс.Диск.${NC}"
+                        fi
+                        read -p "Нажмите Enter..."
+                        ;;
+                    *) ;;
+                esac
+                ;;
+            5)
+                echo ""
+                if [ "$wdt_mode" = "server" ]; then
+                    echo -e "  ${YELLOW}Примечание для Яндекс.Диска:${NC} используйте ${BOLD}пароль приложения${NC} (id.yandex.ru)"
+                fi
+                read -p "  Новый логин [${wdt_login}]: " new_login
+                read -p "  Новый пароль: " new_pass
                 if [ -n "$new_login" ]; then
                     set_wdavtunnel_prop "WEBDAV_LOGIN" "$new_login"
                 fi
@@ -6080,21 +6212,30 @@ EOF_CFG
                 echo -e "${GREEN}✓ Логин/пароль обновлены. Перезапустите туннель для применения.${NC}"
                 read -p "Нажмите Enter..."
                 ;;
-            5)
-                echo ""
-                read -p "  Новый порт WebDAV-сервера (текущий: ${wdt_port}): " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ]; then
-                    set_wdavtunnel_prop "WEBDAV_LISTEN" ":${new_port}"
-                    echo -e "${GREEN}✓ Порт изменён на :${new_port}. Перезапустите для применения.${NC}"
-                    # Обновить правило фаервола
-                    iptables -C INPUT -p tcp --dport "$new_port" -m comment --comment "WDAVTUNNEL_MANAGED" -j ACCEPT 2>/dev/null \
-                        || iptables -I INPUT 1 -p tcp --dport "$new_port" -m comment --comment "WDAVTUNNEL_MANAGED" -j ACCEPT 2>/dev/null || true
+            6)
+                if [ "$wdt_mode" = "server" ]; then
+                    echo ""
+                    read -p "  Новый WebDAV URL [текущий: ${wdt_url}]: " new_url
+                    if [ -n "$new_url" ]; then
+                        set_wdavtunnel_prop "WEBDAV_URL" "$new_url"
+                        echo -e "${GREEN}✓ URL изменён на ${new_url}. Перезапустите туннель для применения.${NC}"
+                    fi
                 else
-                    echo -e "${RED}  Неверный порт (1024-65535)${NC}"
+                    echo ""
+                    read -p "  Новый порт WebDAV-сервера (текущий: ${wdt_port}): " new_port
+                    if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ]; then
+                        set_wdavtunnel_prop "WEBDAV_LISTEN" ":${new_port}"
+                        echo -e "${GREEN}✓ Порт изменён на :${new_port}. Перезапустите для применения.${NC}"
+                        # Обновить правило фаервола
+                        iptables -C INPUT -p tcp --dport "$new_port" -m comment --comment "WDAVTUNNEL_MANAGED" -j ACCEPT 2>/dev/null \
+                            || iptables -I INPUT 1 -p tcp --dport "$new_port" -m comment --comment "WDAVTUNNEL_MANAGED" -j ACCEPT 2>/dev/null || true
+                    else
+                        echo -e "${RED}  Неверный порт (1024-65535)${NC}"
+                    fi
                 fi
                 read -p "Нажмите Enter..."
                 ;;
-            6)
+            7)
                 if [ "$wdt_enc" = "true" ] || [ "$wdt_enc" = "1" ]; then
                     set_wdavtunnel_prop "WEBDAV_ENC" "false"
                     echo -e "${YELLOW}Шифрование ВЫКЛЮЧЕНО. Перезапустите туннель.${NC}"
@@ -6104,7 +6245,7 @@ EOF_CFG
                 fi
                 read -p "Нажмите Enter..."
                 ;;
-            7)
+            8)
                 local cur_mode
                 cur_mode=$(get_wdavtunnel_prop "ROUTING_MODE" "xray")
                 if [ "$cur_mode" = "xray" ]; then
@@ -6120,43 +6261,44 @@ EOF_CFG
                 fi
                 read -p "Нажмите Enter..."
                 ;;
-            8)
+            9)
                 clear
                 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-                echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — URI для клиентского приложения                     ${CYAN}║${NC}"
+                echo -e "${CYAN}║${BOLD}   WebDAV Tunnel — Ссылка для подключения WireTurn                     ${CYAN}║${NC}"
                 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
                 echo ""
                 local uri_full
                 uri_full=$(get_wdavtunnel_client_uri)
-                echo -e "  ${BOLD}URI (selfhosted):${NC}"
+                echo -e "  ${BOLD}Ссылка для WireTurn (Android / Клиент):${NC}"
                 echo -e "  ${GREEN}${uri_full}${NC}"
                 echo ""
-                echo -e "  ${BOLD}Использование на клиенте:${NC}"
+                echo -e "  ${BOLD}Инструкция по подключению в WireTurn:${NC}"
+                echo -e "  1. Скопируйте ссылку выше"
+                echo -e "  2. Откройте приложение WireTurn на смартфоне"
+                echo -e "  3. Нажмите '+' (Добавить) или 'Импорт из буфера обмена'"
+                echo -e "  4. Запустите профиль туннеля"
+                echo ""
+                echo -e "  ${BOLD}Использование через CLI (Linux / Windows / macOS):${NC}"
                 echo -e "  webdav-tunnel -mode client \\"
                 echo -e "    -uri \"${uri_full}\" \\"
                 echo -e "    -socks-listen 127.0.0.1:1080"
-                echo ""
-                echo -e "  ${BOLD}Режимы:${NC}"
-                echo -e "  • SOCKS5 прокси готов на 127.0.0.1:1080"
-                echo -e "  • Настройте браузер / приложение через SOCKS5 127.0.0.1:1080"
-                # QR если доступен qrencode
                 if command -v qrencode >/dev/null 2>&1; then
                     echo ""
-                    echo -e "  ${BOLD}QR-код:${NC}"
+                    echo -e "  ${BOLD}QR-код для сканирования камерой в WireTurn:${NC}"
                     qrencode -t ANSIUTF8 "$uri_full" 2>/dev/null || true
                 fi
                 echo ""
                 read -p "Нажмите Enter для возврата..."
                 ;;
-            9)
+            10)
                 journalctl -u "$WDAVTUNNEL_SERVICE" -n 80 --no-pager 2>/dev/null || echo "(логи недоступны)"
                 read -p "Нажмите Enter..."
                 ;;
-            10)
+            11)
                 echo -e "${YELLOW}(Нажмите Ctrl+C для остановки)${NC}"
                 journalctl -u "$WDAVTUNNEL_SERVICE" -f --no-pager 2>/dev/null || true
                 ;;
-            11)
+            12)
                 clear
                 echo -e "${CYAN}==> Пересборка webdav-tunnel из исходников...${NC}"
                 export PATH=$PATH:/usr/local/go/bin
