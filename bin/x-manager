@@ -60,6 +60,13 @@ MIERU_FW_LOCK="/etc/x-manager/mieru_fw_blocked.lock"
 SNELL_FW_LOCK="/etc/x-manager/snell_fw_blocked.lock"
 WDTT_FW_LOCK="/etc/x-manager/wdtt_fw_blocked.lock"
 CSQTT_TUNNEL_LOCK="/etc/x-manager/csqtt_tunnel_blocked.lock"
+OPENFLUX_DIR="/etc/openflux"
+OPENFLUX_INSTANCES_DIR="/etc/openflux/instances"
+OPENFLUX_BIN="/usr/local/bin/openflux"
+OPENFLUX_RUNNER="/usr/local/bin/openflux-runner.sh"
+OPENFLUX_ROUTING="/usr/local/bin/openflux-routing.sh"
+OPENFLUX_SERVICE_TEMPLATE="/etc/systemd/system/openflux@.service"
+OPENFLUX_ENV="/etc/openflux/openflux.env"
 
 
 WAN_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n 1)
@@ -97,6 +104,116 @@ is_masterdns_installed() {
 
 is_dns_installed() {
     is_cottendns_installed || is_masterdns_installed
+}
+
+is_openflux_installed() {
+    [ -f "$OPENFLUX_BIN" ] || [ -f "$OPENFLUX_SERVICE_TEMPLATE" ] || [ -d "$OPENFLUX_DIR" ]
+}
+
+get_openflux_channel_prop() {
+    local ch="$1"
+    local prop="$2"
+    local default="$3"
+    local f="${OPENFLUX_INSTANCES_DIR}/${ch}.env"
+    local val=""
+    if [ -f "$f" ]; then
+        val=$(grep -oP "^${prop}=\\K.*" "$f" | tr -d '"' | tr -d "'" | head -n 1)
+    elif [ "$ch" = "1" ] && [ -f "$OPENFLUX_ENV" ]; then
+        val=$(grep -oP "^${prop}=\\K.*" "$OPENFLUX_ENV" | tr -d '"' | tr -d "'" | head -n 1)
+    fi
+    echo "${val:-$default}"
+}
+
+set_openflux_channel_prop() {
+    local ch="$1"
+    local prop="$2"
+    local val="$3"
+    mkdir -p "$OPENFLUX_INSTANCES_DIR"
+    local f="${OPENFLUX_INSTANCES_DIR}/${ch}.env"
+    [ ! -f "$f" ] && touch "$f"
+    if grep -q "^${prop}=" "$f"; then
+        sed -i "s|^${prop}=.*|${prop}=\"${val}\"|" "$f"
+    else
+        echo "${prop}=\"${val}\"" >> "$f"
+    fi
+    if [ "$ch" = "1" ]; then
+        [ ! -f "$OPENFLUX_ENV" ] && touch "$OPENFLUX_ENV"
+        if grep -q "^${prop}=" "$OPENFLUX_ENV"; then
+            sed -i "s|^${prop}=.*|${prop}=\"${val}\"|" "$OPENFLUX_ENV"
+        else
+            echo "${prop}=\"${val}\"" >> "$OPENFLUX_ENV"
+        fi
+    fi
+}
+
+get_openflux_prop() {
+    get_openflux_channel_prop "1" "$1" "$2"
+}
+
+set_openflux_prop() {
+    local prop="$1"
+    local val="$2"
+    for ch in 1 2 3 4 5 6 7 8; do
+        if [ "$prop" != "URL" ] || [ "$ch" = "1" ]; then
+            set_openflux_channel_prop "$ch" "$prop" "$val"
+        fi
+    done
+}
+
+get_openflux_counts() {
+    local active=0
+    local configured=0
+    for i in 1 2 3 4 5 6 7 8; do
+        local u=$(get_openflux_channel_prop "$i" "URL" "")
+        [ -n "$u" ] && ((configured++))
+        if systemctl is-active --quiet "openflux@$i" 2>/dev/null; then
+            ((active++))
+        fi
+    done
+    echo "${active}:${configured}"
+}
+
+get_openflux_status() {
+    if ! is_openflux_installed; then
+        echo -e "${RED}НЕ УСТАНОВЛЕН${NC}"
+        return
+    fi
+    local counts=$(get_openflux_counts)
+    local act=$(echo "$counts" | cut -d':' -f1)
+    local cfg=$(echo "$counts" | cut -d':' -f2)
+    if [ "$act" -gt 0 ]; then
+        echo -e "${GREEN}АКТИВЕН (${act}/8)${NC}"
+    elif [ "$cfg" -gt 0 ]; then
+        echo -e "${YELLOW}ОСТАНОВЛЕН (${cfg}/8)${NC}"
+    else
+        echo -e "${YELLOW}НЕ НАСТРОЕН (0/8)${NC}"
+    fi
+}
+
+get_openflux_routing() {
+    local r="xray"
+    [ -f /etc/openflux/routing.mode ] && r=$(cat /etc/openflux/routing.mode | tr -d ' \r\n')
+    if [ "$r" = "direct" ]; then
+        echo -e "${YELLOW}Direct (Прямой)${NC}"
+    else
+        echo -e "${GREEN}Xray (:12346 REDIRECT)${NC}"
+    fi
+}
+
+detect_transport_from_url() {
+    local u="$1"
+    local fallback="${2:-vyandex}"
+    if [[ "$u" =~ cloud\.mail\.ru || "$u" =~ mail\.ru/public ]]; then
+        echo "mailru"
+    elif [[ "$u" =~ disk\.yandex\.ru || "$u" =~ docs\.yandex\.ru ]]; then
+        if [ "$fallback" = "yandex" ]; then
+            echo "yandex"
+        else
+            echo "vyandex"
+        fi
+    else
+        echo "$fallback"
+    fi
 }
 
 get_server_ip() {
@@ -3447,6 +3564,16 @@ rescan_and_adopt_protocols() {
         echo -e "  ${RED}[✗] CSQTT${NC}:              Не установлен"
     fi
 
+    # OpenFlux
+    if is_openflux_installed; then
+        [ ! -L "/usr/local/bin/x-openflux" ] && ln -sf /usr/local/bin/x-manager /usr/local/bin/x-openflux 2>/dev/null || true
+        [ ! -L "/usr/local/bin/x-flux" ] && ln -sf /usr/local/bin/x-manager /usr/local/bin/x-flux 2>/dev/null || true
+        echo -e "  ${GREEN}[✓] OpenFlux (L4)${NC}:        Обнаружен! $(get_openflux_status)"
+        count=$((count + 1))
+    else
+        echo -e "  ${RED}[✗] OpenFlux (L4)${NC}:        Не установлен"
+    fi
+
     # Firewall aliases
     [ ! -L "/usr/local/bin/x-fw" ] && ln -sf /usr/local/bin/x-manager /usr/local/bin/x-fw 2>/dev/null || true
     [ ! -L "/usr/local/bin/x-firewall" ] && ln -sf /usr/local/bin/x-manager /usr/local/bin/x-firewall 2>/dev/null || true
@@ -3526,6 +3653,13 @@ view_global_status() {
     else
         printf "  %-22s %-25b\n" "DNS-Туннель:" "$(get_dns_status)"
     fi
+    if is_openflux_installed; then
+        local of_cnt=$(get_openflux_counts)
+        local of_a=$(echo "$of_cnt" | cut -d':' -f1)
+        printf "  %-22s %-25b [Активно: %s/8 | %b]\n" "OpenFlux (L4):" "$(get_openflux_status)" "$of_a" "$(get_openflux_routing)"
+    else
+        printf "  %-22s %-25b\n" "OpenFlux (L4):" "$(get_openflux_status)"
+    fi
     local xray_st="inactive"
     if systemctl is-active --quiet xray 2>/dev/null; then
         xray_st="${GREEN}active (xray.service)${NC}"
@@ -3569,6 +3703,13 @@ restart_all_services() {
     if is_dns_installed; then
         local cur_dns=$(get_active_dns_engine)
         systemctl restart "$cur_dns" 2>/dev/null || true
+    fi
+    if is_openflux_installed; then
+        for of_r in 1 2 3 4 5 6 7 8; do
+            if [ -n "$(get_openflux_channel_prop "$of_r" "URL" "")" ]; then
+                systemctl restart "openflux@$of_r" 2>/dev/null || true
+            fi
+        done
     fi
     sleep 2
     echo -e "Mieru: $(get_mieru_status)"
@@ -5442,6 +5583,558 @@ print(json.dumps(data))
 }
 
 # ==============================================================================
+# РАЗДЕЛ: УПРАВЛЕНИЕ МУЛЬТИКАНАЛЬНЫМ OPENFLUX (1-8 КАНАЛОВ, L4 gVisor Proxy)
+# ==============================================================================
+
+show_openflux_header() {
+    clear
+    local of_counts=$(get_openflux_counts)
+    local of_act=$(echo "$of_counts" | cut -d':' -f1)
+    local of_cfg=$(echo "$of_counts" | cut -d':' -f2)
+    local of_status="${RED}ОСТАНОВЛЕН${NC}"
+    [ "$of_act" -gt 0 ] && of_status="${GREEN}АКТИВНО: ${of_act}/8${NC}"
+    local of_transport=$(get_openflux_prop "TRANSPORT" "vyandex")
+    local of_codec=$(get_openflux_prop "CODEC" "legacy")
+    local of_key=$(get_openflux_prop "ENCRYPTION_KEY" "")
+    local key_status="${YELLOW}Отключено${NC}"
+    [ -n "$of_key" ] && key_status="${GREEN}Включено (AES-GCM)${NC}"
+
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          РАЗДЕЛ: УПРАВЛЕНИЕ МУЛЬТИКАНАЛЬНЫМ OPENFLUX (1-8)            ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  Сервер:     ${BOLD}${SERVER_IP}${NC}  |  Статус: ${of_status}"
+    echo -e "${CYAN}║${NC}  Режим:      ${CYAN}L4 (gVisor Userspace Proxy)${NC}  |  Маршрут: $(get_openflux_routing)"
+    echo -e "${CYAN}║${NC}  Транспорт:  ${GREEN}${of_transport}${NC} (дефолт)  |  Кодек: ${MAGENTA}${of_codec}${NC} (LZ4)"
+    echo -e "${CYAN}║${NC}  Шифрование: ${key_status}  |  Шлюз Xray: :12346 REDIRECT"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+openflux_manage_routing() {
+    show_openflux_header
+    echo -e "${BOLD}--- Настройка маршрутизации OpenFlux (L4 gVisor) ---${NC}"
+    echo -e "Текущий режим: $(get_openflux_routing)"
+    echo ""
+    echo -e "  ${YELLOW}[1]${NC} 🌐 Маршрутизация Xray (REDIRECT :12346)"
+    echo -e "  ${YELLOW}[2]${NC} ⚡ Прямой выход (Direct WAN)"
+    echo ""
+    echo -e "  ${YELLOW}[0]${NC} Назад"
+    echo ""
+    read -p "Выберите режим [0-2]: " of_rt_choice
+    case "$of_rt_choice" in
+        1)
+            mkdir -p /etc/openflux
+            echo "xray" > /etc/openflux/routing.mode
+            [ -x /usr/local/bin/openflux-routing.sh ] && /usr/local/bin/openflux-routing.sh
+            echo -e "${GREEN}✓ Маршрутизация OpenFlux: Xray (REDIRECT :12346)${NC}"
+            sleep 2
+            ;;
+        2)
+            mkdir -p /etc/openflux
+            echo "direct" > /etc/openflux/routing.mode
+            [ -x /usr/local/bin/openflux-routing.sh ] && /usr/local/bin/openflux-routing.sh
+            echo -e "${GREEN}✓ Маршрутизация OpenFlux: Прямой выход${NC}"
+            sleep 2
+            ;;
+        0) return ;;
+        *) echo "Неверный выбор"; sleep 1 ;;
+    esac
+}
+
+rebuild_openflux() {
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          СБОРКА / ОБНОВЛЕНИЕ OPENFLUX ИЗ ИСХОДНИКОВ (GO)             ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    if ! command -v go >/dev/null 2>&1 && [ ! -x /usr/local/go/bin/go ]; then
+        echo -e "${YELLOW}Установка Go компилятора...${NC}"
+        apt-get update -qq && apt-get install -y -qq golang-go git >/dev/null 2>&1 || true
+        if ! command -v go >/dev/null 2>&1; then
+            local g_arch="amd64"
+            [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ] && g_arch="arm64"
+            curl -fsSL "https://dl.google.com/go/go1.22.6.linux-${g_arch}.tar.gz" -o /tmp/go.tar.gz 2>/dev/null || true
+            if [ -s /tmp/go.tar.gz ]; then
+                rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz && rm -f /tmp/go.tar.gz
+            fi
+        fi
+    fi
+    export PATH=$PATH:/usr/local/go/bin
+
+    if ! command -v go >/dev/null 2>&1; then
+        echo -e "${RED}Ошибка: компилятор Go не найден. Установите Go и повторите попытку.${NC}"
+        read -p "Нажмите Enter..." dummy
+        return 1
+    fi
+
+    id -u openflux &>/dev/null || useradd -r -s /usr/sbin/nologin openflux 2>/dev/null || true
+    mkdir -p /etc/openflux/instances /var/log/openflux
+
+    local tmp_dir="/tmp/openflux_build_$(date +%s)"
+    rm -rf "$tmp_dir"
+    echo -e "  -> Клонирование github.com/p1neappleXpress/OpenFlux..."
+    if git clone --depth 1 https://github.com/p1neappleXpress/OpenFlux.git "$tmp_dir"; then
+        echo -e "  -> Компиляция бинарного файла OpenFlux (CGO_ENABLED=0)..."
+        (cd "$tmp_dir" && CGO_ENABLED=0 go build -v -trimpath -ldflags='-s -w' -o /usr/local/bin/openflux . && chmod +x /usr/local/bin/openflux)
+        rm -rf "$tmp_dir"
+        echo -e "${GREEN}✓ Бинарный файл /usr/local/bin/openflux успешно скомпилирован!${NC}"
+    else
+        echo -e "${RED}Ошибка клонирования репозитория OpenFlux!${NC}"
+        rm -rf "$tmp_dir"
+        read -p "Нажмите Enter..." dummy
+        return 1
+    fi
+
+    # Установка сервисов и скриптов
+    mkdir -p /usr/local/bin /etc/systemd/system
+    cat << 'EOF_RUNNER' > /usr/local/bin/openflux-runner.sh
+#!/usr/bin/env bash
+set -e
+INSTANCE="${1:-1}"
+if [ -n "$INSTANCE" ] && [ -f "/etc/openflux/instances/${INSTANCE}.env" ]; then
+    ENV_FILE="/etc/openflux/instances/${INSTANCE}.env"
+elif [ -n "$INSTANCE" ] && [ -f "$INSTANCE" ]; then
+    ENV_FILE="$INSTANCE"
+else
+    ENV_FILE="/etc/openflux/openflux.env"
+    INSTANCE="1"
+fi
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    . "$ENV_FILE"
+    set +a
+fi
+ROLE="${ROLE:-exit}"
+MODE="${MODE:-l4}"
+TRANSPORT="${TRANSPORT:-vyandex}"
+URL="${URL:-}"
+CODEC="${CODEC:-legacy}"
+DEBUG="${DEBUG:-1}"
+ENCRYPTION_KEY="${ENCRYPTION_KEY:-}"
+KEY_FILE="/etc/openflux/psk-${INSTANCE}.key"
+if [ -z "$URL" ]; then
+    echo "[OpenFlux #$INSTANCE] ВНИМАНИЕ: URL не настроен!"
+    sleep 30
+    exit 1
+fi
+ARGS=("--role=$ROLE" "--mode=$MODE" "--transport=$TRANSPORT" "--codec=$CODEC" "--url=$URL")
+[ "$DEBUG" = "1" ] || [ "$DEBUG" = "true" ] && ARGS+=("--debug")
+if [ -n "$ENCRYPTION_KEY" ]; then
+    mkdir -p /etc/openflux
+    echo -n "$ENCRYPTION_KEY" > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    ARGS+=("--encryption-key-file=$KEY_FILE")
+fi
+exec /usr/local/bin/openflux "${ARGS[@]}"
+EOF_RUNNER
+    chmod +x /usr/local/bin/openflux-runner.sh
+
+    cat << 'EOF_ROUTING' > /usr/local/bin/openflux-routing.sh
+#!/usr/bin/env bash
+set -e
+MODE_FILE="/etc/openflux/routing.mode"
+ENV_FILE="/etc/x-manager/gateways.env"
+XRAY_REDIRECT_PORT=12346
+if [ -f "$ENV_FILE" ]; then
+    val=$(grep -oP '^XRAY_REDIRECT_PORT=\K[0-9]+' "$ENV_FILE" 2>/dev/null || true)
+    [ -n "$val" ] && XRAY_REDIRECT_PORT="$val"
+fi
+MODE="xray"
+[ -f "$MODE_FILE" ] && MODE=$(cat "$MODE_FILE" | tr -d ' 
+')
+SERVER_IP=$(ip -4 addr show scope global 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+
+iptables -w 5 -t nat -D OUTPUT -m owner --uid-owner openflux -j OPENFLUX_OUT 2>/dev/null || true
+iptables -w 5 -t nat -F OPENFLUX_OUT 2>/dev/null || true
+iptables -w 5 -t nat -X OPENFLUX_OUT 2>/dev/null || true
+
+if [ "$MODE" = "xray" ]; then
+    iptables -w 5 -t nat -N OPENFLUX_OUT 2>/dev/null || true
+    iptables -w 5 -t nat -F OPENFLUX_OUT 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -d 127.0.0.0/8 -j RETURN
+    [ -n "$SERVER_IP" ] && iptables -w 5 -t nat -A OPENFLUX_OUT -d "$SERVER_IP" -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 77.88.0.0/18 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 87.250.250.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 94.100.180.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 217.69.139.0/24 -j RETURN 2>/dev/null || true
+    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -j REDIRECT --to-ports "${XRAY_REDIRECT_PORT}"
+    iptables -w 5 -t nat -C OUTPUT -m owner --uid-owner openflux -j OPENFLUX_OUT 2>/dev/null || iptables -w 5 -t nat -I OUTPUT 1 -m owner --uid-owner openflux -j OPENFLUX_OUT
+fi
+EOF_ROUTING
+    chmod +x /usr/local/bin/openflux-routing.sh
+
+    cat << 'EOF_UNIT' > /etc/systemd/system/openflux@.service
+[Unit]
+Description=OpenFlux Exit-Node Service (Channel %i • L4 Mode)
+After=network.target network-online.target xray.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=openflux
+Group=openflux
+LimitNOFILE=65535
+ExecStartPre=+/usr/local/bin/openflux-routing.sh
+ExecStart=/usr/local/bin/openflux-runner.sh %i
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+
+    systemctl daemon-reload
+    echo -e "${GREEN}✓ Системные службы и скрипты OpenFlux обновлены.${NC}"
+    read -p "Нажмите Enter для продолжения..." dummy
+}
+
+menu_openflux() {
+    if ! is_openflux_installed; then
+        clear
+        echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}║${BOLD}                    OPENFLUX НЕ УСТАНОВЛЕН                            ${YELLOW}║${NC}"
+        echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${RED}Служба OpenFlux или бинарный файл /usr/local/bin/openflux не найдены.${NC}"
+        echo ""
+        echo -e "Хотите скомпилировать и установить OpenFlux прямо сейчас? [Y/n]: "
+        read -rp "" inst_ans
+        if [[ ! "$inst_ans" =~ ^[Nn] ]]; then
+            rebuild_openflux
+        else
+            return
+        fi
+    fi
+
+    while true; do
+        show_openflux_header
+        local of_transport=$(get_openflux_prop "TRANSPORT" "vyandex")
+        local of_codec=$(get_openflux_prop "CODEC" "legacy")
+        local of_debug=$(get_openflux_prop "DEBUG" "1")
+        local of_key=$(get_openflux_prop "ENCRYPTION_KEY" "")
+
+        echo -e " ${BOLD}[КАНАЛЫ СВЯЗИ / ОБЛАЧНЫЕ ДОКУМЕНТЫ (1-8)]${NC}"
+        for ch in 1 2 3 4 5 6 7 8; do
+            local ch_url=$(get_openflux_channel_prop "$ch" "URL" "")
+            local ch_tr=$(get_openflux_channel_prop "$ch" "TRANSPORT" "$of_transport")
+            local ch_st="${YELLOW}[НЕ НАСТРОЕН]${NC}"
+            local disp_url="${YELLOW}(ссылка не задана)${NC}"
+            if [ -n "$ch_url" ]; then
+                disp_url="${CYAN}${ch_url}${NC}"
+                if systemctl is-active --quiet "openflux@$ch" 2>/dev/null; then
+                    ch_st="${GREEN}[АКТИВЕН]${NC}"
+                else
+                    ch_st="${RED}[ОСТАНОВЛЕН]${NC}"
+                fi
+            fi
+            printf "   Канал %d: %-22b [%-7s] %b\n" "$ch" "$ch_st" "$ch_tr" "$disp_url"
+        done
+        echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${YELLOW}[1]${NC} 🔗 Выбрать и настроить ссылку для канала (1-8) (Автоопределение Яндекс/Mail.ru)"
+        echo -e "  ${YELLOW}[2]${NC} ⚡ Мастер настройки всех 8 каналов подряд"
+        echo -e "  ${YELLOW}[3]${NC} 🔄 Сменить транспорт по умолчанию (1: vyandex, 2: yandex, 3: mailru)"
+        echo -e "  ${YELLOW}[4]${NC} 📦 Сменить кодек сжатия (1: legacy [LZ4], 2: batched [zstd])"
+        echo -e "  ${YELLOW}[5]${NC} 🔐 Управление сквозным ключом шифрования AES-256-GCM"
+        echo -e "  ${YELLOW}[6]${NC} 🐞 Переключить режим отладки Debug (вкл/выкл в journalctl)"
+        echo -e "  ${YELLOW}[7]${NC} 🌐 Маршрутизация трафика (Xray REDIRECT / Прямой выход)"
+        echo -e "  ${YELLOW}[8]${NC} ▶️  Запустить / перезапустить ВСЕ настроенные каналы"
+        echo -e "  ${YELLOW}[9]${NC} ⏹️  Остановить ВСЕ каналы OpenFlux"
+        echo -e "  ${YELLOW}[10]${NC} 📜 Просмотр последних 30 строк логов (выбор канала 1-8 или общий)"
+        echo -e "  ${YELLOW}[11]${NC} 🔍 Мониторинг логов в реальном времени (live follow)"
+        echo -e "  ${YELLOW}[12]${NC} 🔨 Скомпилировать / переустановить OpenFlux из репозитория"
+        echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
+        echo ""
+        read -p "Выберите действие [0-12, или c1-c8]: " of_choice
+
+        case "$of_choice" in
+            1|c1|c2|c3|c4|c5|c6|c7|c8|C1|C2|C3|C4|C5|C6|C7|C8)
+                local target_ch=""
+                if [[ "$of_choice" =~ ^[cC]([1-8])$ ]]; then
+                    target_ch="${BASH_REMATCH[1]}"
+                else
+                    echo ""
+                    read -rp "Какой канал настроить [1-8, Enter для отмены]: " target_ch
+                fi
+
+                if [[ ! "$target_ch" =~ ^[1-8]$ ]]; then
+                    echo -e "${YELLOW}Действие отменено.${NC}"
+                    sleep 1
+                    continue
+                fi
+
+                echo ""
+                echo -e "${BOLD}--- ВВОД ССЫЛКИ НА ДОКУМЕНТ ДЛЯ КАНАЛА ${target_ch} ---${NC}"
+                local cur_u=$(get_openflux_channel_prop "$target_ch" "URL" "")
+                echo "Текущая ссылка: ${cur_u:-[не задана]}"
+                echo ""
+                echo "• Введите ссылку на документ (Яндекс Диск / 360 или Облако Mail.ru) с правом редактирования."
+                echo "• Оставьте пустым и нажмите Enter, чтобы очистить ссылку (отключить канал)."
+                echo ""
+                read -rp "Новая ссылка: " new_u
+                if [ -n "$new_u" ]; then
+                    local auto_tr=$(detect_transport_from_url "$new_u" "$of_transport")
+                    echo ""
+                    echo -e "${CYAN}ℹ Выбор транспорта для Канала ${target_ch}:${NC}"
+                    echo " 1) $auto_tr (определен автоматически по ссылке)"
+                    echo " 2) vyandex (Яндекс Волга)"
+                    echo " 3) mailru  (Mail.ru Документы)"
+                    echo " 4) yandex  (Яндекс OnlyOffice)"
+                    read -rp "Транспорт [1-4, Enter для '$auto_tr']: " sel_tr
+                    local use_tr="$auto_tr"
+                    case "$sel_tr" in
+                        2) use_tr="vyandex" ;;
+                        3) use_tr="mailru" ;;
+                        4) use_tr="yandex" ;;
+                        *) use_tr="$auto_tr" ;;
+                    esac
+                    set_openflux_channel_prop "$target_ch" "URL" "$new_u"
+                    set_openflux_channel_prop "$target_ch" "ROLE" "exit"
+                    set_openflux_channel_prop "$target_ch" "MODE" "l4"
+                    set_openflux_channel_prop "$target_ch" "TRANSPORT" "$use_tr"
+                    set_openflux_channel_prop "$target_ch" "CODEC" "$of_codec"
+                    set_openflux_channel_prop "$target_ch" "DEBUG" "$of_debug"
+                    set_openflux_channel_prop "$target_ch" "ENCRYPTION_KEY" "$of_key"
+                    echo -e "${GREEN}${BOLD}✓ Ссылка для Канала ${target_ch} сохранена (Транспорт: ${use_tr})!${NC}"
+                    echo "Запуск службы openflux@${target_ch}..."
+                    systemctl enable "openflux@${target_ch}" 2>/dev/null || true
+                    systemctl restart "openflux@${target_ch}"
+                    sleep 2
+                    if systemctl is-active --quiet "openflux@${target_ch}"; then
+                        echo -e "${GREEN}${BOLD}✓ Канал ${target_ch} успешно запущен и работает!${NC}"
+                    else
+                        echo -e "${RED}${BOLD}Ошибка запуска Канала ${target_ch}! Логи:${NC}"
+                        journalctl -u "openflux@${target_ch}" -n 10 --no-pager
+                    fi
+                else
+                    echo -e "${YELLOW}Очистить ссылку и отключить Канал ${target_ch}? [y/N]: ${NC}"
+                    read -rp "" confirm_clr
+                    if [[ "$confirm_clr" =~ ^[YyДд] ]]; then
+                        set_openflux_channel_prop "$target_ch" "URL" ""
+                        systemctl stop "openflux@${target_ch}" 2>/dev/null || true
+                        systemctl disable "openflux@${target_ch}" 2>/dev/null || true
+                        echo -e "${YELLOW}Канал ${target_ch} отключен.${NC}"
+                    fi
+                fi
+                sleep 2
+                ;;
+            2)
+                echo ""
+                echo -e "${BOLD}--- МАСТЕР НАСТРОЙКИ ВСЕХ 8 КАНАЛОВ МУЛЬТИПЛЕКСИРОВАНИЯ ---${NC}"
+                echo "Введите по очереди ссылки на 8 документов Яндекс / Mail.ru (с правом редактирования)."
+                echo "Транспорт (vyandex / mailru) определяется автоматически по формату ссылки."
+                echo "Нажмите Enter без ввода, чтобы оставить текущую ссылку без изменений."
+                echo ""
+                for m_ch in 1 2 3 4 5 6 7 8; do
+                    local cur_m_u=$(get_openflux_channel_prop "$m_ch" "URL" "")
+                    local cur_m_tr=$(get_openflux_channel_prop "$m_ch" "TRANSPORT" "$of_transport")
+                    echo -e "${BOLD}Канал $m_ch${NC} (текущий: ${cur_m_u:-[не задан]} [${cur_m_tr}]):"
+                    read -rp "  Введите URL: " in_u
+                    if [ -n "$in_u" ]; then
+                        local auto_m_tr=$(detect_transport_from_url "$in_u" "$of_transport")
+                        set_openflux_channel_prop "$m_ch" "URL" "$in_u"
+                        set_openflux_channel_prop "$m_ch" "ROLE" "exit"
+                        set_openflux_channel_prop "$m_ch" "MODE" "l4"
+                        set_openflux_channel_prop "$m_ch" "TRANSPORT" "$auto_m_tr"
+                        set_openflux_channel_prop "$m_ch" "CODEC" "$of_codec"
+                        set_openflux_channel_prop "$m_ch" "DEBUG" "$of_debug"
+                        set_openflux_channel_prop "$m_ch" "ENCRYPTION_KEY" "$of_key"
+                        systemctl enable "openflux@${m_ch}" 2>/dev/null || true
+                        systemctl restart "openflux@${m_ch}"
+                        echo -e "  ${GREEN}✓ Канал $m_ch обновлен и запущен (${auto_m_tr}).${NC}"
+                    fi
+                done
+                echo ""
+                echo -e "${GREEN}${BOLD}✓ Настройка завершена!${NC}"
+                sleep 2
+                ;;
+            3)
+                echo ""
+                echo -e "${BOLD}--- ВЫБОР РЕЖИМА ТРАНСПОРТА ДЛЯ ВСЕХ КАНАЛОВ ---${NC}"
+                echo "Текущий транспорт по умолчанию: ${of_transport}"
+                echo ""
+                echo " 1) Яндекс Волга (vyandex - современный редактор Яндекс 360 / Диск, рекомендуется)"
+                echo " 2) Яндекс.Документы (yandex - классический OnlyOffice редактор)"
+                echo " 3) Mail.ru Документы (mailru - docs.datacloudmail.ru, Облако Mail.ru)"
+                read -rp "Выберите транспорт [1-3]: " tr_choice
+                local new_tr=""
+                case "$tr_choice" in
+                    1) new_tr="vyandex" ;;
+                    2) new_tr="yandex" ;;
+                    3) new_tr="mailru" ;;
+                    *) echo -e "${YELLOW}Без изменений.${NC}" ;;
+                esac
+                if [ -n "$new_tr" ]; then
+                    set_openflux_prop "TRANSPORT" "$new_tr"
+                    echo -e "${GREEN}✓ Транспорт установлен: ${new_tr}${NC}"
+                fi
+                for r_ch in 1 2 3 4 5 6 7 8; do
+                    if [ -n "$(get_openflux_channel_prop "$r_ch" "URL" "")" ] && systemctl is-active --quiet "openflux@$r_ch"; then
+                        systemctl restart "openflux@$r_ch"
+                    fi
+                done
+                sleep 2
+                ;;
+            4)
+                echo ""
+                echo -e "${BOLD}--- ВЫБОР КОДЕКА СЖАТИЯ ДЛЯ ВСЕХ КАНАЛОВ ---${NC}"
+                echo "Текущий кодек: ${of_codec}"
+                echo ""
+                echo " 1) legacy (LZ4 - ОБЯЗАТЕЛЕН для мобильных клиентов Android и iOS!)"
+                echo " 2) batched (zstd + coalescing - для десктопного OpenFlux CLI)"
+                read -rp "Выберите кодек [1-2]: " cod_choice
+                case "$cod_choice" in
+                    1) set_openflux_prop "CODEC" "legacy"; echo -e "${GREEN}✓ Кодек установлен: legacy (LZ4)${NC}" ;;
+                    2) set_openflux_prop "CODEC" "batched"; echo -e "${GREEN}✓ Кодек установлен: batched (zstd)${NC}" ;;
+                    *) echo -e "${YELLOW}Без изменений.${NC}" ;;
+                esac
+                for r_ch in 1 2 3 4 5 6 7 8; do
+                    if [ -n "$(get_openflux_channel_prop "$r_ch" "URL" "")" ] && systemctl is-active --quiet "openflux@$r_ch"; then
+                        systemctl restart "openflux@$r_ch"
+                    fi
+                done
+                sleep 2
+                ;;
+            5)
+                echo ""
+                echo -e "${BOLD}--- УПРАВЛЕНИЕ СКВОЗНЫМ ШИФРОВАНИЕМ (AES-256-GCM) ---${NC}"
+                if [ -n "$of_key" ]; then
+                    echo -e "Текущий ключ шифрования: ${GREEN}${of_key}${NC}"
+                else
+                    echo -e "Шифрование: ${YELLOW}Отключено (трафик защищен стандартным TLS облачного сервиса)${NC}"
+                fi
+                echo ""
+                echo " 1) Ввести свой ключ шифрования (парольную фразу)"
+                echo " 2) Сгенерировать случайный безопасный hex-ключ"
+                echo " 3) Отключить дополнительное шифрование (очистить ключ)"
+                read -rp "Выберите действие [1-3]: " key_choice
+                case "$key_choice" in
+                    1)
+                        read -rp "Введите секретный ключ/пароль: " user_key
+                        if [ -n "$user_key" ]; then
+                            set_openflux_prop "ENCRYPTION_KEY" "$user_key"
+                            echo -e "${GREEN}✓ Ключ шифрования сохранен для всех 8 каналов!${NC}"
+                        fi
+                        ;;
+                    2)
+                        gen_key=$(openssl rand -hex 16 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
+                        set_openflux_prop "ENCRYPTION_KEY" "$gen_key"
+                        echo -e "${GREEN}✓ Сгенерирован новый ключ шифрования:${NC}"
+                        echo -e "   ${BOLD}${CYAN}${gen_key}${NC}"
+                        echo -e "${YELLOW}ВАЖНО: Скопируйте этот ключ и вставьте в поле Encryption Key на клиенте!${NC}"
+                        ;;
+                    3)
+                        set_openflux_prop "ENCRYPTION_KEY" ""
+                        rm -f /etc/openflux/psk*.key 2>/dev/null || true
+                        echo -e "${GREEN}✓ Дополнительное шифрование отключено.${NC}"
+                        ;;
+                    *) echo -e "${YELLOW}Без изменений.${NC}" ;;
+                esac
+                for r_ch in 1 2 3 4 5 6 7 8; do
+                    if [ -n "$(get_openflux_channel_prop "$r_ch" "URL" "")" ] && systemctl is-active --quiet "openflux@$r_ch"; then
+                        systemctl restart "openflux@$r_ch"
+                    fi
+                done
+                sleep 3
+                ;;
+            6)
+                echo ""
+                if [ "$of_debug" = "1" ] || [ "$of_debug" = "true" ]; then
+                    set_openflux_prop "DEBUG" "0"
+                    echo -e "${YELLOW}✓ Режим отладки отключен (тихий режим в journalctl).${NC}"
+                else
+                    set_openflux_prop "DEBUG" "1"
+                    echo -e "${GREEN}✓ Режим отладки включен (подробные логи со статистикой пакетов).${NC}"
+                fi
+                for r_ch in 1 2 3 4 5 6 7 8; do
+                    if [ -n "$(get_openflux_channel_prop "$r_ch" "URL" "")" ] && systemctl is-active --quiet "openflux@$r_ch"; then
+                        systemctl restart "openflux@$r_ch"
+                    fi
+                done
+                sleep 2
+                ;;
+            7)
+                openflux_manage_routing
+                ;;
+            8)
+                echo ""
+                echo "Запуск / перезапуск всех настроенных каналов OpenFlux..."
+                local started=0
+                for r_ch in 1 2 3 4 5 6 7 8; do
+                    local u=$(get_openflux_channel_prop "$r_ch" "URL" "")
+                    if [ -n "$u" ]; then
+                        systemctl enable "openflux@$r_ch" 2>/dev/null || true
+                        systemctl restart "openflux@$r_ch"
+                        if systemctl is-active --quiet "openflux@$r_ch"; then
+                            echo -e "  [${GREEN}АКТИВЕН${NC}] Канал $r_ch"
+                            ((started++))
+                        else
+                            echo -e "  [${RED}ОШИБКА${NC}] Канал $r_ch"
+                        fi
+                    else
+                        echo -e "  [${YELLOW}ПРОПУЩЕН${NC}] Канал $r_ch (ссылка не задана)"
+                    fi
+                done
+                echo ""
+                echo -e "Успешно запущено каналов: ${BOLD}${started}${NC}"
+                read -rp "Нажмите Enter для продолжения..." dummy
+                ;;
+            9)
+                echo ""
+                echo "Остановка всех каналов OpenFlux..."
+                systemctl stop openflux@1 openflux@2 openflux@3 openflux@4 openflux@5 openflux@6 openflux@7 openflux@8 2>/dev/null || true
+                echo -e "${YELLOW}✓ Все каналы OpenFlux (1-8) остановлены.${NC}"
+                sleep 2
+                ;;
+            10)
+                echo ""
+                echo -e "${BOLD}--- ВЫБОР КАНАЛА ДЛЯ ПРОСМОТРА ЛОГОВ (1-8) ---${NC}"
+                for l_i in 1 2 3 4 5 6 7 8; do
+                    echo " $l_i) Логи Канала $l_i"
+                done
+                echo " A) Общие логи всех каналов вместе"
+                read -rp "Выберите вариант [1-8, A]: " log_ch
+                echo ""
+                case "$log_ch" in
+                    [1-8])
+                        echo -e "${BOLD}--- ПОСЛЕДНИЕ 30 СТРОК ЛОГОВ КАНАЛА ${log_ch} ---${NC}"
+                        journalctl -u "openflux@${log_ch}" -n 30 --no-pager
+                        ;;
+                    [AaФф])
+                        echo -e "${BOLD}--- ПОСЛЕДНИЕ 40 СТРОК ЛОГОВ ВСЕХ КАНАЛОВ ---${NC}"
+                        journalctl -u "openflux@*" -n 40 --no-pager
+                        ;;
+                    *)
+                        echo "Неверный выбор."
+                        ;;
+                esac
+                echo ""
+                read -rp "Нажмите Enter для возврата..." dummy
+                ;;
+            11)
+                echo ""
+                read -rp "Мониторить конкретный канал [1-8] или все сразу [A]? " fol_ch
+                case "$fol_ch" in
+                    [1-8])
+                        echo -e "${BOLD}--- МОНИТОРИНГ КАНАЛА ${fol_ch} (Ctrl+C для выхода) ---${NC}"
+                        journalctl -u "openflux@${fol_ch}" -f
+                        ;;
+                    *)
+                        echo -e "${BOLD}--- МОНИТОРИНГ ВСЕХ КАНАЛОВ (Ctrl+C для выхода) ---${NC}"
+                        journalctl -u "openflux@*" -f
+                        ;;
+                esac
+                ;;
+            12)
+                rebuild_openflux
+                ;;
+            0) return ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
 # ГЛАВНОЕ МЕНЮ ДИСПЕТЧЕРА
 # ==============================================================================
 main_hub() {
@@ -5474,6 +6167,9 @@ main_hub() {
         exit 0
     elif [ "$invoked" = "x-sub" ] || [ "$invoked" = "x-tuna" ] || [ "$invoked" = "x-subscriptions" ]; then
         menu_subscriptions
+        exit 0
+    elif [ "$invoked" = "x-openflux" ] || [ "$invoked" = "x-flux" ]; then
+        menu_openflux
         exit 0
     fi
 
@@ -5527,11 +6223,20 @@ main_hub() {
             echo -e "${CYAN}║${NC}  ${BOLD}[5] 🌐 DNS-Туннель (MasterDnsVPN)${NC}  -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}║${NC}"
+        if is_openflux_installed; then
+            local of_cnt=$(get_openflux_counts)
+            local of_a=$(echo "$of_cnt" | cut -d':' -f1)
+            echo -e "${CYAN}║${NC}  ${BOLD}[6] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> $(get_openflux_status)"
+            echo -e "${CYAN}║${NC}      Режим: L4 (gVisor)  |  Каналы: 1-8 (Яндекс/Mail.ru) | Маршрут: $(get_openflux_routing)"
+        else
+            echo -e "${CYAN}║${NC}  ${BOLD}[6] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+        fi
+        echo -e "${CYAN}║${NC}"
         if is_sub_server_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[6] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
+            echo -e "${CYAN}║${NC}  ${BOLD}[7] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
             echo -e "${CYAN}║${NC}      API: http://127.0.0.1:22217   |  Порт: :22217 [127.0.0.1] 🔒"
         else
-            echo -e "${CYAN}║${NC}  ${BOLD}[6] 📋 Подписки TUNA${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
+            echo -e "${CYAN}║${NC}  ${BOLD}[7] 📋 Подписки TUNA${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
         fi
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
@@ -5541,29 +6246,32 @@ main_hub() {
         echo -e "  ${CYAN}${BOLD}[4]${NC} 🔒 ${BOLD}Управление CSQTT${NC} (Защита веб-панели, туннель фаервол, логин/пароли)"
         echo -e "  ${YELLOW}${BOLD}[5]${NC} 🌐 ${BOLD}Управление DNS-туннелями${NC} (MasterDnsVPN / CottenDNS, stormdns://, WAN)"
         echo ""
-        echo -e "  ${RED}${BOLD}[6]${NC} 🛡️  ${BOLD}Центр управления фаерволом портов${NC} (Включение/Выключение протоколов, Локдаун)"
-        echo -e "  ${BOLD}[7]${NC} 📊 Сводный статус всех служб и портов сервера"
-        echo -e "  ${BOLD}[8]${NC} 🔄 Перезапустить все сервисы (Mieru + Snell + WDTT + CSQTT + DNS)"
-        echo -e "  ${BOLD}[9]${NC} 🔍 ${BOLD}Пересканировать и подхватить протоколы${NC} (Автоопределение установленных служб)"
-        echo -e "  ${GREEN}${BOLD}[10]${NC} ⚙️  ${BOLD}Оптимизация и безопасность${NC} (DNS с пингом, BBR/буферы под RAM, Swap 2/4G, Fail2ban)"
-        echo -e "  ${PURPLE}${BOLD}[11]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
-        echo -e "  ${CYAN}${BOLD}[12]${NC} 📋 ${BOLD}Сервер подписок TUNA${NC} (Профили, выдача Base64-ссылок, ротация токенов)"
+        echo -e "  ${YELLOW}${BOLD}[6]${NC} 📡 ${BOLD}Управление OpenFlux${NC} (Мультиплекс 1-8 • Яндекс/Mail.ru • Режим L4)"
+        echo ""
+        echo -e "  ${RED}${BOLD}[7]${NC} 🛡️  ${BOLD}Центр управления фаерволом портов${NC} (Включение/Выключение протоколов, Локдаун)"
+        echo -e "  ${BOLD}[8]${NC} 📊 Сводный статус всех служб и портов сервера"
+        echo -e "  ${BOLD}[9]${NC} 🔄 Перезапустить все сервисы (Mieru + Snell + WDTT + CSQTT + DNS + OpenFlux)"
+        echo -e "  ${BOLD}[10]${NC} 🔍 ${BOLD}Пересканировать и подхватить протоколы${NC} (Автоопределение установленных служб)"
+        echo -e "  ${GREEN}${BOLD}[11]${NC} ⚙️  ${BOLD}Оптимизация и безопасность${NC} (DNS с пингом, BBR/буферы под RAM, Swap 2/4G, Fail2ban)"
+        echo -e "  ${PURPLE}${BOLD}[12]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
+        echo -e "  ${CYAN}${BOLD}[13]${NC} 📋 ${BOLD}Сервер подписок TUNA${NC} (Профили, выдача Base64-ссылок, ротация токенов)"
         echo -e "  ${BOLD}[0]${NC} 🚪 Выход"
         echo ""
-        read -p "Выберите раздел [0-12]: " top_choice
+        read -p "Выберите раздел [0-13]: " top_choice
         case "$top_choice" in
             1) menu_mieru ;;
             2) menu_snell ;;
             3) menu_wdtt ;;
             4) menu_csqtt ;;
             5) menu_dns ;;
-            6) menu_firewall ;;
-            7) view_global_status ;;
-            8) restart_all_services ;;
-            9) rescan_and_adopt_protocols ;;
-            10) menu_system_opt ;;
-            11) menu_ssl ;;
-            12) menu_subscriptions ;;
+            6) menu_openflux ;;
+            7) menu_firewall ;;
+            8) view_global_status ;;
+            9) restart_all_services ;;
+            10) rescan_and_adopt_protocols ;;
+            11) menu_system_opt ;;
+            12) menu_ssl ;;
+            13) menu_subscriptions ;;
             0) clear; exit 0 ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac

@@ -36,7 +36,7 @@ fi
 clear
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║${BOLD}          X-MANAGER: УНИВЕРСАЛЬНЫЙ СЕТЕВОЙ ИНСТАЛЛЯТОР         ${CYAN}║${NC}"
-echo -e "${CYAN}║${NC}     Snell v5 (Hybrid) | Mieru Anti-TSPU | WDTT (qwdtt) | Xray-core  ${CYAN}║${NC}"
+echo -e "${CYAN}║${NC}  Snell v5 | Mieru Anti-TSPU | WDTT (qwdtt) | OpenFlux L4 | Xray-core ${CYAN}║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -83,6 +83,7 @@ MIERU_PASS="mita_pass_$(openssl rand -hex 4 2>/dev/null || echo "2026")"
 MIERU_ENTROPY_MODE="LOW_ENTROPY_MODE_48"
 MIERU_MASK_ROTATION="LOW_ENTROPY_MASK_ROTATE_RIGHT_7"
 
+INSTALL_OPENFLUX="yes"
 DEFAULT_ROUTING="xray"
 
 # Если ручной режим — задаем вопросы
@@ -113,6 +114,11 @@ if [ "$MODE" = "manual" ]; then
         [ -n "$custom_m_p" ] && MIERU_PASS="$custom_m_p"
     fi
 
+    # OpenFlux
+    echo ""
+    read -p "Установить OpenFlux (8-канальный L4 туннель через Яндекс/Mail.ru)? [Y/n]: " of_ans
+    [ "$of_ans" = "n" ] || [ "$of_ans" = "N" ] && INSTALL_OPENFLUX="no"
+
     # Маршрутизация по умолчанию
     echo ""
     echo -e "${BOLD}Выберите режим маршрутизации по умолчанию:${NC}"
@@ -128,7 +134,7 @@ export DEBIAN_FRONTEND=noninteractive
 echo -e "  -> Обновление списков пакетов (apt-get update)..."
 apt-get update -qq || true
 echo -e "  -> Проверка необходимых утилит (curl, wget, jq, unzip, python3...)..."
-apt-get install -y -qq curl wget jq unzip iptables qrencode openssl python3 iproute2 >/dev/null 2>&1 || true
+apt-get install -y -qq curl wget jq unzip iptables qrencode openssl python3 iproute2 git golang-go >/dev/null 2>&1 || apt-get install -y -qq curl wget jq unzip iptables qrencode openssl python3 iproute2 git >/dev/null 2>&1 || true
 echo -e "  ✓ Системные утилиты готовы"
 
 echo -e "${CYAN}==> Шаг 2: Анализ и настройка шлюзов ядра Xray (3X-UI)...${NC}"
@@ -731,8 +737,95 @@ else
     echo -e "  ✓ WDTT маршрутизация: Прямой выход"
 fi
 
+# Установка OpenFlux (8 каналов, gVisor L4, Яндекс / Mail.ru Документы)
+if [ "$INSTALL_OPENFLUX" = "yes" ]; then
+    echo -e "${CYAN}==> Шаг 6: Установка OpenFlux (8 каналов, gVisor L4, Яндекс/Mail.ru)...${NC}"
+    id -u openflux &>/dev/null || useradd -r -s /usr/sbin/nologin openflux 2>/dev/null || true
+    mkdir -p /etc/openflux/instances /var/log/openflux
+    
+    # Проверка компилятора Go
+    if ! command -v go >/dev/null 2>&1 && [ ! -x /usr/local/go/bin/go ]; then
+        echo -e "  -> Установка компилятора Go для сборки OpenFlux..."
+        apt-get install -y -qq golang-go >/dev/null 2>&1 || true
+        if ! command -v go >/dev/null 2>&1; then
+            g_arch="amd64"
+            [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ] && g_arch="arm64"
+            curl -fsSL "https://dl.google.com/go/go1.22.6.linux-${g_arch}.tar.gz" -o /tmp/go.tar.gz 2>/dev/null || true
+            if [ -s /tmp/go.tar.gz ]; then
+                rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz && rm -f /tmp/go.tar.gz
+            fi
+        fi
+    fi
+    export PATH=$PATH:/usr/local/go/bin
+
+    # Компиляция OpenFlux если бинарник отсутствует
+    if [ ! -f "/usr/local/bin/openflux" ]; then
+        if command -v go >/dev/null 2>&1; then
+            tmp_of="/tmp/openflux_build_$(date +%s)"
+            rm -rf "$tmp_of"
+            echo -e "  -> Клонирование и компиляция p1neappleXpress/OpenFlux..."
+            if git clone --depth 1 https://github.com/p1neappleXpress/OpenFlux.git "$tmp_of" >/dev/null 2>&1; then
+                (cd "$tmp_of" && CGO_ENABLED=0 go build -v -trimpath -ldflags='-s -w' -o /usr/local/bin/openflux . && chmod +x /usr/local/bin/openflux)
+                rm -rf "$tmp_of"
+                echo -e "  ✓ /usr/local/bin/openflux успешно скомпилирован"
+            else
+                echo -e "${YELLOW}  ! Не удалось клонировать OpenFlux. Скомпилировать можно позже через x-manager.${NC}"
+                rm -rf "$tmp_of"
+            fi
+        else
+            echo -e "${YELLOW}  ! Компилятор Go недоступен. Сборку OpenFlux можно выполнить позже через x-manager.${NC}"
+        fi
+    else
+        echo -e "  ✓ Бинарный файл /usr/local/bin/openflux уже установлен"
+    fi
+
+    # Установка runner и routing скриптов
+    SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    if [ -f "$SCRIPT_DIR/scripts/openflux-routing.sh" ]; then
+        cp -f "$SCRIPT_DIR/scripts/openflux-routing.sh" /usr/local/bin/openflux-routing.sh
+    else
+        curl -fsSL -o /usr/local/bin/openflux-routing.sh "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/openflux-routing.sh?v=$(date +%s)" 2>/dev/null || true
+    fi
+    chmod +x /usr/local/bin/openflux-routing.sh 2>/dev/null || true
+
+    if [ -f "$SCRIPT_DIR/scripts/openflux-runner.sh" ]; then
+        cp -f "$SCRIPT_DIR/scripts/openflux-runner.sh" /usr/local/bin/openflux-runner.sh
+    else
+        curl -fsSL -o /usr/local/bin/openflux-runner.sh "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/openflux-runner.sh?v=$(date +%s)" 2>/dev/null || true
+    fi
+    chmod +x /usr/local/bin/openflux-runner.sh 2>/dev/null || true
+
+    if [ -f "$SCRIPT_DIR/systemd/openflux@.service" ]; then
+        cp -f "$SCRIPT_DIR/systemd/openflux@.service" /etc/systemd/system/openflux@.service
+    else
+        curl -fsSL -o /etc/systemd/system/openflux@.service "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/systemd/openflux@.service?v=$(date +%s)" 2>/dev/null || true
+    fi
+
+    # Инициализация конфигураций 8 каналов
+    for ch in 1 2 3 4 5 6 7 8; do
+        cf="/etc/openflux/instances/${ch}.env"
+        if [ ! -f "$cf" ]; then
+            cat << EOF_CH > "$cf"
+ROLE="exit"
+MODE="l4"
+TRANSPORT="vyandex"
+CODEC="legacy"
+DEBUG="1"
+URL=""
+EOF_CH
+        fi
+    done
+    echo "xray" > /etc/openflux/routing.mode 2>/dev/null || true
+    chown -R openflux:openflux /etc/openflux 2>/dev/null || true
+
+    # Применение правил маршрутизации
+    [ -x /usr/local/bin/openflux-routing.sh ] && /usr/local/bin/openflux-routing.sh 2>/dev/null || true
+    systemctl daemon-reload
+    echo -e "  ✓ 8 каналов OpenFlux инициализированы (L4, Xray REDIRECT :${XRAY_REDIRECT_PORT})"
+fi
+
 # Настройка безопасности (Блокировка шлюзов извне и открытие портов протоколов)
-echo -e "${CYAN}==> Шаг 6: Настройка сетевой безопасности...${NC}"
+echo -e "${CYAN}==> Шаг 7: Настройка сетевой безопасности...${NC}"
 iptables -I INPUT 1 -i "$WAN_IF" -p tcp --dport "${XRAY_TPROXY_PORT}" -j DROP 2>/dev/null || true
 iptables -I INPUT 1 -i "$WAN_IF" -p udp --dport "${XRAY_TPROXY_PORT}" -j DROP 2>/dev/null || true
 iptables -I INPUT 1 -i "$WAN_IF" -p tcp --dport "${XRAY_REDIRECT_PORT}" -j DROP 2>/dev/null || true
@@ -757,7 +850,7 @@ if command -v csqtt >/dev/null 2>&1 || [ -f "/etc/systemd/system/csqtt.service" 
 fi
 
 # Проверка SSL сертификатов
-echo -e "${CYAN}==> Шаг 7: Автоопределение SSL-сертификатов (3X-UI / /root/cert / Let's Encrypt)...${NC}"
+echo -e "${CYAN}==> Шаг 8: Автоопределение SSL-сертификатов (3X-UI / /root/cert / Let's Encrypt)...${NC}"
 existing_cert=""
 for c_cand in /etc/x-ui/server.crt /etc/x-ui/cert.pem /root/cert/*/*.pem /root/cert/*/*.cer /root/cert/fullchain.pem /etc/letsencrypt/live/*/fullchain.pem /root/.acme.sh/*_ecc/fullchain.cer; do
     if [ -f "$c_cand" ]; then
@@ -772,7 +865,7 @@ else
 fi
 
 # Установка диспетчера x-manager
-echo -e "${CYAN}==> Шаг 8: Развертывание диспетчера x-manager...${NC}"
+echo -e "${CYAN}==> Шаг 9: Развертывание диспетчера x-manager...${NC}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [ -f "$SCRIPT_DIR/bin/x-manager" ]; then
     echo -e "  -> Установка x-manager из локального каталога..."
@@ -798,9 +891,11 @@ ln -sf /usr/local/bin/x-manager /usr/local/bin/x-fw
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-firewall
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-sub
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-tuna
+ln -sf /usr/local/bin/x-manager /usr/local/bin/x-openflux
+ln -sf /usr/local/bin/x-manager /usr/local/bin/x-flux
 echo -e "  ✓ Диспетчер x-manager успешно развернут"
 
-echo -e "${CYAN}==> Шаг 9: Развертывание сервера подписок TUNA (tuna-subscriptions)...${NC}"
+echo -e "${CYAN}==> Шаг 10: Развертывание сервера подписок TUNA (tuna-subscriptions)...${NC}"
 if [ -f "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" ]; then
     bash "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" || true
 else
@@ -823,6 +918,7 @@ echo -e "${GREEN}${BOLD}══════════════════�
 echo ""
 echo -e "${BOLD}Для входа в интерактивное меню запустите:${NC}"
 echo -e "  ${CYAN}${BOLD}x-manager${NC}   - Главный центр управления всеми службами"
+echo -e "  ${YELLOW}${BOLD}x-openflux${NC}  - Раздел управления OpenFlux (Яндекс/Mail.ru 8 каналов)"
 echo -e "  ${PURPLE}${BOLD}x-sub${NC}       - Раздел управления сервером подписок TUNA (tuna-subscriptions)"
 echo -e "  ${YELLOW}x-snell${NC}     - Раздел управления Snell v5"
 echo -e "  ${YELLOW}x-mieru${NC}     - Раздел управления Mieru"
@@ -872,6 +968,14 @@ print(f'qwdtt://config?name={urllib.parse.quote_plus(name)}&peer={ip}%3A{port}&h
     echo -e "  • Профиль:  ${prof_name}"
     echo -e "  • Пароль:   ${GREEN}${wdtt_pass}${NC}"
     echo -e "  • Ссылка:   ${CYAN}${qwdtt_link}${NC}"
+    echo ""
+fi
+if [ "$INSTALL_OPENFLUX" = "yes" ]; then
+    echo -e "${BOLD}Параметры OpenFlux (Мультиплексирование 1-8):${NC}"
+    echo -e "  • Режим:      L4 (gVisor Userspace Proxy)"
+    echo -e "  • Транспорт:  Мульти-транспорт (Яндекс Волга / Mail.ru Документы)"
+    echo -e "  • Каналы:     8 независимых каналов (/etc/openflux/instances/1..8.env)"
+    echo -e "  • Управление: ${CYAN}x-openflux${NC} или в меню ${CYAN}x-manager [6]${NC}"
     echo ""
 fi
 echo -e "${GREEN}Все службы запущены и работают в фоновом режиме.${NC}"

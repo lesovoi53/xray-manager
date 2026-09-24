@@ -64,7 +64,15 @@
 
 ---
 
-## 8. TUNA Subscription Server (Сервер подписок)
+## 8. OpenFlux (Multi-Channel Covert Transport Tunnel)
+* **Назначение:** Высокозащищённый мультиплексный транспортный туннель через документы облачных платформ (Яндекс.Диск/360 Волга, OnlyOffice, Облако Mail.ru) в режиме L4 (userspace gVisor proxy) с одновременной поддержкой до 8 независимых каналов, автоматическим определением провайдера по ссылке и сквозным шифрованием AES-256-GCM.
+* **Оригинальный репозиторий:** [p1neappleXpress/OpenFlux](https://github.com/p1neappleXpress/OpenFlux)
+* **Автор:** p1neappleXpress
+* **Лицензия:** **MIT License / Open Source**
+
+---
+
+## 9. TUNA Subscription Server (Сервер подписок)
 * **Назначение:** Автономный демон раздачи Base64-подписок с поддержкой нескольких узлов каждого протокола, кастомных имен подключений, защиты токенами SHA-256 и базы SQLite WAL.
 * **Компонент:** Встроенный модуль X-Manager (`tuna-subscriptions`)
 * **Лицензия:** **MIT License**
