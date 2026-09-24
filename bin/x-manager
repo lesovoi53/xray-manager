@@ -6719,10 +6719,14 @@ EOF_CFG
                     menu_webdav_tunnel_pool
                 else
                     echo ""
-                    if [[ "$wdt_url" =~ mail\.ru ]]; then
-                        echo -e "  ${YELLOW}Примечание для Mail.ru:${NC} используйте ${BOLD}пароль для внешних приложений${NC} (account.mail.ru)"
-                    elif [[ "$wdt_url" =~ yandex ]]; then
-                        echo -e "  ${YELLOW}Примечание для Яндекс.Диска:${NC} используйте ${BOLD}пароль приложения${NC} (id.yandex.ru)"
+                    if [ "$wdt_mode" = "server" ]; then
+                        if [[ "$wdt_url" =~ mail\.ru ]]; then
+                            echo -e "  ${YELLOW}Примечание для Mail.ru:${NC} используйте ${BOLD}пароль для внешних приложений${NC} (account.mail.ru)"
+                        elif [[ "$wdt_url" =~ yandex ]]; then
+                            echo -e "  ${YELLOW}Примечание для Яндекс.Диска:${NC} используйте ${BOLD}пароль приложения${NC} (id.yandex.ru)"
+                        fi
+                    else
+                        echo -e "  ${CYAN}Настройка встроенного сервера WebDAV на VPS (:8443):${NC}"
                     fi
                     read -p "  Новый логин [${wdt_login}]: " new_login
                     read -p "  Новый пароль: " new_pass
