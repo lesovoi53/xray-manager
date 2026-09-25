@@ -6065,6 +6065,405 @@ print(json.dumps(data, ensure_ascii=False, indent=2))
     done
 }
 
+attach_webdav_conn_to_user() {
+    local SUB_API="http://127.0.0.1:22217"
+    local uid="$1"
+    local cid="$2"
+    local u_nick="$3"
+    [ -z "$uid" ] || [ -z "$cid" ] && return 1
+
+    local u_cfg=$(curl -s "${SUB_API}/api/users/${uid}/webdav" 2>/dev/null || echo "{}")
+    local cur_conns=$(echo "$u_cfg" | jq -c '(.connections // [])' 2>/dev/null || echo "[]")
+
+    local new_payload=$(python3 -c '
+import json, sys
+cur_conns = json.loads(sys.argv[1])
+cur_ids = [c["id"] for c in cur_conns if isinstance(c, dict) and "id" in c]
+target_id = sys.argv[2].strip()
+if target_id not in cur_ids:
+    if len(cur_ids) >= 8:
+        print(json.dumps({"error": "У пользователя уже выбрано максимальное количество подключений (8)."}))
+    else:
+        cur_ids.append(target_id)
+        print(json.dumps({"connection_ids": cur_ids, "enabled": True}))
+else:
+    print(json.dumps({"connection_ids": cur_ids, "enabled": True}))
+' "$cur_conns" "$cid")
+
+    local err=$(echo "$new_payload" | jq -r '.error // empty' 2>/dev/null || echo "")
+    if [ -n "$err" ]; then
+        echo -e "${RED}${err}${NC}"
+        return 1
+    fi
+
+    local resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}/webdav" \
+        -H "Content-Type: application/json" \
+        -d "$new_payload" 2>/dev/null || echo "")
+    local r_err=$(echo "$resp" | jq -r '.error // empty' 2>/dev/null || echo "")
+    if [ -n "$r_err" ]; then
+        echo -e "${RED}Ошибка привязки к пользователю: ${r_err}${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}✓ Подключение успешно привязано к пользователю '${u_nick}' и активировано!${NC}"
+    return 0
+}
+
+wizard_import_server_webdav() {
+    local SUB_API="http://127.0.0.1:22217"
+    local target_uid="$1"
+    local target_unick="$2"
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ИМПОРТ ИЗ АКТИВНОЙ КОНФИГУРАЦИИ СЕРВЕРА WEBDAV              ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}\n"
+    echo -e "${CYAN}[*] Чтение текущих настроек /etc/webdav-tunnel/config.env...${NC}"
+    local imp_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-server" \
+        -H "Content-Type: application/json" \
+        -d "{\"save\": false, \"server_ip\": \"${SERVER_IP}\"}" 2>/dev/null || echo "")
+    local imp_ok=$(echo "$imp_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
+    if [ "$imp_ok" != "true" ]; then
+        local imp_err=$(echo "$imp_resp" | jq -r '.error // "Неизвестная ошибка"' 2>/dev/null || echo "$imp_resp")
+        echo -e "${RED}Ошибка предпросмотра импорта: ${imp_err}${NC}"
+        echo ""
+        read -p "Нажмите Enter для возврата..."
+        return 1
+    fi
+
+    echo -e "\n${BOLD}Предпросмотр импортируемого подключения:${NC}"
+    python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+c = data.get("connection", {})
+uri = data.get("uri", "")
+name = c.get("name", "")
+url = c.get("url", "")
+user = c.get("username", "")
+backends = c.get("backends") or []
+b_cnt = len(backends)
+enc_str = "enc=1" if c.get("enc") else "enc=0"
+tout = c.get("timeout", "60s")
+
+print(f"  Имя:        \033[1;32m{name}\033[0m")
+print(f"  Основной:   {url} (user: {user})")
+print(f"  Бэкендов:   {b_cnt}")
+for idx, b in enumerate(backends, 1):
+    b_url = b.get("url", "")
+    b_user = b.get("username", "")
+    b_lbl = b.get("label", "")
+    lbl_str = f", label: {b_lbl}" if b_lbl else ""
+    print(f"    - Бэкенд #{idx}: {b_url} (user: {b_user}{lbl_str})")
+print(f"  Шифрование: {enc_str}")
+print(f"  Таймаут:    {tout}")
+print(f"\n  Сформированный URI:")
+print(f"  \033[36m{uri}\033[0m")
+' "$imp_resp"
+
+    echo ""
+    read -p "Сохранить данное подключение в каталог? [Y/n]: " conf_imp
+    conf_imp=${conf_imp:-Y}
+    if [[ "$conf_imp" =~ ^[YyДд]$ ]]; then
+        local save_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-server" \
+            -H "Content-Type: application/json" \
+            -d "{\"save\": true, \"server_ip\": \"${SERVER_IP}\"}" 2>/dev/null || echo "")
+        local save_id=$(echo "$save_resp" | jq -r '.id // empty' 2>/dev/null || echo "")
+        if [ -n "$save_id" ]; then
+            echo -e "${GREEN}✓ Подключение успешно сохранено в каталоге! [ID: ${save_id}]${NC}"
+            if [ -n "$target_uid" ]; then
+                echo ""
+                read -p "Привязать это подключение к пользователю '${target_unick}' прямо сейчас? [Y/n]: " conf_att
+                conf_att=${conf_att:-Y}
+                if [[ "$conf_att" =~ ^[YyДд]$ ]]; then
+                    attach_webdav_conn_to_user "$target_uid" "$save_id" "$target_unick"
+                fi
+            fi
+        else
+            echo -e "${RED}Ошибка сохранения: $(echo "$save_resp" | jq -r '.error // "Ошибка"')${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Импорт отменен пользователем.${NC}"
+    fi
+    echo ""
+    read -p "Нажмите Enter для продолжения..."
+}
+
+wizard_import_webdav_uri() {
+    local SUB_API="http://127.0.0.1:22217"
+    local target_uid="$1"
+    local target_unick="$2"
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ИМПОРТ ПОДКЛЮЧЕНИЯ ИЗ ССЫЛКИ WEBDAV URI                     ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}\n"
+    echo -e "Поддерживаются любые ссылки TUNA rc9 (webdav://... или webdavs://...),"
+    echo -e "включая сторонние серверы и дополнительные бэкенды (&b1=..., &b2=...).\n"
+    read -p "Введите WebDAV URI: " raw_u
+    raw_u=$(echo "$raw_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$raw_u" ]; then
+        echo -e "${YELLOW}Отменено.${NC}"
+        sleep 1
+        return
+    fi
+
+    local req_json=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'save': False}))" "$raw_u")
+    local imp_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-uri" \
+        -H "Content-Type: application/json" \
+        -d "$req_json" 2>/dev/null || echo "")
+    local imp_ok=$(echo "$imp_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
+    if [ "$imp_ok" != "true" ]; then
+        local imp_err=$(echo "$imp_resp" | jq -r '.error // "Неизвестная ошибка"' 2>/dev/null || echo "$imp_resp")
+        echo -e "${RED}Ошибка разбора URI: ${imp_err}${NC}"
+        echo ""
+        read -p "Нажмите Enter для возврата..."
+        return 1
+    fi
+
+    echo -e "\n${BOLD}Разобранные параметры подключения:${NC}"
+    python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+c = data.get("connection", {})
+name = c.get("name", "")
+url = c.get("url", "")
+user = c.get("username", "")
+backends = c.get("backends") or []
+b_cnt = len(backends)
+enc_str = "enc=1" if c.get("enc") else "enc=0"
+dns_val = c.get("dns") or "(нет)"
+tout = c.get("timeout", "60s")
+
+print(f"  Имя:        \033[1;32m{name}\033[0m")
+print(f"  Основной:   {url} (user: {user})")
+print(f"  Бэкендов:   {b_cnt}")
+for idx, b in enumerate(backends, 1):
+    b_url = b.get("url", "")
+    b_user = b.get("username", "")
+    b_lbl = b.get("label", "")
+    lbl_str = f" [{b_lbl}]" if b_lbl else ""
+    print(f"    - #{idx}: {b_url} (user: {b_user}){lbl_str}")
+print(f"  Шифрование: {enc_str}")
+print(f"  DNS:        {dns_val}")
+print(f"  Таймаут:    {tout}")
+' "$imp_resp"
+
+    echo ""
+    read -p "Сохранить подключение в каталог? [Y/n]: " conf_imp
+    conf_imp=${conf_imp:-Y}
+    if [[ "$conf_imp" =~ ^[YyДд]$ ]]; then
+        local req_save=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'save': True}))" "$raw_u")
+        local save_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-uri" \
+            -H "Content-Type: application/json" \
+            -d "$req_save" 2>/dev/null || echo "")
+        local save_id=$(echo "$save_resp" | jq -r '.id // empty' 2>/dev/null || echo "")
+        if [ -n "$save_id" ]; then
+            echo -e "${GREEN}✓ Подключение успешно сохранено в каталоге! [ID: ${save_id}]${NC}"
+            if [ -n "$target_uid" ]; then
+                echo ""
+                read -p "Привязать это подключение к пользователю '${target_unick}' прямо сейчас? [Y/n]: " conf_att
+                conf_att=${conf_att:-Y}
+                if [[ "$conf_att" =~ ^[YyДд]$ ]]; then
+                    attach_webdav_conn_to_user "$target_uid" "$save_id" "$target_unick"
+                fi
+            fi
+        else
+            echo -e "${RED}Ошибка сохранения: $(echo "$save_resp" | jq -r '.error // "Ошибка"')${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Импорт отменен.${NC}"
+    fi
+    echo ""
+    read -p "Нажмите Enter для продолжения..."
+}
+
+wizard_create_webdav_connection() {
+    local SUB_API="http://127.0.0.1:22217"
+    local target_uid="$1"
+    local target_unick="$2"
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}       МАСТЕР СОЗДАНИЯ ПОДКЛЮЧЕНИЯ WEBDAV (ОСНОВНОЙ + БЭКЕНДЫ)        ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}\n"
+    echo -e "Вы можете настроить подключение к любому стороннему серверу WebDAV,"
+    echo -e "а также добавить до 8 дополнительных бэкендов для пула/балансировки.\n"
+
+    read -p "Отображаемое имя подключения (например 'External-Cloud' или 'Multi-Pool'): " c_name
+    c_name=$(echo "$c_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$c_name" ]; then
+        echo -e "${YELLOW}Отменено: имя не может быть пустым.${NC}"
+        sleep 1
+        return
+    fi
+
+    echo -e "\n${BOLD}--- 1. ОСНОВНОЙ СЕРВЕР WEBDAV ---${NC}"
+    read -p "Основной WebDAV URL (например http://1.2.3.4:8443/ или https://webdav.site.com/): " c_url
+    c_url=$(echo "$c_url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$c_url" ]; then
+        echo -e "${YELLOW}Отменено: URL не может быть пустым.${NC}"
+        sleep 1
+        return
+    fi
+
+    read -p "Логин основного хранилища: " c_user
+    c_user=$(echo "$c_user" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$c_user" ]; then
+        echo -e "${YELLOW}Отменено: логин обязателен.${NC}"
+        sleep 1
+        return
+    fi
+
+    read -s -p "Пароль основного хранилища: " c_pass
+    echo ""
+    c_pass=$(echo "$c_pass" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$c_pass" ]; then
+        echo -e "${YELLOW}Отменено: пароль обязателен.${NC}"
+        sleep 1
+        return
+    fi
+
+    read -p "Метка основного хранилища (Enter для пропуска): " c_lbl
+    c_lbl=$(echo "$c_lbl" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    read -p "Шифрование данных (enc=1)? [Y/n]: " conf_enc
+    conf_enc=${conf_enc:-Y}
+    local c_enc=0
+    [[ "$conf_enc" =~ ^[YyДд]$ ]] && c_enc=1
+
+    local backends_list=()
+    echo ""
+    echo -e "${BOLD}--- 2. ДОПОЛНИТЕЛЬНЫЕ БЭКЕНДЫ (СТОРОННИЕ СЕРВЕРЫ) ---${NC}"
+    echo -e "TUNA rc9 поддерживает до 8 дополнительных бэкендов в одной ссылке."
+    read -p "Добавить дополнительные бэкенды прямо сейчас? [y/N]: " conf_b
+    if [[ "$conf_b" =~ ^[YyДд]$ ]]; then
+        local b_idx=1
+        while [ $b_idx -le 8 ]; do
+            echo -e "\n${CYAN}>>> Бэкенд #${b_idx} (из 8):${NC}"
+            read -p "  URL стороннего бэкенда (Enter для завершения списка): " b_url
+            b_url=$(echo "$b_url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$b_url" ] && break
+
+            read -p "  Логин бэкенда #${b_idx}: " b_u
+            b_u=$(echo "$b_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ -z "$b_u" ]; then
+                echo -e "${YELLOW}Логин пуст, бэкенд пропущен.${NC}"
+                continue
+            fi
+
+            read -s -p "  Пароль бэкенда #${b_idx}: " b_p
+            echo ""
+            b_p=$(echo "$b_p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ -z "$b_p" ]; then
+                echo -e "${YELLOW}Пароль пуст, бэкенд пропущен.${NC}"
+                continue
+            fi
+
+            read -p "  Метка / описание (например 'Node-${b_idx}'): " b_lbl
+            b_lbl=$(echo "$b_lbl" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+            local b_json_str=$(python3 -c "import json, sys; print(json.dumps({'url': sys.argv[1], 'username': sys.argv[2], 'password': sys.argv[3], 'label': sys.argv[4]}))" "$b_url" "$b_u" "$b_p" "$b_lbl")
+            backends_list+=("$b_json_str")
+            echo -e "${GREEN}✓ Бэкенд #${b_idx} добавлен в список (${b_url})${NC}"
+            b_idx=$((b_idx + 1))
+        done
+    fi
+
+    local c_dns=""
+    local c_tout="60s"
+    local c_chunk=131071
+
+    echo ""
+    echo -e "${BOLD}--- 3. ДОПОЛНИТЕЛЬНЫЕ ПАРАМЕТРЫ ТАЙМИНГА И СЕТИ ---${NC}"
+    read -p "Настроить тайминги/DNS вручную? [y/N] (по умолчанию: оптимальные настройки rc9): " conf_adv
+    if [[ "$conf_adv" =~ ^[YyДд]$ ]]; then
+        read -p "  Bootstrap DNS (IP или IP:порт, Enter - отключено): " c_dns
+        c_dns=$(echo "$c_dns" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+        read -p "  Таймаут запроса (дефолт 60s): " in_tout
+        in_tout=$(echo "$in_tout" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [ -n "$in_tout" ] && c_tout="$in_tout"
+
+        read -p "  Размер чанка в байтах (дефолт 131071): " in_chunk
+        in_chunk=$(echo "$in_chunk" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [ -n "$in_chunk" ] && c_chunk="$in_chunk"
+    fi
+
+    local new_conn_json=$(python3 -c '
+import json, sys
+backends_raw = sys.argv[5].splitlines()
+backends = [json.loads(b) for b in backends_raw if b.strip()]
+data = {
+    "name": sys.argv[1],
+    "url": sys.argv[2],
+    "username": sys.argv[3],
+    "password": sys.argv[4],
+    "label": sys.argv[6],
+    "backends": backends,
+    "enc": int(sys.argv[7]),
+    "dns": sys.argv[8],
+    "timeout": sys.argv[9],
+    "chunk_size": int(sys.argv[10])
+}
+print(json.dumps(data))
+' "$c_name" "$c_url" "$c_user" "$c_pass" "$(printf '%s\n' "${backends_list[@]}")" "$c_lbl" "$c_enc" "$c_dns" "$c_tout" "$c_chunk")
+
+    local create_resp=$(curl -s -X POST "${SUB_API}/api/webdav/connections" \
+        -H "Content-Type: application/json" \
+        -d "$new_conn_json" 2>/dev/null || echo "")
+    local create_id=$(echo "$create_resp" | jq -r '.id // empty' 2>/dev/null || echo "")
+    if [ -n "$create_id" ]; then
+        echo -e "\n${GREEN}✓ Подключение успешно создано и сохранено в каталоге! [ID: ${create_id}]${NC}"
+        if [ -n "$target_uid" ]; then
+            echo ""
+            read -p "Привязать это подключение к пользователю '${target_unick}' прямо сейчас? [Y/n]: " conf_att
+            conf_att=${conf_att:-Y}
+            if [[ "$conf_att" =~ ^[YyДд]$ ]]; then
+                attach_webdav_conn_to_user "$target_uid" "$create_id" "$target_unick"
+            fi
+        fi
+    else
+        local create_err=$(echo "$create_resp" | jq -r '.error // "Ошибка"' 2>/dev/null || echo "$create_resp")
+        echo -e "\n${RED}Ошибка создания подключения: ${create_err}${NC}"
+    fi
+    echo ""
+    read -p "Нажмите Enter для продолжения..."
+}
+
+dialog_add_webdav_for_user() {
+    local uid="$1"
+    local u_nick="$2"
+    while true; do
+        clear
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${BOLD}          ДОБАВЛЕНИЕ ПОДКЛЮЧЕНИЯ WEBDAV ДЛЯ ПОЛЬЗОВАТЕЛЯ               ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  Пользователь: ${GREEN}${BOLD}${u_nick}${NC} (ID: ${GRAY}${uid}${NC})"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}\n"
+        echo -e "  ${YELLOW}[1]${NC} 🔗 ${BOLD}По готовой ссылке webdav://${NC} (быстрый импорт стороннего сервера/бэкендов)"
+        echo -e "  ${YELLOW}[2]${NC} 🛠️  ${BOLD}Пошаговый мастер${NC} (ввод стороннего сервера + до 8 дополнительных бэкендов)"
+        echo -e "  ${YELLOW}[3]${NC} 📥 ${BOLD}Импорт из локальной конфигурации webdav-tunnel${NC} этого сервера"
+        echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в меню пользователя"
+        echo ""
+        read -p "Выберите способ добавления [0-3]: " a_act
+        case "$a_act" in
+            1)
+                wizard_import_webdav_uri "$uid" "$u_nick"
+                return
+                ;;
+            2)
+                wizard_create_webdav_connection "$uid" "$u_nick"
+                return
+                ;;
+            3)
+                wizard_import_server_webdav "$uid" "$u_nick"
+                return
+                ;;
+            0) return ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
+}
+
 edit_user_webdav_sub() {
     local SUB_API="http://127.0.0.1:22217"
     local uid="$1"
@@ -6116,16 +6515,18 @@ except Exception as e:
         echo ""
         echo -e "  ${YELLOW}[1]${NC} ⚡ ${BOLD}Включить / отключить WebDAV в подписке${NC}"
         echo -e "  ${YELLOW}[2]${NC} 📑 ${BOLD}Выбрать и упорядочить подключения из каталога${NC} (1–8 подключений)"
-        echo -e "  ${YELLOW}[3]${NC} 👁️  ${BOLD}Предпросмотр выдачи WebDAV для клиента TUNA rc9${NC}"
+        echo -e "  ${YELLOW}[3]${NC} ➕ ${BOLD}Добавить новое подключение${NC} (сторонний сервер / мастер с бэкендами / по ссылке)"
+        echo -e "  ${YELLOW}[4]${NC} 👁️  ${BOLD}Предпросмотр выдачи WebDAV для клиента TUNA rc9${NC}"
+        echo -e "  ${YELLOW}[5]${NC} 📂 ${BOLD}Открыть общий каталог подключений WebDAV${NC} (управление всеми серверами)"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад к редактированию пользователя"
         echo ""
-        read -p "Выберите действие [0-3]: " wd_act
+        read -p "Выберите действие [0-5]: " wd_act
         case "$wd_act" in
             1)
                 local new_en="true"
                 [ "$u_en" = "true" ] && new_en="false"
                 if [ "$new_en" = "true" ] && [ "$sel_conns_len" -eq 0 ]; then
-                    echo -e "${YELLOW}Внимание: для выдачи WebDAV выберите минимум 1 подключение в пункте [2].${NC}"
+                    echo -e "${YELLOW}Внимание: для выдачи WebDAV выберите минимум 1 подключение в пункте [2] или добавьте в [3].${NC}"
                     sleep 1.5
                 fi
                 curl -s -X PUT "${SUB_API}/api/users/${uid}/webdav" -H "Content-Type: application/json" -d "{\"enabled\": $new_en}" >/dev/null 2>&1
@@ -6138,7 +6539,7 @@ except Exception as e:
                 local raw_cat=$(curl -s "${SUB_API}/api/webdav/connections" 2>/dev/null || echo "[]")
                 local cat_cnt=$(python3 -c "import json, sys; conns=json.loads(sys.argv[1]) if sys.argv[1].startswith('[') else []; print(len(conns))" "$raw_cat" 2>/dev/null || echo 0)
                 if [ "$cat_cnt" -eq 0 ]; then
-                    echo -e "${YELLOW}Каталог подключений пуст. Сначала добавьте или импортируйте подключения в каталоге WebDAV.${NC}"
+                    echo -e "${YELLOW}Каталог подключений пуст. Сначала добавьте или импортируйте подключения.${NC}"
                     echo ""
                     read -p "Нажмите Enter для возврата..."
                     continue
@@ -6207,6 +6608,9 @@ else:
                 sleep 1.5
                 ;;
             3)
+                dialog_add_webdav_for_user "$uid" "$u_nick"
+                ;;
+            4)
                 clear
                 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
                 echo -e "${CYAN}║${BOLD}          ПРЕДПРОСМОТР ВЫДАЧИ WEBDAV ДЛЯ КЛИЕНТА TUNA          ${CYAN}║${NC}"
@@ -6217,8 +6621,10 @@ import json, sys
 data = json.loads(sys.argv[1])
 enabled = data.get("enabled", False)
 uris = data.get("uris", [])
-print(f"Статус включения: {\"\033[1;32mВКЛЮЧЕН\033[0m\" if enabled else \"\033[1;31mОТКЛЮЧЕН\033[0m\"}")
-print(f"Количество строк URI: \033[1;33m{len(uris)}\033[0m\n")
+status_str = "\033[1;32mВКЛЮЧЕН\033[0m" if enabled else "\033[1;31mОТКЛЮЧЕН\033[0m"
+cnt = len(uris)
+print(f"Статус включения: {status_str}")
+print(f"Количество строк URI: \033[1;33m{cnt}\033[0m\n")
 if not uris:
     print("  (Нет активных подключений для выдачи)")
 for idx, u in enumerate(uris, 1):
@@ -6226,8 +6632,15 @@ for idx, u in enumerate(uris, 1):
 ' "$prev_resp"
                 read -p "Нажмите Enter для возврата..."
                 ;;
+            5)
+                menu_webdav_sub_catalog
+                ;;
             0)
                 break
+                ;;
+            *)
+                echo "Неверный выбор"
+                sleep 1
                 ;;
         esac
     done
@@ -6263,10 +6676,11 @@ try:
         username = c.get("username", "")
         b_cnt = c.get("backends_count", 0)
         enc = "🔐 enc=1" if c.get("enc") else "🔓 enc=0"
-        dns = f" | dns: {c.get(\"dns\")}" if c.get("dns") else ""
+        dns_val = c.get("dns") or ""
+        dns_str = f" | dns: {dns_val}" if dns_val else ""
         en = "🟢" if c.get("enabled") else "🔴"
         print(f"  \033[1;33m[{i}]\033[0m {en} \033[1;32m{name}\033[0m [\033[36m{cid}\033[0m]")
-        print(f"      Основное: \033[1m{url}\033[0m (user: {username}) | Бэкендов: \033[1;33m{b_cnt}\033[0m | {enc}{dns}")
+        print(f"      Основное: \033[1m{url}\033[0m (user: {username}) | Бэкендов: \033[1;33m{b_cnt}\033[0m | {enc}{dns_str}")
 except Exception as e:
     print(f"  Ошибка вывода подключений: {e}")
 ' "$raw_conns"
@@ -6275,8 +6689,8 @@ except Exception as e:
         echo ""
         echo -e "  ${YELLOW}[1]${NC} 📥 ${BOLD}Импортировать из активной конфигурации сервера WebDAV${NC}"
         echo -e "  ${YELLOW}[2]${NC} 🔗 ${BOLD}Импортировать из готовой ссылки WebDAV URI${NC}"
-        echo -e "  ${YELLOW}[3]${NC} ➕ ${BOLD}Создать новое подключение вручную${NC}"
-        echo -e "  ${YELLOW}[4]${NC} ✏️  ${BOLD}Редактировать подключение из каталога${NC}"
+        echo -e "  ${YELLOW}[3]${NC} ➕ ${BOLD}Создать новое подключение вручную${NC} (основной сервер + до 8 бэкендов)"
+        echo -e "  ${YELLOW}[4]${NC} ✏️  ${BOLD}Редактировать подключение из каталога${NC} (параметры и бэкенды)"
         echo -e "  ${RED}[5]${NC} 🗑️  ${BOLD}Удалить подключение из каталога${NC}"
         echo -e "  ${YELLOW}[6]${NC} 👁️  ${BOLD}Подробный просмотр подключения и ссылки URI${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в меню подписок"
@@ -6284,195 +6698,13 @@ except Exception as e:
         read -p "Выберите действие [0-6]: " cat_act
         case "$cat_act" in
             1)
-                clear
-                echo -e "${CYAN}=== ИМПОРТ ИЗ АКТИВНОЙ КОНФИГУРАЦИИ СЕРВЕРА WEBDAV ===${NC}\n"
-                echo -e "${CYAN}[*] Чтение текущих настроек /etc/webdav-tunnel/config.env (без перезапуска служб)...${NC}"
-                local imp_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-server" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"save\": false, \"server_ip\": \"${SERVER_IP}\"}" 2>/dev/null || echo "")
-                local imp_ok=$(echo "$imp_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
-                if [ "$imp_ok" != "true" ]; then
-                    local imp_err=$(echo "$imp_resp" | jq -r '.error // "Неизвестная ошибка"' 2>/dev/null || echo "$imp_resp")
-                    echo -e "${RED}Ошибка предпросмотра импорта: ${imp_err}${NC}"
-                    echo ""
-                    read -p "Нажмите Enter для возврата..."
-                    continue
-                fi
-
-                echo -e "\n${BOLD}Предпросмотр импортируемого подключения:${NC}"
-                python3 -c '
-import json, sys
-data = json.loads(sys.argv[1])
-c = data.get("connection", {})
-uri = data.get("uri", "")
-print(f"  Имя:        \033[1;32m{c.get(\"name\")}\033[0m")
-print(f"  Основной:   {c.get(\"url\")} (user: {c.get(\"username\")})")
-print(f"  Бэкендов:   {len(c.get(\"backends\", []))}")
-for idx, b in enumerate(c.get("backends", []), 1):
-    print(f"    - Бэкенд #{idx}: {b.get(\"url\")} (user: {b.get(\"username\")}, label: {b.get(\"label\", \"\")})")
-print(f"  Шифрование: {\"enc=1\" if c.get(\"enc\") else \"enc=0\"}")
-print(f"  Таймаут:    {c.get(\"timeout\", \"60s\")}")
-print(f"\n  Сформированный URI:")
-print(f"  \033[36m{uri}\033[0m")
-' "$imp_resp"
-
-                echo ""
-                read -p "Сохранить данное подключение в каталог? [Y/n]: " conf_imp
-                conf_imp=${conf_imp:-Y}
-                if [[ "$conf_imp" =~ ^[YyДд]$ ]]; then
-                    local save_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-server" \
-                        -H "Content-Type: application/json" \
-                        -d "{\"save\": true, \"server_ip\": \"${SERVER_IP}\"}" 2>/dev/null || echo "")
-                    local save_id=$(echo "$save_resp" | jq -r '.id // empty' 2>/dev/null || echo "")
-                    if [ -n "$save_id" ]; then
-                        echo -e "${GREEN}✓ Подключение успешно сохранено в каталоге! [ID: ${save_id}]${NC}"
-                    else
-                        echo -e "${RED}Ошибка сохранения: $(echo "$save_resp" | jq -r '.error // "Ошибка"')${NC}"
-                    fi
-                else
-                    echo -e "${YELLOW}Импорт отменен пользователем.${NC}"
-                fi
-                echo ""
-                read -p "Нажмите Enter для продолжения..."
+                wizard_import_server_webdav "" ""
                 ;;
             2)
-                clear
-                echo -e "${CYAN}=== ИМПОРТ ИЗ ССЫЛКИ WEBDAV URI ===${NC}\n"
-                read -p "Введите WebDAV URI (webdav://... или webdavs://...): " raw_u
-                raw_u=$(echo "$raw_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                if [ -z "$raw_u" ]; then
-                    echo -e "${YELLOW}Отменено.${NC}"
-                    sleep 1
-                    continue
-                fi
-
-                local req_json=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'save': False}))" "$raw_u")
-                local imp_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-uri" \
-                    -H "Content-Type: application/json" \
-                    -d "$req_json" 2>/dev/null || echo "")
-                local imp_ok=$(echo "$imp_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
-                if [ "$imp_ok" != "true" ]; then
-                    local imp_err=$(echo "$imp_resp" | jq -r '.error // "Неизвестная ошибка"' 2>/dev/null || echo "$imp_resp")
-                    echo -e "${RED}Ошибка разбора URI: ${imp_err}${NC}"
-                    echo ""
-                    read -p "Нажмите Enter для возврата..."
-                    continue
-                fi
-
-                echo -e "\n${BOLD}Разобранные параметры подключения:${NC}"
-                python3 -c '
-import json, sys
-data = json.loads(sys.argv[1])
-c = data.get("connection", {})
-print(f"  Имя:        \033[1;32m{c.get(\"name\")}\033[0m")
-print(f"  Основной:   {c.get(\"url\")} (user: {c.get(\"username\")})")
-print(f"  Бэкендов:   {len(c.get(\"backends\", []))}")
-for idx, b in enumerate(c.get("backends", []), 1):
-    print(f"    - #{idx}: {b.get(\"url\")} (user: {b.get(\"username\")})")
-print(f"  Шифрование: {\"enc=1\" if c.get(\"enc\") else \"enc=0\"}")
-print(f"  DNS:        {c.get(\"dns\") or \"(нет)\"}")
-print(f"  Таймаут:    {c.get(\"timeout\", \"60s\")}")
-' "$imp_resp"
-
-                echo ""
-                read -p "Сохранить подключение в каталог? [Y/n]: " conf_imp
-                conf_imp=${conf_imp:-Y}
-                if [[ "$conf_imp" =~ ^[YyДд]$ ]]; then
-                    local req_save=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'save': True}))" "$raw_u")
-                    local save_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-uri" \
-                        -H "Content-Type: application/json" \
-                        -d "$req_save" 2>/dev/null || echo "")
-                    local save_id=$(echo "$save_resp" | jq -r '.id // empty' 2>/dev/null || echo "")
-                    if [ -n "$save_id" ]; then
-                        echo -e "${GREEN}✓ Подключение успешно сохранено в каталоге! [ID: ${save_id}]${NC}"
-                    else
-                        echo -e "${RED}Ошибка сохранения: $(echo "$save_resp" | jq -r '.error // "Ошибка"')${NC}"
-                    fi
-                else
-                    echo -e "${YELLOW}Импорт отменен.${NC}"
-                fi
-                echo ""
-                read -p "Нажмите Enter для продолжения..."
+                wizard_import_webdav_uri "" ""
                 ;;
             3)
-                clear
-                echo -e "${CYAN}=== СОЗДАНИЕ ПОДКЛЮЧЕНИЯ WEBDAV ВРУЧНУЮ ===${NC}\n"
-                read -p "Отображаемое имя подключения (например 'Mail.Ru Pool'): " c_name
-                c_name=$(echo "$c_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                [ -z "$c_name" ] && continue
-
-                read -p "Основной URL хранилища (например https://webdav.cloud.mail.ru/): " c_url
-                c_url=$(echo "$c_url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                [ -z "$c_url" ] && continue
-
-                read -p "Логин основного хранилища: " c_user
-                c_user=$(echo "$c_user" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                [ -z "$c_user" ] && continue
-
-                read -s -p "Пароль основного хранилища: " c_pass
-                echo ""
-                c_pass=$(echo "$c_pass" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                [ -z "$c_pass" ] && continue
-
-                local backends_list=()
-                echo -e "\n${BOLD}Дополнительные бэкенды (от 0 до 8):${NC}"
-                local b_idx=1
-                while [ $b_idx -le 8 ]; do
-                    read -p "URL бэкенда #${b_idx} (Enter для завершения списка): " b_url
-                    b_url=$(echo "$b_url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                    [ -z "$b_url" ] && break
-
-                    read -p "  Логин бэкенда #${b_idx}: " b_u
-                    b_u=$(echo "$b_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                    [ -z "$b_u" ] && continue
-
-                    read -s -p "  Пароль бэкенда #${b_idx}: " b_p
-                    echo ""
-                    b_p=$(echo "$b_p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                    [ -z "$b_p" ] && continue
-
-                    read -p "  Локальная метка (только для панели): " b_lbl
-                    b_lbl=$(echo "$b_lbl" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-
-                    local b_json_str=$(python3 -c "import json, sys; print(json.dumps({'url': sys.argv[1], 'username': sys.argv[2], 'password': sys.argv[3], 'label': sys.argv[4]}))" "$b_url" "$b_u" "$b_p" "$b_lbl")
-                    backends_list+=("$b_json_str")
-                    b_idx=$((b_idx + 1))
-                done
-
-                echo ""
-                read -p "Шифрование данных (enc=1)? [y/N]: " conf_enc
-                local c_enc=0
-                [[ "$conf_enc" =~ ^[YyДд]$ ]] && c_enc=1
-
-                read -p "Bootstrap DNS (IP или IP:порт, Enter - отключено): " c_dns
-                c_dns=$(echo "$c_dns" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-
-                local new_conn_json=$(python3 -c '
-import json, sys
-data = {
-    "name": sys.argv[1],
-    "url": sys.argv[2],
-    "username": sys.argv[3],
-    "password": sys.argv[4],
-    "backends": [json.loads(b) for b in sys.argv[5].splitlines() if b.strip()],
-    "enc": int(sys.argv[6]),
-    "dns": sys.argv[7]
-}
-print(json.dumps(data))
-' "$c_name" "$c_url" "$c_user" "$c_pass" "$(printf '%s\n' "${backends_list[@]}")" "$c_enc" "$c_dns")
-
-                local create_resp=$(curl -s -X POST "${SUB_API}/api/webdav/connections" \
-                    -H "Content-Type: application/json" \
-                    -d "$new_conn_json" 2>/dev/null || echo "")
-                local create_id=$(echo "$create_resp" | jq -r '.id // empty' 2>/dev/null || echo "")
-                if [ -n "$create_id" ]; then
-                    echo -e "\n${GREEN}✓ Подключение успешно создано в каталоге! [ID: ${create_id}]${NC}"
-                else
-                    local create_err=$(echo "$create_resp" | jq -r '.error // "Ошибка"' 2>/dev/null || echo "$create_resp")
-                    echo -e "\n${RED}Ошибка создания: ${create_err}${NC}"
-                fi
-                echo ""
-                read -p "Нажмите Enter для продолжения..."
+                wizard_create_webdav_connection "" ""
                 ;;
             4)
                 if [ "$count_conns" -eq 0 ]; then
@@ -6511,7 +6743,7 @@ print(json.dumps(data))
                 echo -e "  [1] Имя: ${GREEN}${c_nm}${NC}"
                 echo -e "  [2] Основной URL: ${CYAN}${c_url}${NC}"
                 echo -e "  [3] Логин / Пароль (сейчас: user: ${c_usr}, pass: [СКРЫТ])"
-                echo -e "  [4] Бэкенды: ${YELLOW}${c_b_cnt}${NC} шт."
+                echo -e "  [4] Дополнительные бэкенды: ${YELLOW}${c_b_cnt}${NC} шт. (добавление/удаление)"
                 echo -e "  [5] Шифрование (enc): $([ "$c_enc" -eq 1 ] && echo "${GREEN}enc=1${NC}" || echo "${GRAY}enc=0${NC}")"
                 echo -e "  [6] Bootstrap DNS: ${YELLOW}${c_dns:-"(не задан)"}${NC}"
                 echo -e "  [7] Таймаут: ${c_tout}"
@@ -6551,6 +6783,98 @@ print(json.dumps(data))
                         curl -s -X PUT "${SUB_API}/api/webdav/connections/${target_id}" -H "Content-Type: application/json" -d "$p_payload" >/dev/null 2>&1
                         echo -e "${GREEN}✓ Реквизиты обновлены!${NC}"
                         sleep 1
+                        ;;
+                    4)
+                        clear
+                        echo -e "${CYAN}=== УПРАВЛЕНИЕ БЭКЕНДАМИ ПОДКЛЮЧЕНИЯ: ${c_nm} ===${NC}\n"
+                        local det_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=0" 2>/dev/null || echo "{}")
+                        python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+backends = data.get("backends", [])
+print(f"Текущие бэкенды ({len(backends)} из 8):")
+if not backends:
+    print("  (Дополнительные бэкенды не настроены)")
+for idx, b in enumerate(backends, 1):
+    u = b.get("username", "")
+    b_url = b.get("url", "")
+    b_lbl = b.get("label", "")
+    lbl_str = f" [{b_lbl}]" if b_lbl else ""
+    print(f"  \033[1;33m[{idx}]\033[0m {b_url}{lbl_str} (user: {u})")
+' "$det_conn"
+                        echo ""
+                        echo -e "  ${YELLOW}[1]${NC} ➕ Добавить дополнительный бэкенд (сторонний сервер)"
+                        echo -e "  ${RED}[2]${NC} 🗑️  Удалить бэкенд по номеру"
+                        echo -e "  ${RED}[3]${NC} 🧹 Очистить все бэкенды"
+                        echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад"
+                        echo ""
+                        read -p "Выберите действие [0-3]: " b_act
+                        case "$b_act" in
+                            1)
+                                local cur_b_cnt=$(echo "$det_conn" | jq -r '(.backends // []) | length')
+                                if [ "$cur_b_cnt" -ge 8 ]; then
+                                    echo -e "${RED}Достигнут максимум бэкендов (8).${NC}"
+                                    sleep 1.5
+                                    continue
+                                fi
+                                read -p "URL нового бэкенда (например http://other-vps:8443/): " add_b_url
+                                add_b_url=$(echo "$add_b_url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                                [ -z "$add_b_url" ] && continue
+                                read -p "Логин бэкенда: " add_b_u
+                                add_b_u=$(echo "$add_b_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                                read -s -p "Пароль бэкенда: " add_b_p; echo ""
+                                add_b_p=$(echo "$add_b_p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                                read -p "Метка (например 'Node-Backup'): " add_b_lbl
+                                add_b_lbl=$(echo "$add_b_lbl" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+                                local new_b_payload=$(python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+backends = data.get("backends", [])
+backends.append({"url": sys.argv[2], "username": sys.argv[3], "password": sys.argv[4], "label": sys.argv[5]})
+print(json.dumps({"backends": backends}))
+' "$det_conn" "$add_b_url" "$add_b_u" "$add_b_p" "$add_b_lbl")
+
+                                curl -s -X PUT "${SUB_API}/api/webdav/connections/${target_id}" \
+                                    -H "Content-Type: application/json" \
+                                    -d "$new_b_payload" >/dev/null 2>&1
+                                echo -e "${GREEN}✓ Бэкенд успешно добавлен!${NC}"
+                                sleep 1.5
+                                ;;
+                            2)
+                                local cur_b_cnt=$(echo "$det_conn" | jq -r '(.backends // []) | length')
+                                if [ "$cur_b_cnt" -eq 0 ]; then
+                                    echo -e "${YELLOW}Список бэкендов уже пуст.${NC}"
+                                    sleep 1
+                                    continue
+                                fi
+                                read -p "Номер бэкенда для удаления [1-${cur_b_cnt}]: " del_b_idx
+                                if [[ "$del_b_idx" =~ ^[0-9]+$ ]] && [ "$del_b_idx" -ge 1 ] && [ "$del_b_idx" -le "$cur_b_cnt" ]; then
+                                    local del_b_payload=$(python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+backends = data.get("backends", [])
+del backends[int(sys.argv[2])-1]
+print(json.dumps({"backends": backends}))
+' "$det_conn" "$del_b_idx")
+                                    curl -s -X PUT "${SUB_API}/api/webdav/connections/${target_id}" \
+                                        -H "Content-Type: application/json" \
+                                        -d "$del_b_payload" >/dev/null 2>&1
+                                    echo -e "${GREEN}✓ Бэкенд #${del_b_idx} удален!${NC}"
+                                    sleep 1.5
+                                fi
+                                ;;
+                            3)
+                                read -p "Очистить все бэкенды для данного подключения? [y/N]: " conf_clr
+                                if [[ "$conf_clr" =~ ^[YyДд]$ ]]; then
+                                    curl -s -X PUT "${SUB_API}/api/webdav/connections/${target_id}" \
+                                        -H "Content-Type: application/json" \
+                                        -d '{"backends": []}' >/dev/null 2>&1
+                                    echo -e "${GREEN}✓ Все бэкенды очищены!${NC}"
+                                    sleep 1.5
+                                fi
+                                ;;
+                        esac
                         ;;
                     5)
                         local new_enc=1
@@ -6629,26 +6953,48 @@ print(json.dumps(data))
                 python3 -c '
 import json, sys
 c = json.loads(sys.argv[1])
-print(f"Имя:              \033[1;32m{c.get(\"name\")}\033[0m")
-print(f"ID:               {c.get(\"id\")}")
-print(f"Статус:           {\"🟢 Активен\" if c.get(\"enabled\") else \"🔴 Отключен\"}")
-print(f"Основной URL:     \033[36m{c.get(\"url\")}\033[0m")
-print(f"Пользователь:     {c.get(\"username\")}")
-print(f"Пароль:           {c.get(\"password\")}")
-print(f"Шифрование:       {\"enc=1\" if c.get(\"enc\") else \"enc=0\"}")
-print(f"Bootstrap DNS:    {c.get(\"dns\") or \"(нет)\"}")
-print(f"Таймаут:          {c.get(\"timeout\")}")
-print(f"Опрос (min/max):  {c.get(\"poll_min\")} / {c.get(\"poll_max\")}")
-print(f"Coalesce:         {c.get(\"coalesce\")}")
-print(f"Chunk size:       {c.get(\"chunk_size\")}")
-print(f"Puts / Read:      {c.get(\"puts\")} / {c.get(\"read_min\")}-{c.get(\"read_max\")}")
+name = c.get("name", "")
+cid = c.get("id", "")
+st = "🟢 Активен" if c.get("enabled") else "🔴 Отключен"
+url = c.get("url", "")
+user = c.get("username", "")
+pw = c.get("password", "")
+enc_str = "enc=1" if c.get("enc") else "enc=0"
+dns_val = c.get("dns") or "(нет)"
+tout = c.get("timeout", "")
+p_min = c.get("poll_min", "")
+p_max = c.get("poll_max", "")
+coalesce = c.get("coalesce", "")
+c_size = c.get("chunk_size", "")
+puts = c.get("puts", "")
+r_min = c.get("read_min", "")
+r_max = c.get("read_max", "")
+uri = c.get("uri", "")
+
+print(f"Имя:              \033[1;32m{name}\033[0m")
+print(f"ID:               {cid}")
+print(f"Статус:           {st}")
+print(f"Основной URL:     \033[36m{url}\033[0m")
+print(f"Пользователь:     {user}")
+print(f"Пароль:           {pw}")
+print(f"Шифрование:       {enc_str}")
+print(f"Bootstrap DNS:    {dns_val}")
+print(f"Таймаут:          {tout}")
+print(f"Опрос (min/max):  {p_min} / {p_max}")
+print(f"Coalesce:         {coalesce}")
+print(f"Chunk size:       {c_size}")
+print(f"Puts / Read:      {puts} / {r_min}-{r_max}")
 backends = c.get("backends", [])
-print(f"\nДополнительные бэкенды ({len(backends)}):")
+b_cnt = len(backends)
+print(f"\nДополнительные бэкенды ({b_cnt}):")
 for idx, b in enumerate(backends, 1):
-    lbl = f" [{b.get(\"label\")}]" if b.get("label") else ""
-    print(f"  \033[1;33m#{idx}\033[0m {b.get(\"url\")}{lbl} (user: {b.get(\"username\")})")
+    b_url = b.get("url", "")
+    b_user = b.get("username", "")
+    b_lbl = b.get("label", "")
+    lbl_str = f" [{b_lbl}]" if b_lbl else ""
+    print(f"  \033[1;33m#{idx}\033[0m {b_url}{lbl_str} (user: {b_user})")
 print(f"\nСериализованный URI:")
-print(f"\033[1;36m{c.get(\"uri\", \"\")}\033[0m\n")
+print(f"\033[1;36m{uri}\033[0m\n")
 ' "$v_data"
                 read -p "Нажмите Enter для возврата..."
                 ;;
