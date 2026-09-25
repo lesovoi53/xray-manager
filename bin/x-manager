@@ -6289,7 +6289,7 @@ except Exception as e:
                 echo -e "${CYAN}[*] Чтение текущих настроек /etc/webdav-tunnel/config.env (без перезапуска служб)...${NC}"
                 local imp_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-server" \
                     -H "Content-Type: application/json" \
-                    -d '{"save": false}' 2>/dev/null || echo "")
+                    -d "{\"save\": false, \"server_ip\": \"${SERVER_IP}\"}" 2>/dev/null || echo "")
                 local imp_ok=$(echo "$imp_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
                 if [ "$imp_ok" != "true" ]; then
                     local imp_err=$(echo "$imp_resp" | jq -r '.error // "Неизвестная ошибка"' 2>/dev/null || echo "$imp_resp")
@@ -6322,7 +6322,7 @@ print(f"  \033[36m{uri}\033[0m")
                 if [[ "$conf_imp" =~ ^[YyДд]$ ]]; then
                     local save_resp=$(curl -s -X POST "${SUB_API}/api/webdav/import-server" \
                         -H "Content-Type: application/json" \
-                        -d '{"save": true}' 2>/dev/null || echo "")
+                        -d "{\"save\": true, \"server_ip\": \"${SERVER_IP}\"}" 2>/dev/null || echo "")
                     local save_id=$(echo "$save_resp" | jq -r '.id // empty' 2>/dev/null || echo "")
                     if [ -n "$save_id" ]; then
                         echo -e "${GREEN}✓ Подключение успешно сохранено в каталоге! [ID: ${save_id}]${NC}"
