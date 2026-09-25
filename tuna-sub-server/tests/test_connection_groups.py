@@ -242,10 +242,10 @@ class ConnectionGroupsTests(unittest.TestCase):
             self.assertNotIn(uri1, result.stdout)
             self.assertNotIn(uri2, result.stdout)
         try:
-            run_tui(['2', '1', '1', '1', uri1, uri2, '', 'TUI fixture', '1', '1', '0', '1', '0'])
+            run_tui(['2', '1', '1', '1', '6', uri1, uri2, '', '1', 'TUI fixture', '18', '1', '0', '1', '0'])
             before = self.store.editor(self.user['id'])[1]
             self.assertEqual(len(before['groups']), 1)
-            run_tui(['3', '1', 'Renamed', '1', '2', '1', '2', '2', '1', '0', '1', '0'])
+            run_tui(['3', '1', 'Renamed', '1', '2', '1', '7', '2', '1', '0', '1', '0'])
             after = self.store.editor(self.user['id'])[1]
             self.assertEqual(after['groups'][0]['id'], before['groups'][0]['id'])
             self.assertEqual(after['groups'][0]['name'], 'Renamed')
@@ -253,12 +253,17 @@ class ConnectionGroupsTests(unittest.TestCase):
             self.assertEqual(len(self.publish()['groups']), 1)
             run_tui(['4', '1', 'y', '0'])
             self.assertEqual(self.publish()['groups'], [])
-            run_tui(['1', '2', '1', uri1, uri2, '', 'Speedtest fixture', '2', '1', '0', '1', '0'])
+            run_tui(['1', '2', '1', '5', uri1, uri2, '', '1', 'Speedtest fixture', '18', '1', '8', '2', '10', '2', '19', '2', '11', '3', '12', '2', '0', '1', '0'])
             speedtest = self.publish()['groups'][0]
             self.assertEqual(speedtest['type'], 'SPEEDTEST')
             self.assertEqual(speedtest['testUrl'], 'https://speed.cloudflare.com/__down?bytes=10485760')
             self.assertEqual(speedtest['expectedStatus'], 200)
             self.assertEqual(len(speedtest['memberIds']), 2)
+            for key in ('automatic', 'testOnConnect', 'allowMobile'):
+                self.assertTrue(speedtest[key])
+            self.assertEqual(speedtest['durationSeconds'], 10)
+            self.assertEqual(speedtest['maxBytesPerCandidate'], 5242880)
+            self.assertEqual([p['uri'] for p in self.publish()['profiles']], [uri1, uri2])
         finally:
             server.shutdown()
             server.server_close()

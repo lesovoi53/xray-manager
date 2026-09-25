@@ -185,12 +185,12 @@ def members(state, family, initial=None):
             print('Выберите номер из списка.')
 
 
-LABELS = dict(selectionMode='Стратегия BEST/PRIORITY', probeMethod='Метод GET/HEAD', testUrl='HTTPS URL проверки',
-              expectedStatus='Ожидаемый HTTP статус', automatic='Периодические проверки', testOnConnect='Проверка при подключении',
-              intervalSeconds='Интервал, секунд', timeoutSeconds='Таймаут измерения, секунд', holdSeconds='Удержание, секунд',
-              confirmations='Подтверждения смены', improvementMs='Улучшение задержки, мс', improvementPercent='Улучшение скорости, %',
-              samples='Число запросов', durationSeconds='Длительность загрузки, секунд',
-              maxBytesPerCandidate='Лимит байт на участника', allowMobile='Разрешить мобильную сеть', freshnessSeconds='Актуальность, секунд')
+LABELS = dict(selectionMode='Порядок выбора', probeMethod='Метод GET/HEAD', testUrl='URL проверки подключения',
+              expectedStatus='Ожидаемый HTTP статус', automatic='Повторять тест и выбирать сервер', testOnConnect='Тест при подключении',
+              intervalSeconds='Интервал повторной проверки', timeoutSeconds='Таймаут запроса', holdSeconds='Удержание сервера',
+              confirmations='Подтверждений улучшения / отказа', improvementMs='Допуск URLTest', improvementPercent='Допуск скорости',
+              samples='Запросов на сервер', durationSeconds='Длительность загрузки',
+              maxBytesPerCandidate='Лимит трафика на сервер', allowMobile='Тестировать по мобильной сети', freshnessSeconds='Срок годности результата')
 
 
 def settings(group):
@@ -208,60 +208,129 @@ def settings(group):
             print('Неверный номер')
             continue
         field = fields[int(value) - 1]
-        if field in ('automatic', 'testOnConnect', 'allowMobile'):
-            group[field] = choose([False, True], lambda v: 'Включить' if v else 'Выключить')
-        elif field == 'selectionMode':
-            group[field] = choose(['BEST', 'PRIORITY'], lambda v: {'BEST': 'Лучший результат', 'PRIORITY': 'Приоритет по порядку'}[v])
-        elif field == 'probeMethod':
-            group[field] = choose(['GET'] if group['type'] == 'SPEEDTEST' else ['GET', 'HEAD'], str)
-        elif field == 'testUrl':
-            group[field] = test_url(group['type'], group.get(field))
-        else:
-            presets = dict(expectedStatus=[200, 204], intervalSeconds=[60, 300, 600, 1800],
-                timeoutSeconds=[3, 5, 8, 15, 30], holdSeconds=[0, 60, 120, 300],
-                confirmations=[1, 2, 3, 5], improvementMs=[0, 20, 50, 100, 200],
-                improvementPercent=[0, 10, 20, 30, 50], samples=[1, 2, 3, 4, 5],
-                durationSeconds=[3, 5, 10, 15, 30], maxBytesPerCandidate=[1048576, 5242880, 10485760, 52428800],
-                freshnessSeconds=[60, 300, 600, 1800])
-            values = sorted(set(presets[field] + [group[field]]))
-            group[field] = choose(values, lambda v: str(v) + (' (текущее)' if v == group[field] else ''))
+        change_setting(group, field)
+
+def change_setting(group, field):
+    if field in ('automatic', 'testOnConnect', 'allowMobile'):
+        group[field] = choose([False, True], lambda v: 'Включить' if v else 'Выключить')
+    elif field == 'selectionMode':
+        group[field] = choose(['BEST', 'PRIORITY'], lambda v: {'BEST': 'Лучший результат', 'PRIORITY': 'Приоритет по порядку'}[v])
+    elif field == 'probeMethod':
+        group[field] = choose(['GET'] if group['type'] == 'SPEEDTEST' else ['GET', 'HEAD'], str)
+    elif field == 'testUrl':
+        group[field] = test_url(group['type'], group.get(field))
+    else:
+        presets = dict(expectedStatus=[200, 204], intervalSeconds=[60, 300, 600, 1800],
+            timeoutSeconds=[3, 5, 8, 15, 30], holdSeconds=[0, 60, 120, 300],
+            confirmations=[1, 2, 3, 5], improvementMs=[0, 20, 50, 100, 200],
+            improvementPercent=[0, 10, 20, 30, 50], samples=[1, 2, 3, 4, 5],
+            durationSeconds=[3, 5, 10, 15, 30], maxBytesPerCandidate=[1048576, 5242880, 10485760, 52428800],
+            freshnessSeconds=[60, 300, 600, 1800])
+        values = sorted(set(presets[field] + [group[field]]))
+        group[field] = choose(values, lambda v: str(v) + (' (текущее)' if v == group[field] else ''))
+
+def display_value(field, value):
+    if isinstance(value, bool):
+        return 'Включено' if value else 'Выключено'
+    if field == 'selectionMode':
+        return {'BEST': 'Лучший результат теста', 'PRIORITY': 'Приоритет по порядку'}[value]
+    if field == 'maxBytesPerCandidate':
+        return '%s КиБ' % (value / 1024 if value % 1024 else value // 1024)
+    if field == 'improvementMs':
+        return '%s мс' % value
+    if field == 'improvementPercent':
+        return '%s%%' % value
+    if field.endswith('Seconds'):
+        return '%s с' % value
+    return str(value)
+
+
+def group_fields(kind):
+    fields = ['name', 'type', 'testUrl']
+    fields += ['probeMethod', 'improvementMs'] if kind == 'URL_TEST' else ['improvementPercent']
+    fields += ['memberIds', 'memberOrder', 'selectionMode', 'automatic', 'intervalSeconds', 'testOnConnect']
+    if kind == 'SPEEDTEST':
+        fields += ['durationSeconds', 'maxBytesPerCandidate']
+    fields += ['timeoutSeconds', 'expectedStatus', 'holdSeconds', 'confirmations', 'freshnessSeconds']
+    if kind == 'URL_TEST':
+        fields += ['samples']
+    return fields + ['routingProfileId', 'allowMobile']
 
 
 def edit(state, group):
+    """One visible form for both creation and editing; no hidden mandatory wizard."""
+    labels = dict(LABELS, name='Имя профиля / группы', type='Режим',
+                  memberIds='Тип: список серверов', memberOrder='Порядок серверов',
+                  routingProfileId='Цепочка группы (профиль-источник)')
     while True:
-        print('\n%s [%s / %s / %s]' % (group['name'], group['family'], group['type'], group['selectionMode']))
-        print('  [1] Участники\n  [2] Порядок\n  [3] Профиль маршрутизации\n  [4] Тип теста\n  [5] Параметры проверки\n  [0] Готово')
-        action = input('Действие: ').strip()
-        if action == '0':
-            return
-        if action == '1':
-            group['memberIds'] = members(state, group['family'], group['memberIds'])
-            if group['routingProfileId'] not in group['memberIds']:
-                group['routingProfileId'] = group['memberIds'][0]
-                print('Прежний профиль маршрутизации удалён из группы. Выберите новый в пункте 3.')
-        elif action in ('2', '3'):
-            by_id = {p['id']: p for p in state['profiles']}
-            ordered = [by_id[pid] for pid in group['memberIds']]
-            if action == '3':
-                group['routingProfileId'] = choose(ordered, lambda p: p['name'])['id']
+        by_id = {p['id']: p for p in state['profiles']}
+        fields = group_fields(group['type'])
+        print('\nНАСТРОЙКИ ГРУППЫ — %s' % group['family'])
+        for i, field in enumerate(fields, 1):
+            if field == 'memberIds':
+                value = '%d профилей — добавить ссылки подряд / изменить список' % len(group['memberIds'])
+            elif field == 'memberOrder':
+                value = ' → '.join(by_id[pid]['name'] for pid in group['memberIds']) or 'Список пуст'
+            elif field == 'routingProfileId':
+                value = by_id.get(group.get(field), {}).get('name', 'Не задана — выберите участника группы')
             else:
+                value = display_value(field, group[field])
+            print('  [%d] %s: %s' % (i, labels[field], value))
+        print('DNS и правила берутся из профиля-источника. Измерения выполняет клиент после подключения.')
+        print('  [0] Готово — проверить и перейти к сохранению\n  [99] Отмена без сохранения')
+        answer = input('Настройка: ').strip()
+        if answer == '99':
+            return False
+        if answer == '0':
+            try:
+                validate({'profiles': state['profiles'], 'groups': [group]})
+            except Invalid:
+                print('Группа не готова: нужны имя, минимум два сервера и профиль-источник из списка; проверьте параметры.')
+                continue
+            return True
+        if not answer.isdigit() or not 1 <= int(answer) <= len(fields):
+            print('Выберите номер настройки.')
+            continue
+        field = fields[int(answer)-1]
+        try:
+            if field == 'name':
+                name = input('Имя (Enter — оставить текущее): ').strip()
+                if name:
+                    group['name'] = name
+            elif field == 'type':
+                kind = choose(['URL_TEST', 'SPEEDTEST'], str)
+                if kind != group['type']:
+                    url = test_url(kind)
+                    group['type'], group['testUrl'] = kind, url
+                    group['expectedStatus'] = 200 if kind == 'SPEEDTEST' else 204
+                    if kind == 'SPEEDTEST':
+                        group['probeMethod'] = 'GET'
+            elif field == 'memberIds':
+                local = copy.deepcopy(state)
+                selected = (members(local, group['family'], group['memberIds']) if group['memberIds']
+                            else add_servers(local, group['family']))
+                state['profiles'] = local['profiles']
+                group['memberIds'] = selected
+                if group.get('routingProfileId') not in selected:
+                    group['routingProfileId'] = None
+                    print('Выберите цепочку группы (профиль-источник) в настройках.')
+            elif field in ('routingProfileId', 'memberOrder'):
+                ordered = [by_id[pid] for pid in group['memberIds']]
+                if not ordered:
+                    print('Сначала добавьте серверы в список.')
+                    continue
                 profile = choose(ordered, lambda p: p['name'])
-                direction = choose([-1, 1], lambda d: 'Выше' if d == -1 else 'Ниже')
-                old = group['memberIds'].index(profile['id'])
-                new = max(0, min(len(ordered)-1, old+direction))
-                group['memberIds'].insert(new, group['memberIds'].pop(old))
-        elif action == '4':
-            kind = choose(['URL_TEST', 'SPEEDTEST'], str)
-            url = test_url(kind, group.get('testUrl') if kind == group['type'] else None)
-            group['type'], group['testUrl'] = kind, url
-            group['expectedStatus'] = 200 if group['type'] == 'SPEEDTEST' else 204
-            if group['type'] == 'SPEEDTEST' and group['probeMethod'] != 'GET':
-                print('SPEEDTEST требует GET: метод проверки изменён на GET.')
-                group['probeMethod'] = 'GET'
-        elif action == '5':
-            settings(group)
-        else:
-            raise Invalid('Неверное действие')
+                if field == 'routingProfileId':
+                    group[field] = profile['id']
+                else:
+                    direction = choose([-1, 1], lambda d: 'Выше' if d == -1 else 'Ниже')
+                    old = group['memberIds'].index(profile['id'])
+                    new = max(0, min(len(ordered)-1, old+direction))
+                    group['memberIds'].insert(new, group['memberIds'].pop(old))
+            else:
+                change_setting(group, field)
+        except Invalid as error:
+            print(str(error))
 
 
 def main(argv=None):
@@ -300,18 +369,15 @@ def main(argv=None):
                 kind = choose(['URL_TEST', 'SPEEDTEST'], str)
                 print('Семейство серверов:')
                 family = choose(list(FAMILIES), str)
-                selected = add_servers(working, family)
-                name = input('Имя группы: ').strip()
-                group = dict(DEFAULTS, id=str(uuid.uuid4()), name=name, family=family, category=FAMILIES[family],
-                             type=kind, enabled=True, testOnConnect=kind == 'URL_TEST')
-                group['testUrl'] = test_url(kind)
+                group = dict(DEFAULTS, id=str(uuid.uuid4()), name=family + ' ' + kind,
+                             family=family, category=FAMILIES[family], type=kind,
+                             enabled=True, testOnConnect=kind == 'URL_TEST', memberIds=[], routingProfileId=None,
+                             testUrl=('https://www.gstatic.com/generate_204' if kind == 'URL_TEST'
+                                      else 'https://speed.cloudflare.com/__down?bytes=10485760'))
                 if kind == 'SPEEDTEST':
                     group['expectedStatus'] = 200
-                group['memberIds'] = selected
-                by_id = {p['id']: p for p in working['profiles']}
-                print('Профиль маршрутизации группы:')
-                group['routingProfileId'] = choose([by_id[pid] for pid in group['memberIds']], lambda p: p['name'])['id']
-                settings(group)
+                if not edit(working, group):
+                    continue
                 working['groups'].append(group)
             elif action in ('2', '3', '4', '5'):
                 if not working['groups']:
@@ -319,7 +385,8 @@ def main(argv=None):
                     continue
                 group = choose(working['groups'], lambda g: g['name'])
                 if action == '2':
-                    edit(working, group)
+                    if not edit(working, group):
+                        continue
                 elif action == '3':
                     group['name'] = input('Новое имя: ').strip()
                 elif action == '4':

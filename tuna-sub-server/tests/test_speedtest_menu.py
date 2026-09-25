@@ -50,11 +50,29 @@ class SpeedtestMenuTests(unittest.TestCase):
             tui.settings(group)
         self.assertEqual(group, original)
 
+    def test_form_shows_all_mode_specific_settings_before_servers(self):
+        for kind in ('URL_TEST', 'SPEEDTEST'):
+            group = dict(tui.DEFAULTS, name='Test', family='VPN', type=kind, testUrl='https://example.test/probe', memberIds=[], routingProfileId=None, testOnConnect=False)
+            with patch('builtins.input', side_effect=['99']), redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(tui.edit({'profiles': []}, group))
+            for field in tui.group_fields(kind):
+                if field in tui.LABELS:
+                    self.assertIn(tui.LABELS[field], output.getvalue())
+            self.assertIn('Цепочка группы', output.getvalue())
+            self.assertIn('0 профилей', output.getvalue())
+            self.assertNotIn('Ссылка сервера (добавлено', output.getvalue())
+
+    def test_incomplete_form_stays_open_instead_of_saving(self):
+        group = dict(tui.DEFAULTS, name='Test', family='VPN', type='URL_TEST', testUrl='https://example.test/probe', memberIds=[], routingProfileId=None, testOnConnect=True)
+        with patch('builtins.input', side_effect=['0', '99']), redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(tui.edit({'profiles': []}, group))
+        self.assertIn('Группа не готова', output.getvalue())
+
     def test_cancel_type_change_preserves_entire_group(self):
-        group = dict(tui.DEFAULTS, name='Test', family='VPN', type='URL_TEST', testUrl='https://example.test/probe', probeMethod='HEAD')
+        group = dict(tui.DEFAULTS, name='Test', family='VPN', type='URL_TEST', testUrl='https://example.test/probe', probeMethod='HEAD', memberIds=[], routingProfileId=None, testOnConnect=True)
         original = copy.deepcopy(group)
-        with patch('builtins.input', side_effect=['4', '2', '0']), redirect_stdout(io.StringIO()), self.assertRaises(tui.Invalid):
-            tui.edit({}, group)
+        with patch('builtins.input', side_effect=['2', '2', '0', '99']), redirect_stdout(io.StringIO()):
+            self.assertFalse(tui.edit({'profiles': []}, group))
         self.assertEqual(group, original)
 
 
