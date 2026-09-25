@@ -27,9 +27,9 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Проверка аргументов
-MODE="interactive"
-if [ "$1" = "--quick" ] || [ "$1" = "-q" ] || [ "$1" = "--auto" ]; then
-    MODE="quick"
+MODE="quick"
+if [ "$1" = "--manual" ] || [ "$1" = "-m" ] || [ "$1" = "--interactive" ] || [ "$1" = "-i" ]; then
+    MODE="interactive"
 fi
 
 # Баннер
@@ -67,6 +67,9 @@ if [ "$MODE" = "interactive" ]; then
         0) exit 0 ;;
         *) MODE="quick" ;;
     esac
+else
+    echo -e "${GREEN}⚡ Режим: Быстрый старт (автоматическая установка «под ключ» с автоподхватом шлюзов)...${NC}"
+    echo ""
 fi
 
 # Значения по умолчанию
