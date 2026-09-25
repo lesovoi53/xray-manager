@@ -1,4 +1,4 @@
-# Third-party components in v2026.09.25.2
+# Third-party components in v2026.09.26.1
 
 The installer does not replace the independent Xray, WDTT or CSQTT installation.
 Only amd64 release artifacts are mirrored. See `components.json` for exact hashes.

@@ -1325,35 +1325,144 @@ mieru_manage_presets() {
     done
 }
 
+xm_update_socks_route() {
+    # Keep config contents and ownership; a menu failure must not report success.
+    python3 - "$@" <<'PY_ROUTE'
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+
+kind, mode, raw_port, unit, *names = sys.argv[1:]
+backups = []
+changed = []
+was_active = False
+
+class RoutingError(ValueError):
+    pass
+
+def service(*args):
+    return subprocess.run(['systemctl', *args], stdout=subprocess.DEVNULL).returncode == 0
+
+def replace(path, data):
+    stat = path.stat()
+    fd, name = tempfile.mkstemp(prefix='.x-manager-route-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            os.fchown(stream.fileno(), stat.st_uid, stat.st_gid)
+            os.fchmod(stream.fileno(), stat.st_mode & 0o7777)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+try:
+    if kind not in ('mieru', 'dns') or mode not in ('xray', 'direct'):
+        raise RoutingError('Unknown routing mode')
+    if mode == 'xray':
+        if not re.fullmatch(r'[0-9]+', raw_port):
+            raise RoutingError('Saved SOCKS port is not a number')
+        port = int(raw_port)
+        if not 1 <= port <= 65535 or port in (443, 8443):
+            raise RoutingError('Saved SOCKS port is invalid or forbidden')
+    updates = []
+    for name in names:
+        path = Path(name)
+        if not path.exists():
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise RoutingError('Expected a regular configuration file')
+        original = path.read_text()
+        if kind == 'mieru':
+            config = json.loads(original)
+            if not isinstance(config, dict) or not isinstance(config.get('users'), list) or not isinstance(config.get('portBindings'), list):
+                raise RoutingError('Invalid Mieru configuration structure')
+            if mode == 'xray':
+                config['egress'] = {'proxies': [{'name': 'xray_socks', 'protocol': 'SOCKS5_PROXY_PROTOCOL',
+                    'host': '127.0.0.1', 'port': port}], 'rules': [{'ipRanges': ['*'], 'domainNames': ['*'],
+                    'action': 'PROXY', 'proxyNames': ['xray_socks']}]}
+            else:
+                config.pop('egress', None)
+            content = json.dumps(config, ensure_ascii=False, indent=2) + '\n'
+        else:
+            config = tomllib.loads(original)
+            values = {'USE_EXTERNAL_SOCKS5': mode == 'xray'}
+            if mode == 'xray':
+                values.update(FORWARD_IP='127.0.0.1', FORWARD_PORT=port)
+            content = original
+            for key, value in values.items():
+                if key not in config:
+                    raise RoutingError('Missing DNS routing key: ' + key)
+                content, count = re.subn(r'(?m)^' + key + r'[ \t]*=.*$', key + ' = ' + json.dumps(value), content)
+                if count != 1:
+                    raise RoutingError('Ambiguous DNS routing key: ' + key)
+            validated = tomllib.loads(content)
+            if any(validated.get(k) != v for k, v in values.items()):
+                raise RoutingError('DNS routing validation failed')
+        updates.append((path, content.encode()))
+    if not updates:
+        raise RoutingError('No configuration found; nothing changed')
+    was_active = service('is-active', '--quiet', unit)
+    for path, data in updates:
+        directory = Path(tempfile.mkdtemp(prefix='.x-manager-route-backup-', dir=path.parent))
+        backup = directory / path.name
+        shutil.copy2(path, backup)
+        backups.append((path, backup))
+        print('Backup: ' + str(backup))
+    for path, data in updates:
+        replace(path, data)
+        changed.append(path)
+    if was_active:
+        if not service('restart', unit):
+            raise RuntimeError('Service restart failed: ' + unit)
+        time.sleep(2)
+        if not service('is-active', '--quiet', unit):
+            raise RuntimeError('Service did not remain active: ' + unit)
+    else:
+        print('Stopped service preserved: ' + unit)
+except Exception as error:
+    # JSON/TOML parser messages can contain credentials. Never echo their values.
+    message = str(error) if isinstance(error, (RoutingError, RuntimeError)) else type(error).__name__
+    print('Routing update failed: ' + message + '; inspect configuration locally.', file=sys.stderr)
+    restored = True
+    for path, backup in reversed(backups):
+        if path in changed:
+            try:
+                replace(path, backup.read_bytes())
+            except Exception:
+                restored = False
+    if changed and was_active:
+        restored = service('restart', unit) and restored
+        if restored:
+            time.sleep(2)
+            restored = service('is-active', '--quiet', unit)
+    if changed:
+        print('Previous configuration restored.' if restored else 'ROLLBACK FAILED: keep printed backups and inspect the service.', file=sys.stderr)
+    sys.exit(1)
+PY_ROUTE
+}
+
 mieru_manage_routing() {
     show_mieru_header
     echo -e "${BOLD}--- Настройка маршрутизации Mieru ---${NC}"
     echo -e "Текущий режим: $(get_mieru_routing)"
-    echo ""
-    echo -e "  ${YELLOW}[1]${NC} 🌐 Маршрутизация Xray"
-    echo -e "  ${YELLOW}[2]${NC} ⚡ Прямой выход"
-    echo ""
-    echo -e "  ${YELLOW}[0]${NC} Назад"
-    echo ""
-    read -p "Выберите режим [0-2]: " r_choice
-    case "$r_choice" in
-        1)
-            local tmp_cfg="/tmp/mita_egress_cfg.json"
-            jq '.egress = {"proxies": [{"name": "xray_socks", "protocol": "SOCKS5_PROXY_PROTOCOL", "host": "127.0.0.1", "port": 10808}], "rules": [{"ipRanges": ["*"], "domainNames": ["*"], "action": "PROXY", "proxyNames": ["xray_socks"]}]}' \
-               "$MIERU_CONFIG_FILE" > "$tmp_cfg" && mv "$tmp_cfg" "$MIERU_CONFIG_FILE"
-            restart_mieru_and_verify
-            echo -e "${GREEN}✓ Маршрутизация Mieru: Xray${NC}"
-            sleep 2
-            ;;
-        2)
-            local tmp_cfg="/tmp/mita_no_egress.json"
-            jq 'del(.egress)' "$MIERU_CONFIG_FILE" > "$tmp_cfg" && mv "$tmp_cfg" "$MIERU_CONFIG_FILE"
-            restart_mieru_and_verify
-            echo -e "${GREEN}✓ Маршрутизация Mieru: Прямой выход${NC}"
-            sleep 2
-            ;;
-        0) return ;;
-    esac
+    echo "  [1] Маршрутизация Xray SOCKS5 (127.0.0.1:${XRAY_SOCKS_PORT:-10808})"
+    echo '  [2] Прямой выход'
+    echo '  [0] Назад'
+    local r_choice mode
+    read -r -p 'Выберите режим [0-2]: ' r_choice || return 1
+    case "$r_choice" in 1) mode=xray;; 2) mode=direct;; *) return;; esac
+    xm_update_socks_route mieru "$mode" "${XRAY_SOCKS_PORT:-10808}" mita "$MIERU_CONFIG_FILE" || return 1
+    echo -e "${GREEN}✓ Маршрутизация Mieru сохранена: ${mode}${NC}"
 }
 
 mieru_export_links() {
@@ -3144,37 +3253,15 @@ dns_change_routing() {
     clear
     echo -e "${BOLD}--- Настройка маршрутизации DNS-туннеля ---${NC}"
     echo -e "Текущий режим: $(get_dns_routing)"
-    echo ""
-    echo -e "  ${YELLOW}[1]${NC} 🌐 Маршрутизация Xray SOCKS5 (127.0.0.1:10808) ${GREEN}[Рекомендуется]${NC}"
-    echo -e "  ${YELLOW}[2]${NC} ⚡ Прямой выход (Direct)"
-    echo -e "  ${YELLOW}[0]${NC} Отмена"
-    echo ""
-    read -p "Выберите режим [0-2]: " r_choice
-    case "$r_choice" in
-        1)
-            for f in "$COTTEN_CONFIG_FILE" "$MASTERDNS_CONFIG_FILE"; do
-                if [ -f "$f" ]; then
-                    sed -i 's/^USE_EXTERNAL_SOCKS5\s*=.*/USE_EXTERNAL_SOCKS5 = true/' "$f"
-                    sed -i 's/^FORWARD_IP\s*=.*/FORWARD_IP = "127.0.0.1"/' "$f"
-                    sed -i 's/^FORWARD_PORT\s*=.*/FORWARD_PORT = ${XRAY_SOCKS_PORT:-10808}/' "$f"
-                fi
-            done
-            echo -e "${GREEN}✓ Маршрутизация установлена: Xray SOCKS5${NC}"
-            ;;
-        2)
-            for f in "$COTTEN_CONFIG_FILE" "$MASTERDNS_CONFIG_FILE"; do
-                if [ -f "$f" ]; then
-                    sed -i 's/^USE_EXTERNAL_SOCKS5\s*=.*/USE_EXTERNAL_SOCKS5 = false/' "$f"
-                fi
-            done
-            echo -e "${GREEN}✓ Маршрутизация установлена: Прямой выход (Direct)${NC}"
-            ;;
-        *) return ;;
-    esac
-
-    local cur_s=$(get_active_dns_engine)
-    systemctl restart "$cur_s" 2>/dev/null || true
-    sleep 2
+    echo "  [1] Маршрутизация Xray SOCKS5 (127.0.0.1:${XRAY_SOCKS_PORT:-10808})"
+    echo '  [2] Прямой выход (Direct)'
+    echo '  [0] Отмена'
+    local r_choice mode cur_s
+    read -r -p 'Выберите режим [0-2]: ' r_choice || return 1
+    case "$r_choice" in 1) mode=xray;; 2) mode=direct;; *) return;; esac
+    cur_s=$(get_active_dns_engine) || return 1
+    xm_update_socks_route dns "$mode" "${XRAY_SOCKS_PORT:-10808}" "$cur_s" "$COTTEN_CONFIG_FILE" "$MASTERDNS_CONFIG_FILE" || return 1
+    echo -e "${GREEN}✓ Маршрутизация DNS сохранена: ${mode}${NC}"
 }
 
 menu_dns_settings() {
