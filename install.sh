@@ -765,7 +765,7 @@ if [ "$INSTALL_OPENFLUX" = "yes" ]; then
             rm -rf "$tmp_of"
             echo -e "  -> Клонирование и компиляция p1neappleXpress/OpenFlux..."
             if git clone --depth 1 https://github.com/p1neappleXpress/OpenFlux.git "$tmp_of" >/dev/null 2>&1; then
-                local patch_file=""
+                patch_file=""
                 if [ -f "$SCRIPT_DIR/patches/openflux-multistream.patch" ]; then
                     patch_file="$SCRIPT_DIR/patches/openflux-multistream.patch"
                 elif [ -f "/usr/local/share/x-manager/patches/openflux-multistream.patch" ]; then
