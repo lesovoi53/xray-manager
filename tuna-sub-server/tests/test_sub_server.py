@@ -35,6 +35,19 @@ repair_openflux_v2_database = tuna_module.repair_openflux_v2_database
 rollback_openflux_v2_database = tuna_module.rollback_openflux_v2_database
 is_canonical_uuid = tuna_module.is_canonical_uuid
 init_database = tuna_module.init_database
+serialize_webdav_uri = tuna_module.serialize_webdav_uri
+parse_webdav_uri = tuna_module.parse_webdav_uri
+validate_storage_spec = tuna_module.validate_storage_spec
+validate_tuning_params = tuna_module.validate_tuning_params
+import_server_webdav_config = tuna_module.import_server_webdav_config
+MAX_WEBDAV_BACKENDS = tuna_module.MAX_WEBDAV_BACKENDS
+MAX_WEBDAV_URI_BYTES = tuna_module.MAX_WEBDAV_URI_BYTES
+MAX_SUBSCRIPTION_RESPONSE_BYTES = tuna_module.MAX_SUBSCRIPTION_RESPONSE_BYTES
+
+repair_webdav_module = import_module("repair_webdav")
+migrate_webdav_database = repair_webdav_module.migrate_webdav_database
+rollback_webdav_database = repair_webdav_module.rollback_webdav_database
+
 
 
 
@@ -1755,8 +1768,454 @@ class TunaSubscriptionTests(unittest.TestCase):
         self.assertFalse(is_canonical_uuid("00000000-0000-0000-0000-00000000000A")) # Uppercase
         self.assertFalse(is_canonical_uuid("not-a-uuid"))
 
+    # --------------------------------------------------------------------------
+    # ТЕСТ 42: WebDAV - ядро сериализации, парсинга, валидации и контракта TUNA rc9
+    # --------------------------------------------------------------------------
+    def test_42_webdav_core_serialization_and_parsing(self):
+        # 1. Основной backend без дополнительных (0 бэкендов)
+        c0 = {
+            "name": "Single-Dav",
+            "url": "https://webdav.cloud.mail.ru/",
+            "username": "mail_user",
+            "password": "mail_password",
+            "backends": [],
+            "timeout": "45s",
+            "poll_min": "100ms",
+            "poll_max": "300ms",
+            "coalesce": "10ms",
+            "chunk_size": 65536,
+            "puts": 4,
+            "read_min": 2,
+            "read_max": 6,
+            "enc": 0,
+            "dns": ""
+        }
+        ok, err, uri0 = serialize_webdav_uri(c0)
+        self.assertTrue(ok, err)
+        self.assertTrue(uri0.startswith("webdavs://mail_user:mail_password@webdav.cloud.mail.ru/"))
+        self.assertIn("#Single-Dav", uri0)
+        self.assertNotIn("enc=", uri0) # enc=0 опускается
+        self.assertNotIn("backend=", uri0)
+
+        # 2. Ровно 1 дополнительный бэкенд и 8 дополнительных бэкендов (максимум)
+        c1 = dict(c0)
+        c1["backends"] = [{"url": "http://192.0.2.1:8080/storage/", "username": "u1", "password": "p1"}]
+        ok, err, uri1 = serialize_webdav_uri(c1)
+        self.assertTrue(ok, err)
+        self.assertIn("backend=webdav%3A%2F%2Fu1%3Ap1%40192.0.2.1%3A8080%2Fstorage%2F", uri1)
+
+        c8 = dict(c0)
+        c8["backends"] = [
+            {"url": f"https://s{i}.example.com/dav/", "username": f"u{i}", "password": f"p{i}"}
+            for i in range(1, 9)
+        ]
+        ok, err, uri8 = serialize_webdav_uri(c8)
+        self.assertTrue(ok, err)
+        self.assertEqual(uri8.count("backend="), 8)
+
+        # 3. 9 дополнительных бэкендов отклоняются
+        c9 = dict(c0)
+        c9["backends"] = [
+            {"url": f"https://s{i}.example.com/dav/", "username": f"u{i}", "password": f"p{i}"}
+            for i in range(1, 10)
+        ]
+        ok, err, _ = serialize_webdav_uri(c9)
+        self.assertFalse(ok)
+        self.assertIn("Too many backends", err)
+
+        # 4. HTTP vs HTTPS, нестандартный порт 8443, IPv6, путь, кириллица
+        c_ipv6 = {
+            "name": "Мой Сервер 2026",
+            "url": "http://[::1]:8443/custom/path/",
+            "username": "user",
+            "password": "pass",
+            "backends": [],
+            "enc": 1,
+            "dns": "tcp://[2001:4860:4860::8888]:853"
+        }
+        ok, err, uri_ipv6 = serialize_webdav_uri(c_ipv6)
+        self.assertTrue(ok, err)
+        self.assertTrue(uri_ipv6.startswith("webdav://user:pass@[::1]:8443/custom/path/"))
+        self.assertIn("enc=1", uri_ipv6)
+        self.assertIn("dns=tcp%3A%2F%2F%5B2001%3A4860%3A4860%3A%3A8888%5D%3A853", uri_ipv6)
+        self.assertTrue(uri_ipv6.endswith("#%D0%9C%D0%BE%D0%B9%20%D0%A1%D0%B5%D1%80%D0%B2%D0%B5%D1%80%202026"))
+
+        # 5. Специальные символы в логинах и паролях: : @ + & % ? # /
+        complex_spec = {
+            "name": "Complex-Chars",
+            "url": "https://storage.corp.com:9443/dav/",
+            "username": "user:admin@corp+dept&co%3F#/",
+            "password": "p:a@s+s&w%o?r#d/123!",
+            "backends": [
+                {
+                    "url": "http://backup.local/dav/",
+                    "username": "b:u@s+e&r",
+                    "password": "b:p@a+s&s"
+                }
+            ],
+            "timeout": "60s"
+        }
+        ok, err, uri_complex = serialize_webdav_uri(complex_spec)
+        self.assertTrue(ok, err)
+        # Обратный парсинг должен восстановить исходные символы 1 в 1
+        ok_p, err_p, parsed_complex = parse_webdav_uri(uri_complex)
+        self.assertTrue(ok_p, err_p)
+        self.assertEqual(parsed_complex["username"], complex_spec["username"])
+        self.assertEqual(parsed_complex["password"], complex_spec["password"])
+        self.assertEqual(parsed_complex["backends"][0]["username"], "b:u@s+e&r")
+        self.assertEqual(parsed_complex["backends"][0]["password"], "b:p@a+s&s")
+
+        # 6. Отклонение дубликатов одиночных ключей и неизвестных параметров
+        dup_uri = "webdav://u:p@127.0.0.1:8443/?timeout=10s&timeout=20s#Test"
+        ok_d, err_d, _ = parse_webdav_uri(dup_uri)
+        self.assertFalse(ok_d)
+        self.assertIn("Duplicate", err_d)
+
+        unknown_uri = "webdav://u:p@127.0.0.1:8443/?foo=bar#Test"
+        ok_u, err_u, _ = parse_webdav_uri(unknown_uri)
+        self.assertFalse(ok_u)
+        self.assertIn("Unknown query parameter", err_u)
+
+        # 7. Отклонение пустых credentials
+        empty_cred = {
+            "name": "Empty-Cred",
+            "url": "http://127.0.0.1:8443/",
+            "username": "",
+            "password": "p"
+        }
+        ok_ec, err_ec, _ = serialize_webdav_uri(empty_cred)
+        self.assertFalse(ok_ec)
+        self.assertIn("cannot be empty", err_ec)
+
+        # 8. Отклонение недопустимого диапазона тюнинга
+        bad_tuning = dict(c0)
+        bad_tuning["poll_min"] = "500ms"
+        bad_tuning["poll_max"] = "200ms" # poll_max < poll_min
+        ok_bt, err_bt, _ = serialize_webdav_uri(bad_tuning)
+        self.assertFalse(ok_bt)
+        self.assertIn("poll-max", err_bt)
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 43: WebDAV API - управление каталогом, CRUD, маскирование секретов и импорт
+    # --------------------------------------------------------------------------
+    def test_43_webdav_api_catalog_crud_and_secrets(self):
+        # 1. Создание подключения в каталоге
+        conn_payload = {
+            "name": "Catalog-Conn-1",
+            "url": "https://webdav.yandex.ru/",
+            "username": "yandex_test",
+            "password": "secret_yandex_password_999",
+            "backends": [
+                {
+                    "url": "http://backup.local:8080/storage/",
+                    "username": "b_user",
+                    "password": "b_secret_pass",
+                    "label": "Local Backup"
+                }
+            ],
+            "timeout": "30s",
+            "enc": 1
+        }
+        st, _, b = self.api_request("POST", "/api/webdav/connections", conn_payload)
+        self.assertEqual(st, 201)
+        created = json.loads(b.decode())
+        conn_id = created["id"]
+        self.assertEqual(created["name"], "Catalog-Conn-1")
+        self.assertTrue(created["uri"].startswith("webdavs://"))
+
+        # 2. Получение списка: по умолчанию пароли маскируются звездочками
+        st, _, b = self.api_request("GET", "/api/webdav/connections")
+        self.assertEqual(st, 200)
+        conns = json.loads(b.decode())
+        target = next((c for c in conns if c["id"] == conn_id), None)
+        self.assertIsNotNone(target)
+        self.assertNotIn("secret_yandex_password_999", target["password"])
+        self.assertIn("*", target["password"])
+        self.assertNotIn("b_secret_pass", target["backends"][0]["password"])
+
+        # 3. Получение списка с ?secrets=1: пароли выдаются открытыми
+        st, _, b = self.api_request("GET", "/api/webdav/connections?secrets=1")
+        self.assertEqual(st, 200)
+        conns_sec = json.loads(b.decode())
+        target_sec = next((c for c in conns_sec if c["id"] == conn_id), None)
+        self.assertEqual(target_sec["password"], "secret_yandex_password_999")
+        self.assertEqual(target_sec["backends"][0]["password"], "b_secret_pass")
+
+        # 4. Обновление подключения: сохранение пароля при маскированном/пропущенном значении
+        update_payload = {
+            "name": "Catalog-Conn-1-Renamed",
+            "timeout": "50s"
+        }
+        st, _, b = self.api_request("PUT", f"/api/webdav/connections/{conn_id}", update_payload)
+        self.assertEqual(st, 200)
+        upd = json.loads(b.decode())
+        self.assertEqual(upd["name"], "Catalog-Conn-1-Renamed")
+        self.assertEqual(upd["timeout"], "50s")
+
+        # Проверяем, что пароль не был затерт
+        st, _, b = self.api_request("GET", f"/api/webdav/connections/{conn_id}?secrets=1")
+        self.assertEqual(st, 200)
+        target_upd = json.loads(b.decode())
+        self.assertEqual(target_upd["password"], "secret_yandex_password_999")
+
+        # 5. Импорт из URI (предпросмотр vs сохранение)
+        raw_import_uri = (
+            "webdav://imp_user:imp_pass@192.0.2.55:8443/dav/?"
+            "timeout=25s&poll-min=150ms&poll-max=400ms&coalesce=15ms&chunk-size=65536&puts=6&read-min=2&read-max=6&enc=1"
+            "&backend=webdavs%3A%2F%2Fextra_u%3Aextra_p%40s2.example.com%2Fdav%2F#Imported-Dav"
+        )
+        # 5a. Только предпросмотр (save=false)
+        st, _, b = self.api_request("POST", "/api/webdav/import-uri", {"uri": raw_import_uri, "save": False})
+        self.assertEqual(st, 200)
+        prev_data = json.loads(b.decode())
+        self.assertTrue(prev_data["success"])
+        self.assertEqual(prev_data["connection"]["name"], "Imported-Dav")
+        self.assertEqual(prev_data["connection"]["username"], "imp_user")
+        self.assertEqual(prev_data["connection"]["password"], "imp_pass")
+        self.assertEqual(len(prev_data["connection"]["backends"]), 1)
+
+        # 5b. Сохранение (save=true)
+        st, _, b = self.api_request("POST", "/api/webdav/import-uri", {"uri": raw_import_uri, "save": True})
+        self.assertEqual(st, 201)
+        saved_import = json.loads(b.decode())
+        self.assertEqual(saved_import["name"], "Imported-Dav")
+
+        # 6. Удаление подключения
+        st, _, _ = self.api_request("DELETE", f"/api/webdav/connections/{saved_import['id']}")
+        self.assertEqual(st, 200)
+        st_get_del, _, _ = self.api_request("GET", f"/api/webdav/connections/{saved_import['id']}")
+        self.assertEqual(st_get_del, 404)
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 44: WebDAV - привязка к пользователям, изоляция, порядок и предпросмотр
+    # --------------------------------------------------------------------------
+    def test_44_webdav_user_assignment_selection_and_preview(self):
+        # 1. Создаем двух пользователей: wd_alice и wd_bob
+        self.api_request("POST", "/api/users", {"nickname": "wd_alice"})
+        self.api_request("POST", "/api/users", {"nickname": "wd_bob"})
+
+        # 2. Создаем два подключения в каталоге
+        st_c1, _, b_c1 = self.api_request("POST", "/api/webdav/connections", {
+            "name": "Pool-Conn-Alpha",
+            "url": "http://10.0.0.1:8443/dav/",
+            "username": "user_a",
+            "password": "pass_a",
+            "backends": []
+        })
+        c_alpha_id = json.loads(b_c1.decode())["id"]
+
+        st_c2, _, b_c2 = self.api_request("POST", "/api/webdav/connections", {
+            "name": "Pool-Conn-Beta",
+            "url": "https://10.0.0.2:8443/dav/",
+            "username": "user_b",
+            "password": "pass_b",
+            "backends": []
+        })
+        c_beta_id = json.loads(b_c2.decode())["id"]
+
+        # 3. Назначаем wd_alice: Alpha затем Beta
+        st, _, b = self.api_request("PUT", "/api/users/wd_alice/webdav", {
+            "enabled": True,
+            "connection_ids": [c_alpha_id, c_beta_id]
+        })
+        self.assertEqual(st, 200)
+        alice_cfg = json.loads(b.decode())
+        self.assertEqual(len(alice_cfg["connections"]), 2)
+        self.assertEqual(alice_cfg["connections"][0]["id"], c_alpha_id)
+        self.assertEqual(alice_cfg["connections"][1]["id"], c_beta_id)
+
+        # 4. Назначаем wd_bob: только Beta
+        st, _, b = self.api_request("PUT", "/api/users/wd_bob/webdav", {
+            "enabled": True,
+            "connection_ids": [c_beta_id]
+        })
+        self.assertEqual(st, 200)
+        bob_cfg = json.loads(b.decode())
+        self.assertEqual(len(bob_cfg["connections"]), 1)
+        self.assertEqual(bob_cfg["connections"][0]["id"], c_beta_id)
+
+        # 5. Предпросмотр выдачи для wd_alice: 2 URI в строгом порядке
+        st, _, b = self.api_request("GET", "/api/users/wd_alice/webdav/preview")
+        self.assertEqual(st, 200)
+        alice_prev = json.loads(b.decode())
+        self.assertTrue(alice_prev["enabled"])
+        self.assertEqual(alice_prev["count"], 2)
+        self.assertIn("#Pool-Conn-Alpha", alice_prev["uris"][0])
+        self.assertIn("#Pool-Conn-Beta", alice_prev["uris"][1])
+
+        # 6. Предпросмотр выдачи для wd_bob: 1 URI
+        st, _, b = self.api_request("GET", "/api/users/wd_bob/webdav/preview")
+        self.assertEqual(st, 200)
+        bob_prev = json.loads(b.decode())
+        self.assertEqual(bob_prev["count"], 1)
+        self.assertIn("#Pool-Conn-Beta", bob_prev["uris"][0])
+
+        # 7. Изменение порядка для wd_alice: Beta затем Alpha
+        self.api_request("PUT", "/api/users/wd_alice/webdav", {
+            "enabled": True,
+            "connection_ids": [c_beta_id, c_alpha_id]
+        })
+        st, _, b = self.api_request("GET", "/api/users/wd_alice/webdav/preview")
+        alice_prev_reorder = json.loads(b.decode())
+        self.assertIn("#Pool-Conn-Beta", alice_prev_reorder["uris"][0])
+        self.assertIn("#Pool-Conn-Alpha", alice_prev_reorder["uris"][1])
+
+        # wd_bob остался без изменений
+        st, _, b = self.api_request("GET", "/api/users/wd_bob/webdav/preview")
+        self.assertEqual(json.loads(b.decode())["count"], 1)
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 45: WebDAV в подписке - Base64 декодирование, ETag, 304 и лимит 2 MiB
+    # --------------------------------------------------------------------------
+    def test_45_webdav_subscription_emission_etag_and_limits(self):
+        # 1. Получаем токен wd_alice
+        st, _, b = self.api_request("GET", "/api/users/wd_alice")
+        alice_info = json.loads(b.decode())
+        token = alice_info["token"]
+
+        # 2. Запрос подписки
+        st, hdrs, body = self.api_request("GET", f"/sub/{token}")
+        self.assertEqual(st, 200)
+        etag1 = hdrs.get("ETag") or hdrs.get("etag")
+        self.assertIsNotNone(etag1)
+
+        # Декодируем Base64 и проверяем наличие WebDAV строк
+        lines = [line.strip() for line in base64.b64decode(body).decode("utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("webdavs://"))
+        self.assertTrue(lines[1].startswith("webdav://"))
+
+        # 3. Повторный запрос с If-None-Match возвращает 304 Not Modified
+        st_304, _, _ = self.api_request("GET", f"/sub/{token}", headers={"If-None-Match": etag1})
+        self.assertEqual(st_304, 304)
+
+        # 4. Обновляем подключение в каталоге: меняем таймаут и проверяем смену ETag (не должно быть старого 304)
+        c_cursor = self.app.conn.cursor()
+        c_cursor.execute("SELECT id FROM webdav_connections WHERE name = 'Pool-Conn-Beta';")
+        beta_id = c_cursor.fetchone()[0]
+
+        self.api_request("PUT", f"/api/webdav/connections/{beta_id}", {
+            "timeout": "42s"
+        })
+
+        st_new, hdrs_new, body_new = self.api_request("GET", f"/sub/{token}", headers={"If-None-Match": etag1})
+        self.assertEqual(st_new, 200) # Не 304!
+        etag2 = hdrs_new.get("ETag") or hdrs_new.get("etag")
+        self.assertNotEqual(etag1, etag2)
+        self.assertIn("timeout=42s", base64.b64decode(body_new).decode("utf-8"))
+
+        # 5. Отключение WebDAV у пользователя: подписка становится пустой (204 No Content)
+        self.api_request("PUT", "/api/users/wd_alice/webdav", {"enabled": False})
+        st_no_c, _, _ = self.api_request("GET", f"/sub/{token}")
+        self.assertEqual(st_no_c, 204)
+
+        # Включаем обратно
+        self.api_request("PUT", "/api/users/wd_alice/webdav", {"enabled": True})
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 46: Миграция и откат базы данных (repair_webdav.py)
+    # --------------------------------------------------------------------------
+    def test_46_webdav_migration_and_rollback(self):
+        self.app.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        copy_db = os.path.join(self.test_dir, "mig_test.db")
+        shutil.copy2(self.db_path, copy_db)
+
+        # 1. Dry-run миграции
+        ok, msg, rep = migrate_webdav_database(copy_db, dry_run=True, backup=False)
+        self.assertTrue(ok, msg)
+        self.assertTrue(rep["dry_run"])
+
+        # 2. Применение миграции
+        ok_app, msg_app, rep_app = migrate_webdav_database(copy_db, dry_run=False, backup=True)
+        self.assertTrue(ok_app, msg_app)
+        self.assertIsNotNone(rep_app["backup_file"])
+        self.assertTrue(os.path.isfile(rep_app["backup_file"]))
+
+        # 3. Идемпотентность: повторный запуск
+        ok_idem, msg_idem, rep_idem = migrate_webdav_database(copy_db, dry_run=False, backup=False)
+        self.assertTrue(ok_idem, msg_idem)
+        self.assertEqual(rep_idem["tables_created"], [])
+
+        # 4. Откат из созданного бэкапа
+        ok_rb, msg_rb = rollback_webdav_database(rep_app["backup_file"], copy_db)
+        self.assertTrue(ok_rb, msg_rb)
+
+    # --------------------------------------------------------------------------
+    # ТЕСТ 47: Регрессия всех существующих протоколов, OpenFlux v2 и WebDAV
+    # --------------------------------------------------------------------------
+    def test_47_regression_existing_protocols_and_openflux_v2(self):
+        # 1. Создаем пользователя со всеми протоколами
+        user_data = {
+            "nickname": "wd_omni_user",
+            "snell": "snell://192.0.2.1:10001?psk=test_psk&obfs=http",
+            "mieru": "mieru://192.0.2.2:10002?username=m_user&password=m_pass",
+            "custom": "custom://test-custom-link"
+        }
+        st, _, b = self.api_request("POST", "/api/users", user_data)
+        self.assertEqual(st, 201)
+        omni = json.loads(b.decode())
+        u_token = omni["token"]
+        u_id = omni["id"]
+
+        # 2. Создаем OpenFlux группу и включаем для пользователя
+        st_of, _, b_of = self.api_request("POST", "/api/openflux/groups", {
+            "name": "Omni-OF-Group",
+            "transport": "mailru",
+            "mode": "multistream",
+            "codec": "batched",
+            "urls": ["https://cloud.mail.ru/public/omni1"]
+        })
+        self.assertEqual(st_of, 201)
+        of_id = json.loads(b_of.decode())["id"]
+
+        st_put_of, _, b_put_of = self.api_request("PUT", f"/api/users/{u_id}/openflux", {
+            "enabled": True,
+            "mode": "multistream",
+            "group_ids": [of_id]
+        })
+        self.assertEqual(st_put_of, 200)
+
+        # 3. Создаем WebDAV подключение и включаем для пользователя
+        st_wd, _, b_wd = self.api_request("POST", "/api/webdav/connections", {
+            "name": "Omni-WD-Conn",
+            "url": "https://webdav.cloud.mail.ru/",
+            "username": "omni_user",
+            "password": "omni_password",
+            "backends": []
+        })
+        self.assertEqual(st_wd, 201)
+        wd_id = json.loads(b_wd.decode())["id"]
+
+        self.api_request("PUT", f"/api/users/{u_id}/webdav", {
+            "enabled": True,
+            "connection_ids": [wd_id]
+        })
+
+        # 4. Проверяем GET /api/users/<id>
+        st_u, _, b_u = self.api_request("GET", f"/api/users/{u_id}")
+        self.assertEqual(st_u, 200)
+        u_info = json.loads(b_u.decode())
+        self.assertTrue(u_info["openflux_enabled"])
+        self.assertEqual(u_info["openflux_groups_count"], 1)
+        self.assertTrue(u_info["webdav_enabled"])
+        self.assertEqual(u_info["webdav_connections_count"], 1)
+        # Snell (1) + Mieru (1) + Custom (1) + OpenFlux (1) + WebDAV (1) = 5
+        self.assertEqual(u_info["total_uris"], 5)
+
+        # 5. Проверяем выдачу подписки: порядок Snell -> Mieru -> Custom -> OpenFlux -> WebDAV
+        st_sub, _, b_sub = self.api_request("GET", f"/sub/{u_token}")
+        self.assertEqual(st_sub, 200)
+        emitted_lines = [l.strip() for l in base64.b64decode(b_sub).decode("utf-8").splitlines() if l.strip()]
+        self.assertEqual(len(emitted_lines), 5)
+        self.assertTrue(emitted_lines[0].startswith("snell://"))
+        self.assertTrue(emitted_lines[1].startswith("mieru://"))
+        self.assertTrue(emitted_lines[2].startswith("custom://"))
+        self.assertTrue(emitted_lines[3].startswith("openflux-bundle://v2/"))
+        self.assertTrue(emitted_lines[4].startswith("webdavs://"))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

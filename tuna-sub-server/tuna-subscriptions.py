@@ -19,7 +19,8 @@ import time
 import shutil
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, unquote
+import urllib.parse
+from urllib.parse import urlparse, unquote, parse_qs, quote
 
 # Поддержка tomllib (Python 3.11+) с fallback-парсером для более старых версий
 try:
@@ -65,6 +66,22 @@ MAX_ENCRYPTION_KEY_BYTES = 4096
 MAX_OPENFLUX_REVISION = 9007199254740991
 MAX_BUNDLE_GROUPS = 8
 MAX_BUNDLE_TOTAL_URLS = 32
+
+# Константы для WebDAV (TUNA rc9)
+MAX_WEBDAV_URI_BYTES = 131072
+MAX_WEBDAV_STORAGE_URL_LEN = 8192
+MAX_WEBDAV_LOGIN_LEN = 2048
+MAX_WEBDAV_PASSWORD_LEN = 8192
+MAX_WEBDAV_BACKENDS = 8
+MAX_SUBSCRIPTION_RESPONSE_BYTES = 2097152
+ALLOWED_WEBDAV_QUERY_KEYS = {
+    "timeout", "poll-min", "poll-max", "coalesce", "chunk-size",
+    "puts", "read-min", "read-max", "enc", "dns", "backend"
+}
+SINGLE_VALUE_QUERY_KEYS = {
+    "timeout", "poll-min", "poll-max", "coalesce", "chunk-size",
+    "puts", "read-min", "read-max", "enc", "dns"
+}
 
 def load_config(config_path=None):
     """Загрузка конфигурации из TOML или использование значений по умолчанию."""
@@ -213,6 +230,57 @@ def init_database(db_path):
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_user_of_sel_user ON user_openflux_selection(user_id, position);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_user_of_sel_group ON user_openflux_selection(group_id);")
+
+    # Аддитивная схема для WebDAV подключений (TUNA rc9)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS webdav_connections (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            revision INTEGER NOT NULL DEFAULT 1,
+            url TEXT NOT NULL,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            backends_json TEXT NOT NULL DEFAULT '[]',
+            timeout TEXT NOT NULL DEFAULT '60s',
+            poll_min TEXT NOT NULL DEFAULT '200ms',
+            poll_max TEXT NOT NULL DEFAULT '500ms',
+            coalesce TEXT NOT NULL DEFAULT '10ms',
+            chunk_size INTEGER NOT NULL DEFAULT 131071,
+            puts INTEGER NOT NULL DEFAULT 8,
+            read_min INTEGER NOT NULL DEFAULT 3,
+            read_max INTEGER NOT NULL DEFAULT 8,
+            enc INTEGER NOT NULL DEFAULT 0,
+            dns TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_webdav_conn_name ON webdav_connections(name);")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_webdav_config (
+            user_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            revision INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_webdav_selection (
+            user_id TEXT NOT NULL,
+            connection_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(user_id, connection_id),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(connection_id) REFERENCES webdav_connections(id) ON DELETE CASCADE
+        );
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_user_wdav_sel_user ON user_webdav_selection(user_id, position);")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_user_wdav_sel_conn ON user_webdav_selection(connection_id);")
 
     conn.commit()
     return conn
@@ -671,14 +739,15 @@ def validate_single_uri(val: str, max_len: int = 4096) -> tuple[bool, str]:
     """
     Валидация одиночного URI:
     - Запрещены управляющие символы, CR, LF.
-    - Проверка базовой длины.
+    - Проверка базовой длины (для WebDAV отдельный лимит MAX_WEBDAV_URI_BYTES = 131072).
     - Обязательное наличие схемы (://).
     - Разрешены пустые значения.
     """
     if not val:
         return True, ""
-    if len(val) > max_len:
-        return False, f"URI exceeds max length of {max_len}"
+    effective_max = MAX_WEBDAV_URI_BYTES if (val.startswith("webdav://") or val.startswith("webdavs://")) else max_len
+    if len(val) > effective_max:
+        return False, f"URI exceeds max length of {effective_max}"
     if "\r" in val or "\n" in val:
         return False, "URI contains newline or carriage return"
     if "://" not in val:
@@ -740,6 +809,712 @@ def validate_nickname(nick: str, max_len: int = 64) -> tuple[bool, str]:
     if "\r" in nick or "\n" in nick:
         return False, "Nickname contains newlines"
     return True, ""
+
+# ============================================================================
+# Нормативные функции WebDAV (TUNA rc9)
+# ============================================================================
+
+def parse_duration_ms(val: str) -> tuple[bool, str, int]:
+    """Разбор строки длительности (50ms, 10s, 1m) в миллисекунды."""
+    if not val or not isinstance(val, str):
+        return False, "Duration must be a non-empty string", 0
+    s = val.strip().lower()
+    if s in ("0", "0ms", "0s"):
+        return True, "", 0
+    m = re.match(r"^(\d+)(ms|s|m)$", s)
+    if not m:
+        return False, f"Invalid duration format: '{val}' (expected e.g. 50ms, 10s, 1m)", 0
+    num = int(m.group(1))
+    unit = m.group(2)
+    if unit == "ms":
+        return True, "", num
+    elif unit == "s":
+        return True, "", num * 1000
+    elif unit == "m":
+        return True, "", num * 60000
+    return False, f"Unknown unit: '{unit}'", 0
+
+def validate_dns_spec(dns: str) -> tuple[bool, str]:
+    """Валидация параметра dns (IP[:порт], udp://IP:порт, tcp://IP:порт)."""
+    if not dns or not isinstance(dns, str):
+        return True, ""
+    s = dns.strip()
+    if not s:
+        return True, ""
+    target = s
+    if s.startswith("udp://"):
+        target = s[6:]
+    elif s.startswith("tcp://"):
+        target = s[6:]
+    elif "://" in s:
+        return False, f"Unsupported DNS scheme in '{s}' (allowed: none, udp://, tcp://)"
+
+    if target.startswith("["):
+        idx = target.find("]")
+        if idx == -1:
+            return False, f"Malformed IPv6 address in DNS '{s}'"
+        host = target[1:idx]
+        rest = target[idx+1:]
+        if rest:
+            if not rest.startswith(":"):
+                return False, f"Malformed port in DNS '{s}'"
+            try:
+                p = int(rest[1:])
+                if not (1 <= p <= 65535):
+                    return False, f"Port out of range in DNS '{s}'"
+            except ValueError:
+                return False, f"Invalid port in DNS '{s}'"
+    else:
+        parts = target.split(":")
+        if len(parts) == 1:
+            host = parts[0]
+        elif len(parts) == 2:
+            host = parts[0]
+            try:
+                p = int(parts[1])
+                if not (1 <= p <= 65535):
+                    return False, f"Port out of range in DNS '{s}'"
+            except ValueError:
+                return False, f"Invalid port in DNS '{s}'"
+        else:
+            host = target
+
+    if not host:
+        return False, f"Empty host in DNS '{s}'"
+    return True, ""
+
+def validate_tuning_params(params: dict) -> tuple[bool, str, dict]:
+    """Валидация параметров тюнинга WebDAV по нормативу TUNA rc9."""
+    cleaned = {}
+
+    # timeout: 1s–10m; дефолт 60s
+    timeout = str(params.get("timeout", "60s")).strip() or "60s"
+    ok, err, t_ms = parse_duration_ms(timeout)
+    if not ok:
+        return False, f"Invalid timeout: {err}", {}
+    if not (1000 <= t_ms <= 600000):
+        return False, f"Timeout out of range (1s–10m): got {timeout} ({t_ms}ms)", {}
+    cleaned["timeout"] = timeout
+
+    # poll-min: 1ms–60s; дефолт 200ms
+    poll_min = str(params.get("poll_min", params.get("poll-min", "200ms"))).strip() or "200ms"
+    ok, err, pmin_ms = parse_duration_ms(poll_min)
+    if not ok:
+        return False, f"Invalid poll-min: {err}", {}
+    if not (1 <= pmin_ms <= 60000):
+        return False, f"poll-min out of range (1ms–60s): got {poll_min} ({pmin_ms}ms)", {}
+    cleaned["poll_min"] = poll_min
+
+    # poll-max: не меньше poll-min и не больше 60s; дефолт 500ms
+    poll_max = str(params.get("poll_max", params.get("poll-max", "500ms"))).strip() or "500ms"
+    ok, err, pmax_ms = parse_duration_ms(poll_max)
+    if not ok:
+        return False, f"Invalid poll-max: {err}", {}
+    if not (1 <= pmax_ms <= 60000):
+        return False, f"poll-max out of range (1ms–60s): got {poll_max} ({pmax_ms}ms)", {}
+    if pmax_ms < pmin_ms:
+        return False, f"poll-max ({poll_max}) cannot be less than poll-min ({poll_min})", {}
+    cleaned["poll_max"] = poll_max
+
+    # coalesce: 0–1s; дефолт 10ms
+    coalesce = str(params.get("coalesce", "10ms")).strip() or "10ms"
+    ok, err, c_ms = parse_duration_ms(coalesce)
+    if not ok:
+        return False, f"Invalid coalesce: {err}", {}
+    if not (0 <= c_ms <= 1000):
+        return False, f"coalesce out of range (0–1s): got {coalesce} ({c_ms}ms)", {}
+    cleaned["coalesce"] = coalesce
+
+    # chunk-size: целое 1024–4194304; дефолт 131071
+    try:
+        chunk_size = int(params.get("chunk_size", params.get("chunk-size", 131071)))
+    except (ValueError, TypeError):
+        return False, "chunk-size must be an integer", {}
+    if not (1024 <= chunk_size <= 4194304):
+        return False, f"chunk-size out of range (1024–4194304): got {chunk_size}", {}
+    cleaned["chunk_size"] = chunk_size
+
+    # puts: целое 1–32; дефолт 8
+    try:
+        puts = int(params.get("puts", 8))
+    except (ValueError, TypeError):
+        return False, "puts must be an integer", {}
+    if not (1 <= puts <= 32):
+        return False, f"puts out of range (1–32): got {puts}", {}
+    cleaned["puts"] = puts
+
+    # read-min: целое 1–32; дефолт 3
+    try:
+        read_min = int(params.get("read_min", params.get("read-min", 3)))
+    except (ValueError, TypeError):
+        return False, "read-min must be an integer", {}
+    if not (1 <= read_min <= 32):
+        return False, f"read-min out of range (1–32): got {read_min}", {}
+    cleaned["read_min"] = read_min
+
+    # read-max: целое 1–32, не меньше read-min; дефолт 8
+    try:
+        read_max = int(params.get("read_max", params.get("read-max", 8)))
+    except (ValueError, TypeError):
+        return False, "read-max must be an integer", {}
+    if not (1 <= read_max <= 32):
+        return False, f"read-max out of range (1–32): got {read_max}", {}
+    if read_max < read_min:
+        return False, f"read-max ({read_max}) cannot be less than read-min ({read_min})", {}
+    cleaned["read_max"] = read_max
+
+    # enc: только 0 или 1; отсутствие означает false
+    raw_enc = params.get("enc", 0)
+    if isinstance(raw_enc, bool):
+        cleaned["enc"] = 1 if raw_enc else 0
+    elif str(raw_enc).strip() in ("1", "true", "True"):
+        cleaned["enc"] = 1
+    elif str(raw_enc).strip() in ("0", "false", "False", ""):
+        cleaned["enc"] = 0
+    else:
+        return False, f"enc must be 0 or 1 (got: '{raw_enc}')", {}
+
+    # dns: bootstrap хранилища, опционален
+    dns_val = str(params.get("dns", "")).strip()
+    if dns_val:
+        ok, err = validate_dns_spec(dns_val)
+        if not ok:
+            return False, err, {}
+        cleaned["dns"] = dns_val
+    else:
+        cleaned["dns"] = ""
+
+    return True, "", cleaned
+
+def parse_storage_url(url_str: str) -> tuple[bool, str, dict]:
+    """Разбор и валидация URL хранилища WebDAV."""
+    if not url_str or not isinstance(url_str, str):
+        return False, "Storage URL must be a non-empty string", {}
+    s = url_str.strip()
+    if len(s) > MAX_WEBDAV_STORAGE_URL_LEN:
+        return False, f"Storage URL exceeds limit of {MAX_WEBDAV_STORAGE_URL_LEN} chars", {}
+
+    if s.startswith("http://"):
+        wire_scheme = "webdav"
+        base_s = s
+    elif s.startswith("https://"):
+        wire_scheme = "webdavs"
+        base_s = s
+    elif s.startswith("webdav://"):
+        wire_scheme = "webdav"
+        base_s = "http://" + s[9:]
+    elif s.startswith("webdavs://"):
+        wire_scheme = "webdavs"
+        base_s = "https://" + s[10:]
+    else:
+        return False, f"Storage URL must start with http://, https://, webdav:// or webdavs:// (got: '{s[:30]}')", {}
+
+    parsed = urllib.parse.urlsplit(base_s)
+    if not parsed.hostname:
+        return False, f"Storage URL missing hostname: '{url_str}'", {}
+    if parsed.username or parsed.password:
+        return False, f"Storage URL must not contain userinfo (username/password): '{url_str}'", {}
+    if parsed.query or parsed.fragment:
+        return False, f"Storage URL must not contain query parameters or fragments: '{url_str}'", {}
+
+    h = parsed.hostname
+    if ":" in h and not h.startswith("["):
+        h = f"[{h}]"
+
+    port_part = f":{parsed.port}" if parsed.port else ""
+    host_port = f"{h}{port_part}"
+
+    path = parsed.path
+    if not path or not path.startswith("/"):
+        path = "/" + path if path else "/"
+
+    std_scheme = "https" if wire_scheme == "webdavs" else "http"
+    std_url = f"{std_scheme}://{host_port}{path}"
+
+    return True, "", {
+        "raw_url": std_url,
+        "wire_scheme": wire_scheme,
+        "host_port": host_port,
+        "path": path,
+    }
+
+def validate_storage_spec(spec: dict, is_primary: bool = False) -> tuple[bool, str, dict]:
+    """Валидация спецификации хранилища (URL, логин, пароль, метка)."""
+    if not isinstance(spec, dict):
+        return False, "Storage specification must be a dictionary", {}
+
+    url = spec.get("url", "")
+    ok, err, parsed = parse_storage_url(url)
+    if not ok:
+        return False, err, {}
+
+    username = str(spec.get("username", "")).strip()
+    if not username:
+        return False, "Storage login cannot be empty", {}
+    if len(username) > MAX_WEBDAV_LOGIN_LEN:
+        return False, f"Storage login exceeds maximum length of {MAX_WEBDAV_LOGIN_LEN} characters", {}
+
+    password = str(spec.get("password", "")).strip()
+    if not password:
+        return False, "Storage password cannot be empty", {}
+    if len(password) > MAX_WEBDAV_PASSWORD_LEN:
+        return False, f"Storage password exceeds maximum length of {MAX_WEBDAV_PASSWORD_LEN} characters", {}
+
+    label = str(spec.get("label", "")).strip()
+
+    return True, "", {
+        "url": parsed["raw_url"],
+        "wire_scheme": parsed["wire_scheme"],
+        "host_port": parsed["host_port"],
+        "path": parsed["path"],
+        "username": username,
+        "password": password,
+        "label": label,
+    }
+
+def serialize_webdav_uri(conn: dict) -> tuple[bool, str, str]:
+    """
+    Канонический сериализатор WebDAV URI по нормативу TUNA rc9:
+    - Primary: webdav[s]://LOGIN:PASS@HOST:PORT/path/
+    - Query: timeout, poll-min, poll-max, coalesce, chunk-size, puts, read-min, read-max, enc (if 1), dns (if set), backend (repeating)
+    - Fragment: #NAME (percent-encoded UTF-8)
+    - Вложенные backends: webdav[s]://LOGIN:PASS@HOST:PORT/path/ percent-encoded в backend=
+    - Ограничение итогового URI <= 131072 байт ASCII/UTF-8.
+    """
+    name = str(conn.get("name", "")).strip()
+    if not name:
+        return False, "Connection name cannot be empty", ""
+
+    primary_spec = {
+        "url": conn.get("url", ""),
+        "username": conn.get("username", ""),
+        "password": conn.get("password", ""),
+        "label": conn.get("label", ""),
+    }
+    ok_p, err_p, p_clean = validate_storage_spec(primary_spec, is_primary=True)
+    if not ok_p:
+        return False, f"Primary storage error: {err_p}", ""
+
+    # Валидация параметров тюнинга
+    ok_t, err_t, t_clean = validate_tuning_params(conn)
+    if not ok_t:
+        return False, f"Tuning parameters error: {err_t}", ""
+
+    # Дополнительные backends (0..8)
+    raw_backends = conn.get("backends", [])
+    if not isinstance(raw_backends, list):
+        return False, "Backends must be a list", ""
+    if len(raw_backends) > MAX_WEBDAV_BACKENDS:
+        return False, f"Too many backends: {len(raw_backends)} (max {MAX_WEBDAV_BACKENDS} allowed)", ""
+
+    clean_backends = []
+    for idx, b in enumerate(raw_backends):
+        ok_b, err_b, b_clean = validate_storage_spec(b, is_primary=False)
+        if not ok_b:
+            return False, f"Backend #{idx+1} error: {err_b}", ""
+        clean_backends.append(b_clean)
+
+    # Кодирование реквизитов основного хранилища (safe='' кодирует : @ + & % ? # /)
+    enc_p_user = urllib.parse.quote(p_clean["username"], safe="")
+    enc_p_pass = urllib.parse.quote(p_clean["password"], safe="")
+    base_uri = f"{p_clean['wire_scheme']}://{enc_p_user}:{enc_p_pass}@{p_clean['host_port']}{p_clean['path']}"
+
+    # Query параметры в каноническом порядке
+    q_pairs = [
+        f"timeout={t_clean['timeout']}",
+        f"poll-min={t_clean['poll_min']}",
+        f"poll-max={t_clean['poll_max']}",
+        f"coalesce={t_clean['coalesce']}",
+        f"chunk-size={t_clean['chunk_size']}",
+        f"puts={t_clean['puts']}",
+        f"read-min={t_clean['read_min']}",
+        f"read-max={t_clean['read_max']}",
+    ]
+
+    if t_clean["enc"] == 1:
+        q_pairs.append("enc=1")
+
+    if t_clean["dns"]:
+        enc_dns = urllib.parse.quote(t_clean["dns"], safe="")
+        q_pairs.append(f"dns={enc_dns}")
+
+    for b in clean_backends:
+        enc_b_user = urllib.parse.quote(b["username"], safe="")
+        enc_b_pass = urllib.parse.quote(b["password"], safe="")
+        nested_uri = f"{b['wire_scheme']}://{enc_b_user}:{enc_b_pass}@{b['host_port']}{b['path']}"
+        # Весь вложенный URI кодируется как значение query параметра backend
+        enc_nested = urllib.parse.quote(nested_uri, safe="")
+        q_pairs.append(f"backend={enc_nested}")
+
+    query_str = "&".join(q_pairs)
+    frag_str = urllib.parse.quote(name, safe="")
+
+    full_uri = f"{base_uri}?{query_str}#{frag_str}"
+    uri_bytes = len(full_uri.encode("utf-8"))
+    if uri_bytes > MAX_WEBDAV_URI_BYTES:
+        return False, f"Resulting WebDAV URI size ({uri_bytes} bytes) exceeds limit of {MAX_WEBDAV_URI_BYTES} bytes", ""
+
+    return True, "", full_uri
+
+def parse_webdav_uri(uri_str: str) -> tuple[bool, str, dict]:
+    """
+    Канонический парсер WebDAV URI по нормативу TUNA rc9:
+    - Проверка размера <= 131072
+    - Парсинг fragment (#NAME)
+    - Парсинг схемы (webdav / webdavs)
+    - Парсинг userinfo и authority основного хранилища
+    - Проверка отсутствия неизвестных query параметров и дубликатов одиночных ключей
+    - Разбор повторяющихся backend параметров
+    - Возврат структурированного словаря подключения.
+    """
+    if not uri_str or not isinstance(uri_str, str):
+        return False, "URI must be a non-empty string", {}
+    s = uri_str.strip()
+    if len(s.encode("utf-8")) > MAX_WEBDAV_URI_BYTES:
+        return False, f"URI exceeds max allowed size of {MAX_WEBDAV_URI_BYTES} bytes", {}
+
+    if not (s.startswith("webdav://") or s.startswith("webdavs://")):
+        return False, "URI must start with webdav:// or webdavs://", {}
+
+    # Fragment
+    if "#" in s:
+        s_no_frag, frag_raw = s.split("#", 1)
+        name = urllib.parse.unquote(frag_raw)
+    else:
+        s_no_frag = s
+        name = "WebDAV"
+
+    if "?" in s_no_frag:
+        base_part, query_part = s_no_frag.split("?", 1)
+    else:
+        base_part = s_no_frag
+        query_part = ""
+
+    parsed_base = urllib.parse.urlsplit(base_part)
+    scheme = parsed_base.scheme
+    if scheme not in ("webdav", "webdavs"):
+        return False, f"Invalid scheme '{scheme}'", {}
+
+    if not parsed_base.netloc:
+        return False, "Missing authority in URI", {}
+
+    if "@" not in parsed_base.netloc:
+        return False, "Missing userinfo (username:password) in primary storage", {}
+
+    userinfo, hostport = parsed_base.netloc.split("@", 1)
+    if ":" not in userinfo:
+        return False, "Malformed userinfo: expected username:password", {}
+    enc_user, enc_pass = userinfo.split(":", 1)
+    user = urllib.parse.unquote(enc_user)
+    password = urllib.parse.unquote(enc_pass)
+
+    if not user:
+        return False, "Primary storage username cannot be empty", {}
+    if not password:
+        return False, "Primary storage password cannot be empty", {}
+
+    path = parsed_base.path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+
+    std_scheme = "https" if scheme == "webdavs" else "http"
+    primary_url = f"{std_scheme}://{hostport}{path}"
+
+    tuning = {
+        "timeout": "60s",
+        "poll_min": "200ms",
+        "poll_max": "500ms",
+        "coalesce": "10ms",
+        "chunk_size": 131071,
+        "puts": 8,
+        "read_min": 3,
+        "read_max": 8,
+        "enc": 0,
+        "dns": "",
+    }
+    backends = []
+
+    if query_part:
+        raw_pairs = query_part.split("&")
+        seen_single_keys = set()
+        for pair in raw_pairs:
+            if not pair:
+                continue
+            if "=" not in pair:
+                return False, f"Malformed query parameter '{pair}' (missing '=')", {}
+            k, v = pair.split("=", 1)
+            k = k.strip()
+            if k not in ALLOWED_WEBDAV_QUERY_KEYS:
+                return False, f"Unknown query parameter '{k}'", {}
+            if k in SINGLE_VALUE_QUERY_KEYS:
+                if k in seen_single_keys:
+                    return False, f"Duplicate query parameter '{k}'", {}
+                seen_single_keys.add(k)
+
+            unquoted_v = urllib.parse.unquote(v)
+            if k == "timeout":
+                tuning["timeout"] = unquoted_v
+            elif k == "poll-min":
+                tuning["poll_min"] = unquoted_v
+            elif k == "poll-max":
+                tuning["poll_max"] = unquoted_v
+            elif k == "coalesce":
+                tuning["coalesce"] = unquoted_v
+            elif k == "chunk-size":
+                try:
+                    tuning["chunk_size"] = int(unquoted_v)
+                except ValueError:
+                    return False, f"Invalid chunk-size '{unquoted_v}'", {}
+            elif k == "puts":
+                try:
+                    tuning["puts"] = int(unquoted_v)
+                except ValueError:
+                    return False, f"Invalid puts '{unquoted_v}'", {}
+            elif k == "read-min":
+                try:
+                    tuning["read_min"] = int(unquoted_v)
+                except ValueError:
+                    return False, f"Invalid read-min '{unquoted_v}'", {}
+            elif k == "read-max":
+                try:
+                    tuning["read_max"] = int(unquoted_v)
+                except ValueError:
+                    return False, f"Invalid read-max '{unquoted_v}'", {}
+            elif k == "enc":
+                if unquoted_v not in ("0", "1"):
+                    return False, f"Invalid enc value '{unquoted_v}' (expected 0 or 1)", {}
+                tuning["enc"] = int(unquoted_v)
+            elif k == "dns":
+                tuning["dns"] = unquoted_v
+            elif k == "backend":
+                nested_uri = unquoted_v
+                if not (nested_uri.startswith("webdav://") or nested_uri.startswith("webdavs://")):
+                    return False, f"Invalid nested backend scheme in '{nested_uri}'", {}
+                if "?" in nested_uri or "#" in nested_uri:
+                    return False, f"Nested backend must not contain query or fragment: '{nested_uri}'", {}
+                b_parsed = urllib.parse.urlsplit(nested_uri)
+                if not b_parsed.netloc or "@" not in b_parsed.netloc:
+                    return False, f"Nested backend missing credentials in '{nested_uri}'", {}
+                b_userinfo, b_hostport = b_parsed.netloc.split("@", 1)
+                if ":" not in b_userinfo:
+                    return False, f"Malformed nested backend credentials in '{nested_uri}'", {}
+                b_enc_u, b_enc_p = b_userinfo.split(":", 1)
+                b_user = urllib.parse.unquote(b_enc_u)
+                b_pass = urllib.parse.unquote(b_enc_p)
+                if not b_user:
+                    return False, "Nested backend username cannot be empty", {}
+                if not b_pass:
+                    return False, "Nested backend password cannot be empty", {}
+                b_path = b_parsed.path or "/"
+                if not b_path.startswith("/"):
+                    b_path = "/" + b_path
+                b_std_scheme = "https" if b_parsed.scheme == "webdavs" else "http"
+                b_std_url = f"{b_std_scheme}://{b_hostport}{b_path}"
+                backends.append({
+                    "url": b_std_url,
+                    "username": b_user,
+                    "password": b_pass,
+                    "label": "",
+                })
+
+    if len(backends) > MAX_WEBDAV_BACKENDS:
+        return False, f"Too many backends in URI: {len(backends)} (max {MAX_WEBDAV_BACKENDS} allowed)", {}
+
+    ok_t, err_t, clean_tuning = validate_tuning_params(tuning)
+    if not ok_t:
+        return False, err_t, {}
+
+    res = {
+        "name": name,
+        "url": primary_url,
+        "username": user,
+        "password": password,
+        "backends": backends,
+        **clean_tuning
+    }
+    return True, "", res
+
+def import_server_webdav_config(env_path: str = "/etc/webdav-tunnel/config.env", server_ip: str = "127.0.0.1") -> tuple[bool, str, dict]:
+    """
+    Инспектирует активную конфигурацию сервера WebDAV (config.env) и строит
+    объект подключения для предварительного просмотра владельцем.
+    НЕ перезапускает службы и НЕ меняет файлы конфигурации.
+    """
+    if not os.path.isfile(env_path):
+        return False, f"Server WebDAV config file not found: {env_path}", {}
+
+    env = {}
+    with open(env_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip("\"'")
+            env[k] = v
+
+    mode = env.get("WEBDAV_MODE", "selfhosted").strip().lower()
+    enc_val = env.get("WEBDAV_ENC", "false").strip().lower() in ("true", "1", "yes")
+    enc = 1 if enc_val else 0
+
+    timeout = env.get("WEBDAV_TIMEOUT", "60s").strip() or "60s"
+    poll_min = env.get("WEBDAV_POLL_MIN", "200ms").strip() or "200ms"
+    poll_max = env.get("WEBDAV_POLL_MAX", "500ms").strip() or "500ms"
+    coalesce = env.get("WEBDAV_COALESCE", "10ms").strip() or "10ms"
+    try:
+        chunk_size = int(env.get("WEBDAV_CHUNK_SIZE", 131071))
+    except (ValueError, TypeError):
+        chunk_size = 131071
+    try:
+        puts = int(env.get("WEBDAV_PUTS", 8))
+    except (ValueError, TypeError):
+        puts = 8
+    try:
+        read_min = int(env.get("WEBDAV_READ_MIN", 3))
+    except (ValueError, TypeError):
+        read_min = 3
+    try:
+        read_max = int(env.get("WEBDAV_READ_MAX", 8))
+    except (ValueError, TypeError):
+        read_max = 8
+    dns = env.get("WEBDAV_DNS", "").strip()
+
+    storages = []
+
+    if mode == "multi":
+        loc_en = env.get("MULTI_LOCAL_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+        l_port = env.get("SELFHOSTED_PORT", "8443").strip() or "8443"
+        l_user = env.get("SELFHOSTED_LOGIN", "wdav").strip() or "wdav"
+        l_pass = env.get("SELFHOSTED_PASSWORD", env.get("WEBDAV_PASSWORD", "")).strip()
+        if loc_en and l_pass:
+            storages.append({
+                "url": f"http://{server_ip}:{l_port}/",
+                "username": l_user,
+                "password": l_pass,
+                "label": "Local Selfhosted"
+            })
+
+        m_en = env.get("MULTI_MAILRU_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+        m_user = env.get("MAILRU_LOGIN", env.get("MULTI_MAILRU_LOGIN", "")).strip()
+        m_pass = env.get("MAILRU_PASSWORD", env.get("MULTI_MAILRU_PASSWORD", "")).strip()
+        if m_en and m_user and m_pass:
+            storages.append({
+                "url": "https://webdav.cloud.mail.ru/",
+                "username": m_user,
+                "password": m_pass,
+                "label": "Mail.ru Cloud"
+            })
+
+        y_en = env.get("MULTI_YANDEX_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+        y_user = env.get("YANDEX_LOGIN", env.get("MULTI_YANDEX_LOGIN", "")).strip()
+        y_pass = env.get("YANDEX_PASSWORD", env.get("MULTI_YANDEX_PASSWORD", "")).strip()
+        if y_en and y_user and y_pass:
+            storages.append({
+                "url": "https://webdav.yandex.ru/",
+                "username": y_user,
+                "password": y_pass,
+                "label": "Yandex Disk"
+            })
+
+        c_en = env.get("MULTI_CUSTOM_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+        c_url = env.get("CUSTOM_URL", env.get("MULTI_CUSTOM_URL", "")).strip()
+        c_user = env.get("CUSTOM_LOGIN", env.get("MULTI_CUSTOM_LOGIN", "")).strip()
+        c_pass = env.get("CUSTOM_PASSWORD", env.get("MULTI_CUSTOM_PASSWORD", "")).strip()
+        if c_en and c_url and c_user and c_pass:
+            storages.append({
+                "url": c_url,
+                "username": c_user,
+                "password": c_pass,
+                "label": "Custom Storage"
+            })
+
+        if not storages:
+            return False, "No configured storages enabled in multi mode", {}
+
+        primary = storages[0]
+        backends = storages[1:]
+        name = "Multi-WebDAV"
+
+    elif mode == "selfhosted":
+        l_port = env.get("SELFHOSTED_PORT", "8443").strip() or "8443"
+        l_user = env.get("SELFHOSTED_LOGIN", "wdav").strip() or "wdav"
+        l_pass = env.get("SELFHOSTED_PASSWORD", env.get("WEBDAV_PASSWORD", "")).strip()
+        if not l_pass:
+            return False, "Selfhosted mode missing password in server config", {}
+        primary = {
+            "url": f"http://{server_ip}:{l_port}/",
+            "username": l_user,
+            "password": l_pass,
+            "label": "Local Selfhosted"
+        }
+        backends = []
+        name = "Selfhosted-WebDAV"
+
+    elif mode == "mailru":
+        m_user = env.get("MAILRU_LOGIN", env.get("MULTI_MAILRU_LOGIN", "")).strip()
+        m_pass = env.get("MAILRU_PASSWORD", env.get("MULTI_MAILRU_PASSWORD", "")).strip()
+        if not m_user or not m_pass:
+            return False, "Mailru mode missing login or password in server config", {}
+        primary = {
+            "url": "https://webdav.cloud.mail.ru/",
+            "username": m_user,
+            "password": m_pass,
+            "label": "Mail.ru Cloud"
+        }
+        backends = []
+        name = "Mailru-WebDAV"
+
+    elif mode == "yandex":
+        y_user = env.get("YANDEX_LOGIN", env.get("MULTI_YANDEX_LOGIN", "")).strip()
+        y_pass = env.get("YANDEX_PASSWORD", env.get("MULTI_YANDEX_PASSWORD", "")).strip()
+        if not y_user or not y_pass:
+            return False, "Yandex mode missing login or password in server config", {}
+        primary = {
+            "url": "https://webdav.yandex.ru/",
+            "username": y_user,
+            "password": y_pass,
+            "label": "Yandex Disk"
+        }
+        backends = []
+        name = "Yandex-WebDAV"
+
+    elif mode == "custom":
+        c_url = env.get("CUSTOM_URL", env.get("MULTI_CUSTOM_URL", "")).strip()
+        c_user = env.get("CUSTOM_LOGIN", env.get("MULTI_CUSTOM_LOGIN", "")).strip()
+        c_pass = env.get("CUSTOM_PASSWORD", env.get("MULTI_CUSTOM_PASSWORD", "")).strip()
+        if not c_url or not c_user or not c_pass:
+            return False, "Custom mode missing url, login or password in server config", {}
+        primary = {
+            "url": c_url,
+            "username": c_user,
+            "password": c_pass,
+            "label": "Custom Storage"
+        }
+        backends = []
+        name = "Custom-WebDAV"
+    else:
+        return False, f"Unknown WEBDAV_MODE: '{mode}'", {}
+
+    conn = {
+        "name": name,
+        "url": primary["url"],
+        "username": primary["username"],
+        "password": primary["password"],
+        "label": primary.get("label", ""),
+        "backends": backends,
+        "timeout": timeout,
+        "poll_min": poll_min,
+        "poll_max": poll_max,
+        "coalesce": coalesce,
+        "chunk_size": chunk_size,
+        "puts": puts,
+        "read_min": read_min,
+        "read_max": read_max,
+        "enc": enc,
+        "dns": dns,
+    }
+    return True, "", conn
 
 class SubscriptionApp:
     def __init__(self, config):
@@ -870,9 +1645,23 @@ class SubscriptionApp:
             c_of.execute("SELECT COUNT(*) FROM user_openflux_selection WHERE user_id = ?;", (r["id"],))
             of_cnt = c_of.fetchone()[0] if of_en else 0
 
+            # Проверка WebDAV
+            c_wd = self.conn.cursor()
+            c_wd.execute("SELECT enabled FROM user_webdav_config WHERE user_id = ?;", (r["id"],))
+            wd_row = c_wd.fetchone()
+            wd_en = bool(wd_row["enabled"]) if wd_row else False
+            c_wd.execute("""
+                SELECT COUNT(*) FROM user_webdav_selection s
+                JOIN webdav_connections c ON s.connection_id = c.id
+                WHERE s.user_id = ? AND s.enabled = 1 AND c.enabled = 1;
+            """, (r["id"],))
+            wd_cnt = c_wd.fetchone()[0] if wd_en else 0
+
             total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list)
             if of_en and of_cnt > 0:
                 total_uris += 1
+            if wd_en and wd_cnt > 0:
+                total_uris += wd_cnt
 
             raw_token = r["subscription_token"] if "subscription_token" in r.keys() and r["subscription_token"] else ""
             sub_url = self.get_sub_url(raw_token)
@@ -895,6 +1684,7 @@ class SubscriptionApp:
                     "masterdnsvpn": len(dns_list) > 0,
                     "custom": len(custom_list) > 0,
                     "openflux": of_en and of_cnt > 0,
+                    "webdav": wd_en and wd_cnt > 0,
                 },
                 "counts": {
                     "csqtt": len(csqtt_list),
@@ -904,6 +1694,7 @@ class SubscriptionApp:
                     "masterdnsvpn": len(dns_list),
                     "custom": len(custom_list),
                     "openflux": of_cnt,
+                    "webdav": wd_cnt,
                 }
             })
         return 200, users
@@ -931,9 +1722,23 @@ class SubscriptionApp:
         c_of.execute("SELECT COUNT(*) FROM user_openflux_selection WHERE user_id = ?;", (r["id"],))
         of_cnt = c_of.fetchone()[0] if of_en else 0
 
+        # Проверка WebDAV
+        c_wd = self.conn.cursor()
+        c_wd.execute("SELECT enabled FROM user_webdav_config WHERE user_id = ?;", (r["id"],))
+        wd_row = c_wd.fetchone()
+        wd_en = bool(wd_row["enabled"]) if wd_row else False
+        c_wd.execute("""
+            SELECT COUNT(*) FROM user_webdav_selection s
+            JOIN webdav_connections c ON s.connection_id = c.id
+            WHERE s.user_id = ? AND s.enabled = 1 AND c.enabled = 1;
+        """, (r["id"],))
+        wd_cnt = c_wd.fetchone()[0] if wd_en else 0
+
         total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list)
         if of_en and of_cnt > 0:
             total_uris += 1
+        if wd_en and wd_cnt > 0:
+            total_uris += wd_cnt
 
         raw_token = r["subscription_token"] if "subscription_token" in r.keys() and r["subscription_token"] else ""
         sub_url = self.get_sub_url(raw_token)
@@ -958,6 +1763,8 @@ class SubscriptionApp:
             "custom_uris": custom_list,
             "openflux_enabled": of_en,
             "openflux_groups_count": of_cnt,
+            "webdav_enabled": wd_en,
+            "webdav_connections_count": wd_cnt,
             "total_uris": total_uris,
             "enabled": bool(r["enabled"]),
             "revision": r["revision"],
@@ -1956,6 +2763,598 @@ class SubscriptionApp:
             "groups": imported_groups
         }
 
+    # ========================================================================
+    # Управление каталогом WebDAV подключений и профилями пользователей
+    # ========================================================================
+
+    def list_webdav_connections(self, include_secrets: bool = False) -> tuple[int, list]:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM webdav_connections ORDER BY created_at ASC;")
+        rows = c.fetchall()
+        res = []
+        for r in rows:
+            try:
+                backends = json.loads(r["backends_json"])
+            except Exception:
+                backends = []
+
+            c_dict = {
+                "name": r["name"],
+                "url": r["url"],
+                "username": r["username"],
+                "password": r["password"],
+                "backends": backends,
+                "timeout": r["timeout"],
+                "poll_min": r["poll_min"],
+                "poll_max": r["poll_max"],
+                "coalesce": r["coalesce"],
+                "chunk_size": r["chunk_size"],
+                "puts": r["puts"],
+                "read_min": r["read_min"],
+                "read_max": r["read_max"],
+                "enc": r["enc"],
+                "dns": r["dns"],
+            }
+            ok_u, _, full_uri = serialize_webdav_uri(c_dict)
+
+            disp_pass = r["password"] if include_secrets else ("*" * min(len(r["password"]), 16))
+            disp_backends = []
+            for b in backends:
+                b_copy = dict(b)
+                if not include_secrets:
+                    b_copy["password"] = "*" * min(len(b_copy.get("password", "")), 16)
+                disp_backends.append(b_copy)
+
+            item = {
+                "id": r["id"],
+                "name": r["name"],
+                "enabled": bool(r["enabled"]),
+                "revision": r["revision"],
+                "url": r["url"],
+                "username": r["username"],
+                "password": disp_pass,
+                "backends": disp_backends,
+                "backends_count": len(backends),
+                "timeout": r["timeout"],
+                "poll_min": r["poll_min"],
+                "poll_max": r["poll_max"],
+                "coalesce": r["coalesce"],
+                "chunk_size": r["chunk_size"],
+                "puts": r["puts"],
+                "read_min": r["read_min"],
+                "read_max": r["read_max"],
+                "enc": r["enc"],
+                "dns": r["dns"],
+                "uri": full_uri if ok_u else "",
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+            res.append(item)
+        return 200, res
+
+    def get_webdav_connection(self, conn_id: str, include_secrets: bool = False) -> tuple[int, dict]:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM webdav_connections WHERE id = ?;", (conn_id,))
+        r = c.fetchone()
+        if not r:
+            return 404, {"error": "WebDAV connection not found"}
+
+        try:
+            backends = json.loads(r["backends_json"])
+        except Exception:
+            backends = []
+
+        c_dict = {
+            "name": r["name"],
+            "url": r["url"],
+            "username": r["username"],
+            "password": r["password"],
+            "backends": backends,
+            "timeout": r["timeout"],
+            "poll_min": r["poll_min"],
+            "poll_max": r["poll_max"],
+            "coalesce": r["coalesce"],
+            "chunk_size": r["chunk_size"],
+            "puts": r["puts"],
+            "read_min": r["read_min"],
+            "read_max": r["read_max"],
+            "enc": r["enc"],
+            "dns": r["dns"],
+        }
+        ok_u, _, full_uri = serialize_webdav_uri(c_dict)
+
+        disp_pass = r["password"] if include_secrets else ("*" * min(len(r["password"]), 16))
+        disp_backends = []
+        for b in backends:
+            b_copy = dict(b)
+            if not include_secrets:
+                b_copy["password"] = "*" * min(len(b_copy.get("password", "")), 16)
+            disp_backends.append(b_copy)
+
+        return 200, {
+            "id": r["id"],
+            "name": r["name"],
+            "enabled": bool(r["enabled"]),
+            "revision": r["revision"],
+            "url": r["url"],
+            "username": r["username"],
+            "password": disp_pass,
+            "backends": disp_backends,
+            "backends_count": len(backends),
+            "timeout": r["timeout"],
+            "poll_min": r["poll_min"],
+            "poll_max": r["poll_max"],
+            "coalesce": r["coalesce"],
+            "chunk_size": r["chunk_size"],
+            "puts": r["puts"],
+            "read_min": r["read_min"],
+            "read_max": r["read_max"],
+            "enc": r["enc"],
+            "dns": r["dns"],
+            "uri": full_uri if ok_u else "",
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        }
+
+    def create_webdav_connection(self, data: dict) -> tuple[int, dict]:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            return 400, {"error": "Connection name is required"}
+
+        primary_spec = {
+            "url": data.get("url", ""),
+            "username": data.get("username", ""),
+            "password": data.get("password", ""),
+            "label": data.get("label", ""),
+        }
+        ok_p, err_p, clean_primary = validate_storage_spec(primary_spec, is_primary=True)
+        if not ok_p:
+            return 400, {"error": f"Primary storage error: {err_p}"}
+
+        ok_t, err_t, clean_tuning = validate_tuning_params(data)
+        if not ok_t:
+            return 400, {"error": f"Tuning parameters error: {err_t}"}
+
+        raw_backends = data.get("backends", [])
+        if not isinstance(raw_backends, list):
+            return 400, {"error": "Backends must be a list"}
+        if len(raw_backends) > MAX_WEBDAV_BACKENDS:
+            return 400, {"error": f"Too many backends: {len(raw_backends)} (max {MAX_WEBDAV_BACKENDS} allowed)"}
+
+        clean_backends = []
+        for idx, b in enumerate(raw_backends):
+            ok_b, err_b, b_clean = validate_storage_spec(b, is_primary=False)
+            if not ok_b:
+                return 400, {"error": f"Backend #{idx+1} error: {err_b}"}
+            clean_backends.append(b_clean)
+
+        test_conn = {
+            "name": name,
+            "url": clean_primary["url"],
+            "username": clean_primary["username"],
+            "password": clean_primary["password"],
+            "backends": clean_backends,
+            **clean_tuning
+        }
+        ok_ser, err_ser, uri = serialize_webdav_uri(test_conn)
+        if not ok_ser:
+            return 400, {"error": f"WebDAV URI serialization error: {err_ser}"}
+
+        conn_id = str(data.get("id") or "").strip().lower()
+        if not conn_id or not is_canonical_uuid(conn_id):
+            conn_id = str(uuid.uuid4()).lower()
+
+        c = self.conn.cursor()
+        c.execute("SELECT id FROM webdav_connections WHERE id = ?;", (conn_id,))
+        if c.fetchone():
+            return 409, {"error": f"WebDAV connection with ID '{conn_id}' already exists"}
+
+        enabled = 1 if data.get("enabled", True) in (True, 1, "true", "1") else 0
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        with self.conn:
+            self.conn.execute("""
+                INSERT INTO webdav_connections (
+                    id, name, enabled, revision, url, username, password, backends_json,
+                    timeout, poll_min, poll_max, coalesce, chunk_size, puts, read_min, read_max,
+                    enc, dns, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                conn_id, name, enabled, clean_primary["url"], clean_primary["username"], clean_primary["password"],
+                json.dumps(clean_backends), clean_tuning["timeout"], clean_tuning["poll_min"], clean_tuning["poll_max"],
+                clean_tuning["coalesce"], clean_tuning["chunk_size"], clean_tuning["puts"], clean_tuning["read_min"],
+                clean_tuning["read_max"], clean_tuning["enc"], clean_tuning["dns"], now, now
+            ))
+
+        return 201, {
+            "id": conn_id,
+            "name": name,
+            "enabled": bool(enabled),
+            "revision": 1,
+            "url": clean_primary["url"],
+            "username": clean_primary["username"],
+            "backends": clean_backends,
+            "backends_count": len(clean_backends),
+            **clean_tuning,
+            "uri": uri,
+            "created_at": now,
+            "updated_at": now
+        }
+
+    def update_webdav_connection(self, conn_id: str, data: dict) -> tuple[int, dict]:
+        conn_id = str(conn_id).strip().lower()
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM webdav_connections WHERE id = ?;", (conn_id,))
+        cur = c.fetchone()
+        if not cur:
+            return 404, {"error": "WebDAV connection not found"}
+
+        name = str(data.get("name", cur["name"])).strip()
+        if not name:
+            return 400, {"error": "Connection name cannot be empty"}
+
+        url = str(data.get("url", cur["url"])).strip()
+        username = str(data.get("username", cur["username"])).strip()
+        password = data.get("password")
+        if password is None or password == "" or password == "********" or password == "[HIDDEN]":
+            password = cur["password"]
+        else:
+            password = str(password).strip()
+
+        primary_spec = {
+            "url": url,
+            "username": username,
+            "password": password,
+            "label": data.get("label", ""),
+        }
+        ok_p, err_p, clean_primary = validate_storage_spec(primary_spec, is_primary=True)
+        if not ok_p:
+            return 400, {"error": f"Primary storage error: {err_p}"}
+
+        cur_backends = []
+        try:
+            cur_backends = json.loads(cur["backends_json"])
+        except Exception:
+            pass
+
+        if "backends" in data:
+            raw_backends = data["backends"]
+            if not isinstance(raw_backends, list):
+                return 400, {"error": "Backends must be a list"}
+            if len(raw_backends) > MAX_WEBDAV_BACKENDS:
+                return 400, {"error": f"Too many backends: {len(raw_backends)} (max {MAX_WEBDAV_BACKENDS} allowed)"}
+            clean_backends = []
+            for idx, b in enumerate(raw_backends):
+                b_pass = b.get("password")
+                if (b_pass is None or b_pass == "" or b_pass == "********" or b_pass == "[HIDDEN]") and idx < len(cur_backends):
+                    b = dict(b)
+                    b["password"] = cur_backends[idx].get("password", "")
+                ok_b, err_b, b_clean = validate_storage_spec(b, is_primary=False)
+                if not ok_b:
+                    return 400, {"error": f"Backend #{idx+1} error: {err_b}"}
+                clean_backends.append(b_clean)
+        else:
+            clean_backends = cur_backends
+
+        tuning_input = {
+            "timeout": data.get("timeout", cur["timeout"]),
+            "poll_min": data.get("poll_min", cur["poll_min"]),
+            "poll_max": data.get("poll_max", cur["poll_max"]),
+            "coalesce": data.get("coalesce", cur["coalesce"]),
+            "chunk_size": data.get("chunk_size", cur["chunk_size"]),
+            "puts": data.get("puts", cur["puts"]),
+            "read_min": data.get("read_min", cur["read_min"]),
+            "read_max": data.get("read_max", cur["read_max"]),
+            "enc": data.get("enc", cur["enc"]),
+            "dns": data.get("dns", cur["dns"]),
+        }
+        ok_t, err_t, clean_tuning = validate_tuning_params(tuning_input)
+        if not ok_t:
+            return 400, {"error": f"Tuning parameters error: {err_t}"}
+
+        enabled = cur["enabled"]
+        if "enabled" in data:
+            enabled = 1 if data["enabled"] in (True, 1, "true", "1") else 0
+
+        test_conn = {
+            "name": name,
+            "url": clean_primary["url"],
+            "username": clean_primary["username"],
+            "password": clean_primary["password"],
+            "backends": clean_backends,
+            **clean_tuning
+        }
+        ok_ser, err_ser, uri = serialize_webdav_uri(test_conn)
+        if not ok_ser:
+            return 400, {"error": f"WebDAV URI serialization error: {err_ser}"}
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        new_rev = cur["revision"] + 1
+
+        with self.conn:
+            c.execute("SELECT DISTINCT user_id FROM user_webdav_selection WHERE connection_id = ? AND enabled = 1;", (conn_id,))
+            affected_users = [row[0] for row in c.fetchall()]
+
+            self.conn.execute("""
+                UPDATE webdav_connections SET
+                    name = ?, enabled = ?, revision = ?, url = ?, username = ?, password = ?,
+                    backends_json = ?, timeout = ?, poll_min = ?, poll_max = ?, coalesce = ?,
+                    chunk_size = ?, puts = ?, read_min = ?, read_max = ?, enc = ?, dns = ?, updated_at = ?
+                WHERE id = ?;
+            """, (
+                name, enabled, new_rev, clean_primary["url"], clean_primary["username"], clean_primary["password"],
+                json.dumps(clean_backends), clean_tuning["timeout"], clean_tuning["poll_min"], clean_tuning["poll_max"],
+                clean_tuning["coalesce"], clean_tuning["chunk_size"], clean_tuning["puts"], clean_tuning["read_min"],
+                clean_tuning["read_max"], clean_tuning["enc"], clean_tuning["dns"], now, conn_id
+            ))
+
+            for u_id in affected_users:
+                self.conn.execute("UPDATE user_webdav_config SET revision = revision + 1, updated_at = ? WHERE user_id = ?;", (now, u_id))
+                self.conn.execute("UPDATE users SET revision = revision + 1, updated_at = ? WHERE id = ?;", (now, u_id))
+
+        return 200, {
+            "id": conn_id,
+            "name": name,
+            "enabled": bool(enabled),
+            "revision": new_rev,
+            "url": clean_primary["url"],
+            "username": clean_primary["username"],
+            "backends": clean_backends,
+            "backends_count": len(clean_backends),
+            **clean_tuning,
+            "uri": uri,
+            "created_at": cur["created_at"],
+            "updated_at": now
+        }
+
+    def delete_webdav_connection(self, conn_id: str) -> tuple[int, dict]:
+        conn_id = str(conn_id).strip().lower()
+        c = self.conn.cursor()
+        c.execute("SELECT id FROM webdav_connections WHERE id = ?;", (conn_id,))
+        if not c.fetchone():
+            return 404, {"error": "WebDAV connection not found"}
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.conn:
+            c.execute("SELECT DISTINCT user_id FROM user_webdav_selection WHERE connection_id = ?;", (conn_id,))
+            affected_users = [row[0] for row in c.fetchall()]
+
+            self.conn.execute("DELETE FROM user_webdav_selection WHERE connection_id = ?;", (conn_id,))
+            self.conn.execute("DELETE FROM webdav_connections WHERE id = ?;", (conn_id,))
+
+            for u_id in affected_users:
+                self.conn.execute("UPDATE user_webdav_config SET revision = revision + 1, updated_at = ? WHERE user_id = ?;", (now, u_id))
+                self.conn.execute("UPDATE users SET revision = revision + 1, updated_at = ? WHERE id = ?;", (now, u_id))
+
+        return 200, {"deleted": True, "id": conn_id}
+
+    def import_webdav_uri(self, data: dict) -> tuple[int, dict]:
+        uri = str(data.get("uri") or "").strip()
+        if not uri:
+            return 400, {"error": "URI is required"}
+        ok, err, parsed = parse_webdav_uri(uri)
+        if not ok:
+            return 400, {"error": f"Failed to parse WebDAV URI: {err}"}
+
+        if data.get("save"):
+            return self.create_webdav_connection(parsed)
+
+        return 200, {"success": True, "parsed": parsed, "connection": parsed}
+
+    def import_server_webdav(self, data: dict) -> tuple[int, dict]:
+        env_path = str(data.get("env_path") or "/etc/webdav-tunnel/config.env").strip()
+        server_ip = str(data.get("server_ip") or "").strip()
+        if not server_ip:
+            if self.public_host:
+                server_ip = self.public_host
+            elif self.bind_addr not in ("0.0.0.0", "", "::"):
+                server_ip = self.bind_addr
+            else:
+                server_ip = "127.0.0.1"
+
+        ok, err, candidate = import_server_webdav_config(env_path, server_ip)
+        if not ok:
+            return 400, {"error": f"Failed to inspect server WebDAV config: {err}"}
+
+        ok_ser, err_ser, uri = serialize_webdav_uri(candidate)
+        if not ok_ser:
+            return 400, {"error": f"Failed to serialize inspected connection: {err_ser}"}
+
+        if data.get("save"):
+            return self.create_webdav_connection(candidate)
+
+        return 200, {
+            "success": True,
+            "connection": candidate,
+            "uri": uri
+        }
+
+    def get_user_webdav(self, user_id_or_nick: str) -> tuple[int, dict]:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id_or_nick, user_id_or_nick))
+        user = c.fetchone()
+        if not user:
+            return 404, {"error": "User not found"}
+
+        u_id = user["id"]
+        c.execute("SELECT * FROM user_webdav_config WHERE user_id = ?;", (u_id,))
+        wd_cfg = c.fetchone()
+        if not wd_cfg:
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            with self.conn:
+                self.conn.execute("""
+                    INSERT INTO user_webdav_config (user_id, enabled, revision, updated_at)
+                    VALUES (?, 1, 1, ?);
+                """, (u_id, now))
+            c.execute("SELECT * FROM user_webdav_config WHERE user_id = ?;", (u_id,))
+            wd_cfg = c.fetchone()
+
+        c.execute("""
+            SELECT c.*, s.enabled AS sel_enabled, s.position
+            FROM user_webdav_selection s
+            JOIN webdav_connections c ON s.connection_id = c.id
+            WHERE s.user_id = ?
+            ORDER BY s.position ASC;
+        """, (u_id,))
+        sel_rows = c.fetchall()
+
+        conns_res = []
+        conn_ids = []
+        for r in sel_rows:
+            try:
+                backends = json.loads(r["backends_json"])
+            except Exception:
+                backends = []
+            conn_ids.append(r["id"])
+            conns_res.append({
+                "id": r["id"],
+                "name": r["name"],
+                "enabled": bool(r["sel_enabled"]),
+                "catalog_enabled": bool(r["enabled"]),
+                "position": r["position"],
+                "url": r["url"],
+                "backends_count": len(backends),
+                "timeout": r["timeout"],
+                "enc": r["enc"],
+            })
+
+        return 200, {
+            "user_id": u_id,
+            "nickname": user["nickname"],
+            "enabled": bool(wd_cfg["enabled"]),
+            "revision": wd_cfg["revision"],
+            "connections": conns_res,
+            "connection_ids": conn_ids,
+        }
+
+    def update_user_webdav(self, user_id_or_nick: str, data: dict) -> tuple[int, dict]:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id_or_nick, user_id_or_nick))
+        user = c.fetchone()
+        if not user:
+            return 404, {"error": "User not found"}
+
+        u_id = user["id"]
+        c.execute("SELECT * FROM user_webdav_config WHERE user_id = ?;", (u_id,))
+        wd_cfg = c.fetchone()
+        cur_enabled = bool(wd_cfg["enabled"]) if wd_cfg else True
+
+        new_enabled = cur_enabled
+        if "enabled" in data:
+            new_enabled = bool(data["enabled"])
+
+        new_selection = None
+        if "connections" in data and isinstance(data["connections"], list):
+            new_selection = []
+            for item in data["connections"]:
+                if isinstance(item, dict) and "id" in item:
+                    new_selection.append({
+                        "id": str(item["id"]).strip().lower(),
+                        "enabled": bool(item.get("enabled", True))
+                    })
+                elif isinstance(item, str):
+                    new_selection.append({
+                        "id": item.strip().lower(),
+                        "enabled": True
+                    })
+        elif "connection_ids" in data and isinstance(data["connection_ids"], list):
+            new_selection = [{"id": str(cid).strip().lower(), "enabled": True} for cid in data["connection_ids"]]
+
+        if new_selection is not None:
+            for item in new_selection:
+                c.execute("SELECT id FROM webdav_connections WHERE id = ?;", (item["id"],))
+                if not c.fetchone():
+                    return 400, {"error": f"WebDAV connection '{item['id']}' not found in catalog"}
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.conn:
+            if wd_cfg:
+                self.conn.execute("""
+                    UPDATE user_webdav_config SET enabled = ?, revision = revision + 1, updated_at = ?
+                    WHERE user_id = ?;
+                """, (1 if new_enabled else 0, now, u_id))
+            else:
+                self.conn.execute("""
+                    INSERT INTO user_webdav_config (user_id, enabled, revision, updated_at)
+                    VALUES (?, ?, 1, ?);
+                """, (u_id, 1 if new_enabled else 0, now))
+
+            if new_selection is not None:
+                self.conn.execute("DELETE FROM user_webdav_selection WHERE user_id = ?;", (u_id,))
+                for pos, item in enumerate(new_selection):
+                    self.conn.execute("""
+                        INSERT INTO user_webdav_selection (user_id, connection_id, position, enabled)
+                        VALUES (?, ?, ?, ?);
+                    """, (u_id, item["id"], pos, 1 if item["enabled"] else 0))
+
+            self.conn.execute("UPDATE users SET revision = revision + 1, updated_at = ? WHERE id = ?;", (now, u_id))
+
+        return self.get_user_webdav(u_id)
+
+    def preview_user_webdav(self, user_id_or_nick: str) -> tuple[int, dict]:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id_or_nick, user_id_or_nick))
+        user = c.fetchone()
+        if not user:
+            return 404, {"error": "User not found"}
+
+        u_id = user["id"]
+        c.execute("SELECT enabled FROM user_webdav_config WHERE user_id = ?;", (u_id,))
+        wd_cfg = c.fetchone()
+        wd_en = bool(wd_cfg["enabled"]) if wd_cfg else False
+        if not wd_en:
+            return 200, {
+                "user_id": u_id,
+                "nickname": user["nickname"],
+                "enabled": False,
+                "uris": [],
+                "count": 0
+            }
+
+        c.execute("""
+            SELECT c.* FROM user_webdav_selection s
+            JOIN webdav_connections c ON s.connection_id = c.id
+            WHERE s.user_id = ? AND s.enabled = 1 AND c.enabled = 1
+            ORDER BY s.position ASC;
+        """, (u_id,))
+        conns = c.fetchall()
+
+        uris = []
+        for r in conns:
+            try:
+                backends = json.loads(r["backends_json"])
+            except Exception:
+                backends = []
+            c_dict = {
+                "name": r["name"],
+                "url": r["url"],
+                "username": r["username"],
+                "password": r["password"],
+                "backends": backends,
+                "timeout": r["timeout"],
+                "poll_min": r["poll_min"],
+                "poll_max": r["poll_max"],
+                "coalesce": r["coalesce"],
+                "chunk_size": r["chunk_size"],
+                "puts": r["puts"],
+                "read_min": r["read_min"],
+                "read_max": r["read_max"],
+                "enc": r["enc"],
+                "dns": r["dns"],
+            }
+            ok_u, err_u, uri = serialize_webdav_uri(c_dict)
+            if not ok_u:
+                return 500, {"error": f"Failed to serialize connection '{r['name']}': {err_u}"}
+            uris.append(uri)
+
+        return 200, {
+            "user_id": u_id,
+            "nickname": user["nickname"],
+            "enabled": True,
+            "uris": uris,
+            "count": len(uris)
+        }
+
     def get_subscription_payload(self, token: str, if_none_match: str = None) -> tuple[int, dict, bytes]:
         """
         Выдача подписки по токену:
@@ -2044,12 +3443,52 @@ class SubscriptionApp:
 
             non_empty.append(v2_uri)
 
+        # WebDAV интеграция
+        c.execute("SELECT enabled FROM user_webdav_config WHERE user_id = ?;", (user["id"],))
+        wd_cfg = c.fetchone()
+        if wd_cfg and wd_cfg["enabled"]:
+            c.execute("""
+                SELECT c.* FROM user_webdav_selection s
+                JOIN webdav_connections c ON s.connection_id = c.id
+                WHERE s.user_id = ? AND s.enabled = 1 AND c.enabled = 1
+                ORDER BY s.position ASC;
+            """, (user["id"],))
+            selected_conns = c.fetchall()
+            for r in selected_conns:
+                try:
+                    backends = json.loads(r["backends_json"])
+                except Exception:
+                    backends = []
+                c_dict = {
+                    "name": r["name"],
+                    "url": r["url"],
+                    "username": r["username"],
+                    "password": r["password"],
+                    "backends": backends,
+                    "timeout": r["timeout"],
+                    "poll_min": r["poll_min"],
+                    "poll_max": r["poll_max"],
+                    "coalesce": r["coalesce"],
+                    "chunk_size": r["chunk_size"],
+                    "puts": r["puts"],
+                    "read_min": r["read_min"],
+                    "read_max": r["read_max"],
+                    "enc": r["enc"],
+                    "dns": r["dns"],
+                }
+                ok_u, err_u, uri = serialize_webdav_uri(c_dict)
+                if not ok_u:
+                    return 500, {"error": f"WebDAV serialization failed for connection '{r['name']}': {err_u}"}, b""
+                non_empty.append(uri)
+
         if not non_empty:
             return 204, {}, b""
 
         raw_text = "\n".join(non_empty) + "\n"
         raw_bytes = raw_text.encode("utf-8")
         b64_payload = base64.b64encode(raw_bytes)
+        if len(b64_payload) > MAX_SUBSCRIPTION_RESPONSE_BYTES:
+            return 500, {"error": f"Subscription response exceeds maximum size of {MAX_SUBSCRIPTION_RESPONSE_BYTES} bytes"}, b""
 
         # Вычисление детерминированного ETag
         content_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
@@ -2185,6 +3624,40 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             self.send_json(status, res)
             return
 
+        # WebDAV connections catalog: GET /api/webdav/connections
+        if path == "/api/webdav/connections":
+            qs = parse_qs(parsed.query)
+            include_secrets = qs.get("secrets", ["0"])[0] in ("1", "true", "yes") or qs.get("include_secrets", ["0"])[0] in ("1", "true", "yes")
+            status, res = self.app.list_webdav_connections(include_secrets=include_secrets)
+            self.send_json(status, res)
+            return
+
+        # GET /api/webdav/connections/<id>
+        m_wd_conn = re.match(r"^/api/webdav/connections/([^/]+)$", path)
+        if m_wd_conn:
+            conn_id = unquote(m_wd_conn.group(1))
+            qs = parse_qs(parsed.query)
+            include_secrets = qs.get("secrets", ["0"])[0] in ("1", "true", "yes") or qs.get("include_secrets", ["0"])[0] in ("1", "true", "yes")
+            status, res = self.app.get_webdav_connection(conn_id, include_secrets=include_secrets)
+            self.send_json(status, res)
+            return
+
+        # GET /api/users/<id_or_nickname>/webdav/preview
+        m_wd_user_prev = re.match(r"^/api/users/([^/]+)/webdav/preview$", path)
+        if m_wd_user_prev:
+            user_id = unquote(m_wd_user_prev.group(1))
+            status, res = self.app.preview_user_webdav(user_id)
+            self.send_json(status, res)
+            return
+
+        # GET /api/users/<id_or_nickname>/webdav
+        m_wd_user = re.match(r"^/api/users/([^/]+)/webdav$", path)
+        if m_wd_user:
+            user_id = unquote(m_wd_user.group(1))
+            status, res = self.app.get_user_webdav(user_id)
+            self.send_json(status, res)
+            return
+
         # Управляющий API: GET /api/users
         if path == "/api/users":
             status, res = self.app.list_users()
@@ -2252,6 +3725,42 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             self.send_json(status, res)
             return
 
+        # POST /api/webdav/connections
+        if path == "/api/webdav/connections":
+            try:
+                data = self.read_json_body()
+            except ValueError as e:
+                code = 413 if "Payload Too Large" in str(e) else 400
+                self.send_json(code, {"error": str(e)})
+                return
+            status, res = self.app.create_webdav_connection(data)
+            self.send_json(status, res)
+            return
+
+        # POST /api/webdav/import-uri
+        if path == "/api/webdav/import-uri":
+            try:
+                data = self.read_json_body()
+            except ValueError as e:
+                code = 413 if "Payload Too Large" in str(e) else 400
+                self.send_json(code, {"error": str(e)})
+                return
+            status, res = self.app.import_webdav_uri(data)
+            self.send_json(status, res)
+            return
+
+        # POST /api/webdav/import-server
+        if path == "/api/webdav/import-server":
+            try:
+                data = self.read_json_body()
+            except ValueError as e:
+                code = 413 if "Payload Too Large" in str(e) else 400
+                self.send_json(code, {"error": str(e)})
+                return
+            status, res = self.app.import_server_webdav(data)
+            self.send_json(status, res)
+            return
+
         # POST /api/users
         if path == "/api/users":
             try:
@@ -2306,6 +3815,34 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             self.send_json(status, res)
             return
 
+        # PUT /api/webdav/connections/<id>
+        m_wd_conn = re.match(r"^/api/webdav/connections/([^/]+)$", path)
+        if m_wd_conn:
+            conn_id = unquote(m_wd_conn.group(1))
+            try:
+                data = self.read_json_body()
+            except ValueError as e:
+                code = 413 if "Payload Too Large" in str(e) else 400
+                self.send_json(code, {"error": str(e)})
+                return
+            status, res = self.app.update_webdav_connection(conn_id, data)
+            self.send_json(status, res)
+            return
+
+        # PUT /api/users/<id_or_nickname>/webdav
+        m_wd_user = re.match(r"^/api/users/([^/]+)/webdav$", path)
+        if m_wd_user:
+            user_id = unquote(m_wd_user.group(1))
+            try:
+                data = self.read_json_body()
+            except ValueError as e:
+                code = 413 if "Payload Too Large" in str(e) else 400
+                self.send_json(code, {"error": str(e)})
+                return
+            status, res = self.app.update_user_webdav(user_id, data)
+            self.send_json(status, res)
+            return
+
         # PUT /api/users/<id_or_nickname>
         m_user = re.match(r"^/api/users/([^/]+)$", path)
         if m_user:
@@ -2331,6 +3868,14 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         if m_of_grp:
             group_id = unquote(m_of_grp.group(1))
             status, res = self.app.delete_openflux_group(group_id)
+            self.send_json(status, res)
+            return
+
+        # DELETE /api/webdav/connections/<id>
+        m_wd_conn = re.match(r"^/api/webdav/connections/([^/]+)$", path)
+        if m_wd_conn:
+            conn_id = unquote(m_wd_conn.group(1))
+            status, res = self.app.delete_webdav_connection(conn_id)
             self.send_json(status, res)
             return
 
