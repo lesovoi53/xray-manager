@@ -44,9 +44,23 @@ def confirm(prompt):
     return input('Выбор: ').strip() in ('1', 'y')
 
 
-def test_url(kind):
+def test_url(kind, current=None):
     if kind == 'URL_TEST':
-        return choose(['https://www.gstatic.com/generate_204', 'https://cp.cloudflare.com/generate_204'], str)
+        choices = ['https://www.gstatic.com/generate_204', 'https://cp.cloudflare.com/generate_204']
+        if current and current not in choices:
+            choices.append(current)
+        return choose(choices, lambda url: url + (' (текущий)' if url == current else ''))
+    choices = [
+        ('Cloudflare — 1 МиБ', 'https://speed.cloudflare.com/__down?bytes=1048576'),
+        ('Cloudflare — 10 МиБ', 'https://speed.cloudflare.com/__down?bytes=10485760'),
+    ]
+    if current and current not in [url for _, url in choices]:
+        choices.append(('Оставить текущий URL', current))
+    choices.append(('Свой HTTPS URL', None))
+    print('Источник Speedtest: загрузку выполняет клиент после подключения; лимит трафика задаётся отдельно.')
+    _, selected = choose(choices, lambda item: item[0] + (' (текущий)' if current and item[1] == current else ''))
+    if selected is not None:
+        return selected
     while True:
         value = input('HTTPS URL файла Speedtest (0 — отмена): ').strip()
         if value == '0':
@@ -86,6 +100,58 @@ def import_profiles(base, path, state):
     print('В черновик добавлено профилей: %d. Существующие ссылки не изменены.' % count)
 
 
+def add_servers(state, family, initial=None):
+    """Accept consecutive links without reopening an action menu after each one."""
+    selected = list(initial or [])
+    available = [p for p in state['profiles'] if family_of(p['uri']) == family]
+    print('\nДобавляйте ссылки серверов по одной, нажимая Enter после каждой.')
+    print('Пустая строка — закончить список; 0 — отменить. Нужно от 2 до 1000 участников.')
+    if available:
+        print('Можно выбрать сохранённый профиль: @номер; * — выбрать все показанные.')
+        for i, profile in enumerate(available, 1):
+            print('  @%d — %s' % (i, profile['name']))
+    while True:
+        line = input('Ссылка сервера (добавлено %d): ' % len(selected)).strip()
+        if line == '0':
+            raise Invalid('Добавление серверов отменено')
+        if not line:
+            if len(selected) >= 2:
+                return selected
+            print('Для автовыбора нужно минимум два разных сервера. Добавьте ещё %d.' % (2-len(selected)))
+            continue
+        if line == '*' and available:
+            selected = list(dict.fromkeys(selected + [p['id'] for p in available]))
+            print('Выбрано участников: %d.' % len(selected))
+            continue
+        if line.startswith('@'):
+            number = line[1:]
+            if not number.isdigit() or not 1 <= int(number) <= len(available):
+                print('Нет такого сохранённого профиля. Вставьте ссылку или @номер из списка.')
+                continue
+            profile = available[int(number)-1]
+        else:
+            try:
+                if family_of(line) != family:
+                    raise Invalid('Ссылка относится к другому семейству')
+            except Invalid as error:
+                print(str(error))
+                continue
+            profile = next((p for p in state['profiles'] if p['uri'] == line), None)
+            if profile is None:
+                if len(state['profiles']) >= 1000:
+                    print('Достигнут лимит клиента: 1000 профилей. Завершите список пустой строкой.')
+                    continue
+                parsed = urllib.parse.urlsplit(line)
+                name = urllib.parse.unquote(parsed.fragment) or '%s %d' % (family, len(state['profiles'])+1)
+                profile = dict(id=str(uuid.uuid4()), name=name, uri=line)
+                state['profiles'].append(profile)
+        if profile['id'] in selected:
+            print('Этот сервер уже добавлен. Вставьте следующую ссылку.')
+        else:
+            selected.append(profile['id'])
+            print('Добавлен: %s. Всего: %d.' % (profile['name'], len(selected)))
+
+
 def members(state, family, initial=None):
     selected = list(initial or [])
     while True:
@@ -104,24 +170,11 @@ def members(state, family, initial=None):
             continue
         if answer == '2':
             selected = [p['id'] for p in available]
+            if not selected:
+                print('Сохранённых профилей этого семейства нет. Выберите 1 и добавьте ссылки серверов.')
             continue
         if answer == '1':
-            line = input('Ссылка сервера (0 — назад): ').strip()
-            if line == '0':
-                continue
-            try:
-                if family_of(line) != family:
-                    raise Invalid('Ссылка относится к другому семейству')
-            except Invalid as error:
-                print(str(error)); continue
-            profile = next((p for p in state['profiles'] if p['uri'] == line), None)
-            if profile is None:
-                parsed = urllib.parse.urlsplit(line)
-                name = urllib.parse.unquote(parsed.fragment) or '%s %d' % (family, len(state['profiles'])+1)
-                profile = dict(id=str(uuid.uuid4()), name=name, uri=line)
-                state['profiles'].append(profile)
-            if profile['id'] not in selected:
-                selected.append(profile['id'])
+            selected = add_servers(state, family, selected)
         elif answer.isdigit() and 4 <= int(answer) <= len(available)+3:
             pid = available[int(answer)-4]['id']
             if pid in selected:
@@ -162,7 +215,7 @@ def settings(group):
         elif field == 'probeMethod':
             group[field] = choose(['GET'] if group['type'] == 'SPEEDTEST' else ['GET', 'HEAD'], str)
         elif field == 'testUrl':
-            group[field] = test_url(group['type'])
+            group[field] = test_url(group['type'], group.get(field))
         else:
             presets = dict(expectedStatus=[200, 204], intervalSeconds=[60, 300, 600, 1800],
                 timeoutSeconds=[3, 5, 8, 15, 30], holdSeconds=[0, 60, 120, 300],
@@ -198,8 +251,9 @@ def edit(state, group):
                 new = max(0, min(len(ordered)-1, old+direction))
                 group['memberIds'].insert(new, group['memberIds'].pop(old))
         elif action == '4':
-            group['type'] = choose(['URL_TEST', 'SPEEDTEST'], str)
-            group['testUrl'] = test_url(group['type'])
+            kind = choose(['URL_TEST', 'SPEEDTEST'], str)
+            url = test_url(kind, group.get('testUrl') if kind == group['type'] else None)
+            group['type'], group['testUrl'] = kind, url
             group['expectedStatus'] = 200 if group['type'] == 'SPEEDTEST' else 204
             if group['type'] == 'SPEEDTEST' and group['probeMethod'] != 'GET':
                 print('SPEEDTEST требует GET: метод проверки изменён на GET.')
@@ -242,20 +296,27 @@ def main(argv=None):
         try:
             working = copy.deepcopy(displayed)
             if action == '1':
-                family = choose(list(FAMILIES), str)
-                name = input('Имя группы: ').strip()
+                print('Тип автовыбора:')
                 kind = choose(['URL_TEST', 'SPEEDTEST'], str)
+                print('Семейство серверов:')
+                family = choose(list(FAMILIES), str)
+                selected = add_servers(working, family)
+                name = input('Имя группы: ').strip()
                 group = dict(DEFAULTS, id=str(uuid.uuid4()), name=name, family=family, category=FAMILIES[family],
                              type=kind, enabled=True, testOnConnect=kind == 'URL_TEST')
                 group['testUrl'] = test_url(kind)
                 if kind == 'SPEEDTEST':
                     group['expectedStatus'] = 200
-                group['memberIds'] = members(working, family)
+                group['memberIds'] = selected
                 by_id = {p['id']: p for p in working['profiles']}
+                print('Профиль маршрутизации группы:')
                 group['routingProfileId'] = choose([by_id[pid] for pid in group['memberIds']], lambda p: p['name'])['id']
                 settings(group)
                 working['groups'].append(group)
             elif action in ('2', '3', '4', '5'):
+                if not working['groups']:
+                    print('Групп пока нет — сначала выберите [1] Создать группу.')
+                    continue
                 group = choose(working['groups'], lambda g: g['name'])
                 if action == '2':
                     edit(working, group)
@@ -268,6 +329,9 @@ def main(argv=None):
                 else:
                     continue
             elif action in ('6', '8', '9'):
+                if not working['profiles']:
+                    print('Профилей пока нет — добавьте серверы при создании группы или импортируйте их пунктом [10].')
+                    continue
                 profile = choose(working['profiles'], lambda p: '%s [%s; реквизиты скрыты]' % (p['name'], family_of(p['uri'])))
                 if action == '8':
                     if confirm('Показать полную ссылку с секретами?'):

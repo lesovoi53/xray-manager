@@ -25,7 +25,7 @@ APT Debian. Xray, WDTT и CSQTT, установленные пользовате
 Загрузите `x-manager.tar.gz` и `SHA256SUMS` из одного выпуска:
 
 ```bash
-tag=v2026.09.26.1
+tag=v2026.09.26.2
 base="https://github.com/lesovoi53/xray-manager/releases/download/$tag"
 mkdir -p x-manager-install && cd x-manager-install
 curl -fLO "$base/x-manager.tar.gz"

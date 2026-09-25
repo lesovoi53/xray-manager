@@ -26,7 +26,7 @@ class ConnectionGroupsTests(unittest.TestCase):
     def test_speedtest_blank_url_reprompts_and_settings_use_choices(self):
         tui = importlib.import_module('tuna-groups')
         output = io.StringIO()
-        with patch('builtins.input', side_effect=['', 'http://invalid.test/file', 'https://[broken', 'https://example.test/file#fragment', 'https://example.test/file']), redirect_stdout(output):
+        with patch('builtins.input', side_effect=['3', '', 'http://invalid.test/file', 'https://[broken', 'https://example.test/file#fragment', 'https://example.test/file']), redirect_stdout(output):
             self.assertEqual(tui.test_url('SPEEDTEST'), 'https://example.test/file')
         self.assertIn('непустой HTTPS URL', output.getvalue())
         group = dict(groups.DEFAULTS, type='URL_TEST', testOnConnect=True, testUrl='https://example.test/probe')
@@ -242,7 +242,7 @@ class ConnectionGroupsTests(unittest.TestCase):
             self.assertNotIn(uri1, result.stdout)
             self.assertNotIn(uri2, result.stdout)
         try:
-            run_tui(['1', '1', 'TUI fixture', '1', '1', '1', uri1, '1', uri2, '3', '1', '0', '1', '0'])
+            run_tui(['2', '1', '1', '1', uri1, uri2, '', 'TUI fixture', '1', '1', '0', '1', '0'])
             before = self.store.editor(self.user['id'])[1]
             self.assertEqual(len(before['groups']), 1)
             run_tui(['3', '1', 'Renamed', '1', '2', '1', '2', '2', '1', '0', '1', '0'])
@@ -253,6 +253,12 @@ class ConnectionGroupsTests(unittest.TestCase):
             self.assertEqual(len(self.publish()['groups']), 1)
             run_tui(['4', '1', 'y', '0'])
             self.assertEqual(self.publish()['groups'], [])
+            run_tui(['1', '2', '1', uri1, uri2, '', 'Speedtest fixture', '2', '1', '0', '1', '0'])
+            speedtest = self.publish()['groups'][0]
+            self.assertEqual(speedtest['type'], 'SPEEDTEST')
+            self.assertEqual(speedtest['testUrl'], 'https://speed.cloudflare.com/__down?bytes=10485760')
+            self.assertEqual(speedtest['expectedStatus'], 200)
+            self.assertEqual(len(speedtest['memberIds']), 2)
         finally:
             server.shutdown()
             server.server_close()
