@@ -1562,10 +1562,10 @@ index a91eade..f21bdd4 100644
  
  func (b *BaseTransport) RecordReconnect() {
 diff --git a/transport/yandex/boards.go b/transport/yandex/boards.go
-index 2cf2ce4..6ef79e8 100644
+index 2cf2ce4..eae34af 100644
 --- a/transport/yandex/boards.go
 +++ b/transport/yandex/boards.go
-@@ -309,16 +309,18 @@ func (t *BoardsTransport) get(client *http.Client, u, accept, referer string) er
+@@ -309,16 +309,22 @@ func (t *BoardsTransport) get(client *http.Client, u, accept, referer string) er
  }
  
  func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, content interface{}) error {
@@ -1577,9 +1577,13 @@ index 2cf2ce4..6ef79e8 100644
 -
 -	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
 -		strings.NewReader(form.Encode()))
++	payload, err := json.Marshal(content)
++	if err != nil {
++		return err
++	}
 +	bodyMap := map[string]interface{}{
 +		"action":  action,
-+		"content": content,
++		"content": base64.StdEncoding.EncodeToString(payload),
 +	}
 +	raw, err := json.Marshal(bodyMap)
 +	if err != nil {
@@ -1593,7 +1597,7 @@ index 2cf2ce4..6ef79e8 100644
  	req.Header.Set("X-Requested-With", "XMLHttpRequest")
  	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
  	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
-@@ -340,16 +342,18 @@ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, cont
+@@ -340,16 +346,22 @@ func (t *BoardsTransport) postAPI(client *http.Client, hash, action string, cont
  }
  
  func (t *BoardsTransport) getWhiteboardInfo(client *http.Client, hash string) (map[string]string, error) {
@@ -1605,9 +1609,13 @@ index 2cf2ce4..6ef79e8 100644
 -
 -	req, _ := http.NewRequest("POST", "https://"+boardsBase+"/api",
 -		strings.NewReader(form.Encode()))
++	payload, err := json.Marshal(map[string]string{"hash": hash})
++	if err != nil {
++		return nil, err
++	}
 +	bodyMap := map[string]interface{}{
 +		"action":  "get-whiteboard-info",
-+		"content": map[string]string{"hash": hash},
++		"content": base64.StdEncoding.EncodeToString(payload),
 +	}
 +	raw, err := json.Marshal(bodyMap)
 +	if err != nil {
@@ -1621,6 +1629,73 @@ index 2cf2ce4..6ef79e8 100644
  	req.Header.Set("X-Requested-With", "XMLHttpRequest")
  	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
  	req.Header.Set("Referer", "https://"+boardsBase+"/guest/?hash="+hash)
+diff --git a/transport/yandex/boards_json_test.go b/transport/yandex/boards_json_test.go
+new file mode 100644
+index 0000000..da440dd
+--- /dev/null
++++ b/transport/yandex/boards_json_test.go
+@@ -0,0 +1,61 @@
++package yandex
++
++import (
++	"encoding/base64"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++)
++
++type boardsRoundTrip func(*http.Request) (*http.Response, error)
++
++func (f boardsRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
++
++func TestBoardsJSONEnvelope(t *testing.T) {
++	for _, action := range []string{"request-guest-token", "get-whiteboard-info"} {
++		t.Run(action, func(t *testing.T) {
++			calls := 0
++			client := &http.Client{Transport: boardsRoundTrip(func(r *http.Request) (*http.Response, error) {
++				calls++
++				if r.Method != "POST" || !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
++					t.Fatal("Boards requires a JSON POST")
++				}
++				var body struct {
++					Action  string `json:"action"`
++					Content string `json:"content"`
++				}
++				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++					t.Fatal("content must be a Base64 string")
++				}
++				if body.Action != action {
++					t.Fatal("unexpected action")
++				}
++				decoded, err := base64.StdEncoding.DecodeString(body.Content)
++				if err != nil {
++					t.Fatal("invalid Base64")
++				}
++				var content map[string]string
++				if json.Unmarshal(decoded, &content) != nil || content["hash"] != "fixture-hash" {
++					t.Fatal("payload changed")
++				}
++				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"presentation":{"properties":{"current_slide":"fixture-slide"}}}`)), Header: make(http.Header)}, nil
++			})}
++			transport := &BoardsTransport{}
++			if action == "request-guest-token" {
++				if err := transport.postAPI(client, "fixture-hash", action, map[string]string{"hash": "fixture-hash"}); err != nil {
++					t.Fatal(err)
++				}
++			} else {
++				info, err := transport.getWhiteboardInfo(client, "fixture-hash")
++				if err != nil || info["current_slide"] != "fixture-slide" {
++					t.Fatal("response not decoded")
++				}
++			}
++			if calls != 1 {
++				t.Fatal("request was not sent")
++			}
++		})
++	}
++}
 diff --git a/transport/yandex/captcha.go b/transport/yandex/captcha.go
 index f202710..445fb88 100644
 --- a/transport/yandex/captcha.go

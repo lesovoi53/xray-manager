@@ -18,11 +18,16 @@ WEBDAV_STORAGE="${WEBDAV_STORAGE:-/var/lib/webdav-tunnel/data}"
 # Раздельные учетные данные по провайдерам (с обратной совместимостью)
 SELFHOSTED_LOGIN="${SELFHOSTED_LOGIN:-wdav}"
 SELFHOSTED_PASSWORD="${SELFHOSTED_PASSWORD:-${WEBDAV_PASSWORD:-}}"
-SELFHOSTED_PORT="${SELFHOSTED_PORT:-8443}"
+SELFHOSTED_PORT="${SELFHOSTED_PORT:-18080}"
 raw_listen="${WEBDAV_LISTEN:-}"
 if [ -n "$raw_listen" ]; then
     p_from_l=$(echo "$raw_listen" | grep -oP ':\K[0-9]+$' || true)
     [ -n "$p_from_l" ] && SELFHOSTED_PORT="$p_from_l"
+fi
+
+if [ "$SELFHOSTED_PORT" = 443 ] || [ "$SELFHOSTED_PORT" = 8443 ]; then
+    echo '[webdav-tunnel] Local ports 443 and 8443 are forbidden; migrate the saved configuration explicitly.' >&2
+    exit 1
 fi
 
 MAILRU_LOGIN="${MAILRU_LOGIN:-${MULTI_MAILRU_LOGIN:-}}"
@@ -70,58 +75,9 @@ if [ "$WEBDAV_MODE" = "multi" ]; then
         sleep 1
     fi
 
-    # Генерация/обновление YAML файла со всеми активными бекендами
-    cat > "$YAML_FILE" <<EOF_YAML
-mode: server
-timeout: 60s
-tuning:
-  chunk-size: 131071
-  coalesce: 10ms
-  poll-max: 500ms
-  poll-min: 200ms
-  puts: 8
-  read-max: 8
-  read-min: 3
-backends:
-EOF_YAML
-
-    if [ "${MULTI_LOCAL_ENABLED:-true}" = "true" ] && [ -n "$SELFHOSTED_PASSWORD" ]; then
-        cat >> "$YAML_FILE" <<EOF_YAML
-  - url: http://${SERVER_IP}:${SELFHOSTED_PORT}
-    login: ${SELFHOSTED_LOGIN}
-    password: ${SELFHOSTED_PASSWORD}
-EOF_YAML
-    fi
-
-    if [ "${MULTI_MAILRU_ENABLED:-true}" = "true" ] && [ -n "${MAILRU_LOGIN:-}" ] && [ -n "${MAILRU_PASSWORD:-}" ]; then
-        cat >> "$YAML_FILE" <<EOF_YAML
-  - url: https://webdav.cloud.mail.ru
-    login: ${MAILRU_LOGIN}
-    password: ${MAILRU_PASSWORD}
-EOF_YAML
-    fi
-
-    if [ "${MULTI_YANDEX_ENABLED:-false}" = "true" ] && [ -n "${YANDEX_LOGIN:-}" ] && [ -n "${YANDEX_PASSWORD:-}" ]; then
-        cat >> "$YAML_FILE" <<EOF_YAML
-  - url: https://webdav.yandex.ru
-    login: ${YANDEX_LOGIN}
-    password: ${YANDEX_PASSWORD}
-EOF_YAML
-    fi
-
-    if [ "${MULTI_CUSTOM_ENABLED:-false}" = "true" ] && [ -n "${CUSTOM_URL:-}" ] && [ -n "${CUSTOM_LOGIN:-}" ] && [ -n "${CUSTOM_PASSWORD:-}" ]; then
-        cat >> "$YAML_FILE" <<EOF_YAML
-  - url: ${CUSTOM_URL}
-    login: ${CUSTOM_LOGIN}
-    password: ${CUSTOM_PASSWORD}
-EOF_YAML
-    fi
-
-    if [ "$WEBDAV_ENC" = "true" ] || [ "$WEBDAV_ENC" = "1" ]; then
-        echo "enc: true" >> "$YAML_FILE"
-    fi
-
-    chmod 660 "$YAML_FILE" 2>/dev/null || true
+    export SERVER_IP SELFHOSTED_PORT SELFHOSTED_LOGIN SELFHOSTED_PASSWORD
+    export MAILRU_LOGIN MAILRU_PASSWORD YANDEX_LOGIN YANDEX_PASSWORD CUSTOM_URL CUSTOM_LOGIN CUSTOM_PASSWORD WEBDAV_ENC
+    python3 /usr/local/share/x-manager/scripts/webdav-config.py
 
     echo "[webdav-tunnel] Запуск в режиме MULTI-BACKEND (конфиг: $YAML_FILE)"
     ARGS=("-config=$YAML_FILE")
@@ -138,6 +94,14 @@ EOF_YAML
 
     /usr/local/bin/webdav-tunnel "${ARGS[@]}" &
     RELAY_PID=$!
+    if [ -n "$STORAGE_PID" ]; then
+        if wait -n "$RELAY_PID" "$STORAGE_PID"; then
+            echo '[webdav-tunnel] A required multi-backend process exited unexpectedly' >&2
+            exit 1
+        else
+            exit $?
+        fi
+    fi
     wait "$RELAY_PID"
     exit $?
 

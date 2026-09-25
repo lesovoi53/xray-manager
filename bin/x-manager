@@ -77,6 +77,8 @@ WDAVTUNNEL_SERVICE="webdav-tunnel"
 WDAVTUNNEL_USER="wdavtunnel"
 
 
+[ ! -r /etc/x-manager/gateways.env ] || . /etc/x-manager/gateways.env
+
 WAN_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n 1)
 [ -z "$WAN_IF" ] && WAN_IF="ens3"
 
@@ -943,6 +945,7 @@ sync_active_firewall_rules() {
 
 menu_firewall() {
     while true; do
+        {
         clear
         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${CYAN}║${BOLD}          ЦЕНТР УПРАВЛЕНИЯ ФАЕРВОЛОМ ПОРТОВ (IPTABLES)                ${CYAN}║${NC}"
@@ -982,7 +985,9 @@ menu_firewall() {
         echo -e "  ${GREEN}${BOLD}[8]${NC} 🟢 ${BOLD}РАЗБЛОКИРОВАТЬ ВСЕ ПРОТОКОЛЫ (Открыть штатный доступ)${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-8]: " fw_act
+        } >/dev/null
+        xm_choose_action menu_firewall fw_act || return
+
         case "$fw_act" in
             1) is_mieru_installed && toggle_mieru_fw ;;
             2) is_snell_installed && toggle_snell_fw ;;
@@ -1413,42 +1418,7 @@ mieru_export_links() {
 }
 
 mieru_check_update() {
-    show_mieru_header
-    echo -e "${BOLD}--- Проверка обновлений Mieru (mita) с GitHub ---${NC}"
-    local cur_v=$(get_mieru_version)
-    echo -e "Текущая установленная версия: ${CYAN}v${cur_v}${NC}"
-    echo -e "${YELLOW}Опрос официального репозитория enfein/mieru...${NC}"
-    local latest_v=$(curl -fsSL -I -o /dev/null -w '%{url_effective}' https://github.com/enfein/mieru/releases/latest 2>/dev/null | sed -e 's#.*/tag/##' -e 's#.*/tag/v##' -e 's#^v##')
-    if [ -z "$latest_v" ] || [[ "$latest_v" =~ "github.com" ]]; then
-        latest_v=$(curl -fsSL https://api.github.com/repos/enfein/mieru/releases/latest 2>/dev/null | grep -o '"tag_name": *"[^"]*' | sed -e 's/"tag_name": *"//' -e 's/^v//')
-    fi
-    [ -z "$latest_v" ] && latest_v="$cur_v"
-
-    echo -e "Последняя версия на GitHub:   ${GREEN}v${latest_v}${NC}"
-    echo ""
-    if [ "$cur_v" = "$latest_v" ]; then
-        echo -e "${GREEN}✓ У вас уже установлена самая последняя версия Mieru (v${cur_v})!${NC}"
-        echo ""
-        read -p "Нажмите Enter для возврата..."
-        return
-    fi
-
-    read -p "Обновить Mieru с версии v${cur_v} до актуальной v${latest_v}? [Y/n]: " up_ch
-    [[ "$up_ch" =~ ^[nN]$ ]] && return
-
-    echo -e "${YELLOW}Скачивание и установка mita v${latest_v}...${NC}"
-    local arch_deb="amd64"
-    [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ] && arch_deb="arm64"
-    if curl -fL --progress-bar -o /tmp/mita_new.deb "https://github.com/enfein/mieru/releases/download/v${latest_v}/mita_${latest_v}_${arch_deb}.deb"; then
-        dpkg -i /tmp/mita_new.deb 2>/dev/null || apt-get install -f -y 2>/dev/null || true
-        rm -f /tmp/mita_new.deb
-    else
-        curl -fL --progress-bar "https://github.com/enfein/mieru/releases/download/v${latest_v}/mita_${latest_v}_linux_${arch_deb}.tar.gz" | tar -xz -C /usr/local/bin/ mita 2>/dev/null || true
-        chmod +x /usr/local/bin/mita 2>/dev/null || true
-    fi
-    restart_mieru_and_verify
-    echo -e "${GREEN}✓ Mieru успешно обновлен до версии v$(get_mieru_version)!${NC}"
-    sleep 2
+    xm_release_update
 }
 
 menu_mieru() {
@@ -1464,6 +1434,7 @@ menu_mieru() {
         return
     fi
     while true; do
+        {
         show_mieru_header
         echo -e "  ${YELLOW}[1]${NC} 📊 Статус службы Mita (Mieru) и сокеты"
         echo -e "  ${YELLOW}[2]${NC} 🌐 Маршрутизация трафика (Xray / Прямой выход)"
@@ -1478,7 +1449,9 @@ menu_mieru() {
         echo -e "  ${GREEN}${BOLD}[11]${NC} 🔄 ${BOLD}Проверить и обновить Mieru до последней версии с GitHub${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите пункт [0-11]: " m_choice
+        } >/dev/null
+        xm_choose_action menu_mieru m_choice || return
+
         case "$m_choice" in
             1)
                 show_mieru_header
@@ -1720,6 +1693,7 @@ menu_snell() {
         return
     fi
     while true; do
+        {
         show_snell_header
         echo -e "  ${YELLOW}[1]${NC} 📊 Статус службы Snell и сокеты"
         echo -e "  ${YELLOW}[2]${NC} 🌐 Маршрутизация трафика (Xray / Прямой выход)"
@@ -1733,7 +1707,9 @@ menu_snell() {
         echo -e "  ${YELLOW}[10]${NC} 🔒 ${BOLD}Управление доступом в фаерволе${NC} ($(get_snell_fw_status))"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите пункт [0-10]: " s_choice
+        } >/dev/null
+        xm_choose_action menu_snell s_choice || return
+
         case "$s_choice" in
             1)
                 show_snell_header
@@ -1881,6 +1857,7 @@ menu_wdtt() {
         return
     fi
     while true; do
+        {
         show_wdtt_header
         echo -e "  ${YELLOW}[1]${NC} 📊 Статус службы WDTT и активные сокеты"
         echo -e "  ${YELLOW}[2]${NC} 🌐 Маршрутизация трафика (Xray / Прямой выход)"
@@ -1892,7 +1869,9 @@ menu_wdtt() {
         echo -e "  ${YELLOW}[8]${NC} 🔒 ${BOLD}Управление доступом в фаерволе${NC} ($(get_wdtt_fw_status))"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите пункт [0-8]: " w_choice
+        } >/dev/null
+        xm_choose_action menu_wdtt w_choice || return
+
         case "$w_choice" in
             1)
                 show_wdtt_header
@@ -2316,6 +2295,7 @@ menu_csqtt() {
     fi
 
     while true; do
+        {
         show_csqtt_header
         echo -e "  ${YELLOW}[1]${NC} 📊 Статус службы csqtt и активные сокеты"
         echo -e "  ${YELLOW}[2]${NC} 🔒 ${BOLD}Включить защиту веб-панели${NC} (Доступ ТОЛЬКО через SSH-туннель)"
@@ -2330,7 +2310,9 @@ menu_csqtt() {
         echo -e "  ${YELLOW}[11]${NC} 🔗 ${BOLD}Показать клиентскую ссылку (csqtt://) и QR-код${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите пункт [0-11]: " c_choice
+        } >/dev/null
+        xm_choose_action menu_csqtt c_choice || return
+
         case "$c_choice" in
             1)
                 show_csqtt_header
@@ -2614,6 +2596,7 @@ sync_ssl_to_xui() {
 
 menu_ssl() {
     while true; do
+        {
         clear
         local p_cert=$(detect_primary_ssl_cert 2>/dev/null || true)
         local c_path="Не обнаружен"
@@ -2648,7 +2631,9 @@ menu_ssl() {
         echo -e "  ${YELLOW}[4]${NC} 💡 ${BOLD}Памятка по управлению SSL через веб-панель 3X-UI${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-4]: " ssl_act
+        } >/dev/null
+        xm_choose_action menu_ssl ssl_act || return
+
         case "$ssl_act" in
             1)
                 clear
@@ -3171,7 +3156,7 @@ dns_change_routing() {
                 if [ -f "$f" ]; then
                     sed -i 's/^USE_EXTERNAL_SOCKS5\s*=.*/USE_EXTERNAL_SOCKS5 = true/' "$f"
                     sed -i 's/^FORWARD_IP\s*=.*/FORWARD_IP = "127.0.0.1"/' "$f"
-                    sed -i 's/^FORWARD_PORT\s*=.*/FORWARD_PORT = 10808/' "$f"
+                    sed -i 's/^FORWARD_PORT\s*=.*/FORWARD_PORT = ${XRAY_SOCKS_PORT:-10808}/' "$f"
                 fi
             done
             echo -e "${GREEN}✓ Маршрутизация установлена: Xray SOCKS5${NC}"
@@ -3266,13 +3251,11 @@ install_cottendns() {
     local pkg_arch="AMD64"
     case "$arch" in
         x86_64) pkg_arch="AMD64" ;;
-        aarch64|arm64) pkg_arch="ARM64" ;;
         *) echo -e "${RED}Архитектура $arch не поддерживается автоматически.${NC}"; sleep 2; return ;;
     esac
 
     local tmp_dir=$(mktemp -d)
-    local dl_url="https://github.com/WhiteDNS/CottenDNS/releases/download/v2026.09.01.221444-530ffbf/CottenDns_Server_Linux_${pkg_arch}.tar.gz"
-    if ! curl -sL "$dl_url" -o "$tmp_dir/cotten.tar.gz"; then
+    if ! python3 /usr/local/share/x-manager/scripts/release-assets.py 'cottendns-{arch}.tar.gz' "$tmp_dir/cotten.tar.gz"; then
         echo -e "${RED}Ошибка скачивания с GitHub!${NC}"
         rm -rf "$tmp_dir"
         sleep 2
@@ -3326,7 +3309,7 @@ SOCKS_CONNECT_TIMEOUT = 120.0
 USE_EXTERNAL_SOCKS5 = true
 SOCKS5_AUTH = false
 FORWARD_IP = "127.0.0.1"
-FORWARD_PORT = 10808
+FORWARD_PORT = ${XRAY_SOCKS_PORT:-10808}
 DATA_ENCRYPTION_METHOD = 5
 ENCRYPTION_AUTO_DETECT = true
 ENCRYPTION_KEY_FILE = "/etc/cottendns/encrypt_key.txt"
@@ -3419,13 +3402,11 @@ install_masterdns() {
     local pkg_arch="AMD64"
     case "$arch" in
         x86_64) pkg_arch="AMD64" ;;
-        aarch64|arm64) pkg_arch="ARM64" ;;
         *) echo -e "${RED}Архитектура $arch не поддерживается автоматически.${NC}"; sleep 2; return ;;
     esac
 
     local tmp_dir=$(mktemp -d)
-    local dl_url="https://github.com/masterking32/MasterDnsVPN/releases/download/v2026.06.13.234407-7de2476/MasterDnsVPN_Server_Linux_${pkg_arch}.tar.gz"
-    if ! curl -sL "$dl_url" -o "$tmp_dir/master.tar.gz"; then
+    if ! python3 /usr/local/share/x-manager/scripts/release-assets.py 'masterdns-{arch}.tar.gz' "$tmp_dir/master.tar.gz"; then
         echo -e "${RED}Ошибка скачивания с GitHub!${NC}"
         rm -rf "$tmp_dir"
         sleep 2
@@ -3461,7 +3442,7 @@ DNS_UPSTREAM_SERVERS = ["1.1.1.1:53", "8.8.8.8:53"]
 USE_EXTERNAL_SOCKS5 = true
 SOCKS5_AUTH = false
 FORWARD_IP = "127.0.0.1"
-FORWARD_PORT = 10808
+FORWARD_PORT = ${XRAY_SOCKS_PORT:-10808}
 DATA_ENCRYPTION_METHOD = 5
 ENCRYPTION_KEY_FILE = "/etc/masterdns/encrypt_key.txt"
 LOG_LEVEL = "INFO"
@@ -3615,6 +3596,7 @@ menu_dns() {
     fi
 
     while true; do
+        {
         show_dns_header
         echo -e "  ${YELLOW}[1]${NC} 📱 ${BOLD}Показать 3 профиля подключения${NC} (stormdns:// ссылки + QR-коды)"
         echo -e "  ${YELLOW}[2]${NC} 🔄 ${BOLD}Переключить активный движок${NC} (CottenDNS <-> MasterDnsVPN)"
@@ -3625,7 +3607,9 @@ menu_dns() {
         echo -e "  ${YELLOW}[7]${NC} ➕ Установить второй движок / Удалить DNS-туннель"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите пункт [0-7]: " top_d_choice
+        } >/dev/null
+        xm_choose_action menu_dns top_d_choice || return
+
         case "$top_d_choice" in
             1) show_dns_profiles ;;
             2) switch_dns_engine ;;
@@ -3840,9 +3824,9 @@ view_global_status() {
     printf "  %-22s %-25b\n" "Fail2ban (Защита SSH):" "$(get_f2b_short_status)"
     echo ""
     echo -e "${BOLD}--- Внутренние шлюзы ядра Xray (Вход для прокси-служб) ---${NC}"
-    echo -e "  • ${CYAN}TPROXY (прозрачный шлюз):${NC} 127.0.0.1:12345 (TCP/UDP) ${GREEN}[Локально / Извне ЗАКРЫТ 🔒]${NC}"
-    echo -e "  • ${CYAN}SOCKS5 вход ядра:${NC}         127.0.0.1:10808 (TCP)     ${GREEN}[Локально / Извне ЗАКРЫТ 🔒]${NC}"
-    echo -e "  • ${CYAN}Dokodemo REDIRECT:${NC}       127.0.0.1:12346 (TCP)     ${GREEN}[Локально / Вход для Snell 🔒]${NC}"
+    echo -e "  • ${CYAN}TPROXY (прозрачный шлюз):${NC} 127.0.0.1:${XRAY_TPROXY_PORT:-12345} (TCP/UDP) ${GREEN}[Локально / Извне ЗАКРЫТ 🔒]${NC}"
+    echo -e "  • ${CYAN}SOCKS5 вход ядра:${NC}         127.0.0.1:${XRAY_SOCKS_PORT:-10808} (TCP)     ${GREEN}[Локально / Извне ЗАКРЫТ 🔒]${NC}"
+    echo -e "  • ${CYAN}Dokodemo REDIRECT:${NC}       127.0.0.1:${XRAY_REDIRECT_PORT:-12346} (TCP)     ${GREEN}[Локально / Вход для Snell 🔒]${NC}"
     echo ""
     echo -e "${BOLD}--- Открытые прослушиваемые порты ---${NC}"
     echo -e "${YELLOW}TCP порты:${NC}"
@@ -4812,6 +4796,7 @@ menu_fail2ban() {
 # ------------------------------------------------------------------------------
 menu_system_opt() {
     while true; do
+        {
         clear
         local cur_dns=$(get_sys_dns_short)
         local cur_bbr=$(get_bbr_short_status)
@@ -4840,7 +4825,9 @@ menu_system_opt() {
         echo -e "  ${YELLOW}${BOLD}[5]${NC} 📊 Сводный отчет о характеристиках сервера и сети"
         echo -e "  ${BOLD}[0]${NC} 🚪 Назад в главное меню"
         echo ""
-        read -p "Выберите раздел [0-5]: " sys_choice
+        } >/dev/null
+        xm_choose_action menu_system_opt sys_choice || return
+
         case "$sys_choice" in
             1) menu_dns_system ;;
             2) menu_bbr_tuning ;;
@@ -5274,13 +5261,13 @@ edit_sub_user() {
         local status_str="🟢 Активен"
         [ "$u_en" != "true" ] && status_str="🔴 Отключен"
 
-        local u_of_en=$(echo "$user_json" | jq -r '.protocols.openflux // .openflux // false')
-        local c_of=$(echo "$user_json" | jq -r '(.counts.openflux // 0)')
+        local u_of_en=$(echo "$user_json" | jq -r 'if has("openflux_enabled") then .openflux_enabled else (.protocols.openflux // .openflux // false) end')
+        local c_of=$(echo "$user_json" | jq -r '(.openflux_groups_count // .counts.openflux // 0)')
         local of_label="Отключен"
         [ "$u_of_en" = "true" ] && of_label="Включен (${c_of} групп)"
 
-        local u_wd_en=$(echo "$user_json" | jq -r '.protocols.webdav // .webdav // false')
-        local c_wd=$(echo "$user_json" | jq -r '(.counts.webdav // 0)')
+        local u_wd_en=$(echo "$user_json" | jq -r 'if has("webdav_enabled") then .webdav_enabled else (.protocols.webdav // .webdav // false) end')
+        local c_wd=$(echo "$user_json" | jq -r '(.webdav_connections_count // .counts.webdav // 0)')
         local wd_label="Отключен"
         [ "$u_wd_en" = "true" ] && wd_label="Включен (${c_wd} подкл.)"
 
@@ -5303,10 +5290,14 @@ edit_sub_user() {
         echo -e "  ${YELLOW}[9]${NC} 📁 ${BOLD}WebDAV (Подключения / Бэкенды / Пул)${NC} [${wd_label}]"
         echo -e "  ${YELLOW}[10]${NC} 🔄 ${BOLD}Пересобрать профиль из активных служб сервера${NC}"
         echo -e "  ${RED}[11]${NC} 🗑️  ${BOLD}Удалить этого пользователя безвозвратно${NC}"
+        echo -e "  ${YELLOW}[12]${NC} 🎯 ${BOLD}Группы автовыбора URL-test / Speedtest${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Завершить редактирование"
         echo ""
-        read -p "Выберите действие [0-11]: " e_act
+        read -p "Выберите действие [0-12]: " e_act
         case "$e_act" in
+            12)
+                python3 /usr/local/bin/tuna-groups "$uid" --api "$SUB_API"
+                ;;
             1)
                 echo ""
                 read -p "Введите новый никнейм (Enter для отмены): " new_n
@@ -5962,8 +5953,9 @@ except Exception as e:
                 echo -e "${CYAN}[*] Запрос импорта локальных групп из /etc/openflux...${NC}"
                 local imp_resp=$(curl -s -X POST "${SUB_API}/api/openflux/import-local" 2>/dev/null || echo "")
                 local imp_status=$(echo "$imp_resp" | jq -r '.status // empty' 2>/dev/null || echo "")
-                if [ "$imp_status" = "ok" ]; then
-                    local imp_count=$(echo "$imp_resp" | jq -r '.count // 0' 2>/dev/null || echo 0)
+                local imp_ok=$(echo "$imp_resp" | jq -r '.success // false' 2>/dev/null)
+                if [ "$imp_ok" = "true" ] || [ "$imp_status" = "ok" ]; then
+                    local imp_count=$(echo "$imp_resp" | jq -r '.imported_count // .count // 0' 2>/dev/null)
                     echo -e "${GREEN}✓ Локальный импорт завершен успешно!${NC}"
                     echo -e "  Импортировано/синхронизировано групп: ${BOLD}${imp_count}${NC}"
                     echo -e "  ${GRAY}(Транспорты vyandex пропущены per v2 contract: разрешены только mailru, boards, cupsonline)${NC}"
@@ -7981,26 +7973,6 @@ print(f"\033[1;36m{uri}\033[0m\n")
     done
 }
 
-sync_tuna_sub_daemon() {
-    local daemon_src=""
-    local cur_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-    if [ -f "${cur_script_dir}/../tuna-sub-server/tuna-subscriptions.py" ]; then
-        daemon_src="${cur_script_dir}/../tuna-sub-server/tuna-subscriptions.py"
-    elif [ -f "${cur_script_dir}/tuna-sub-server/tuna-subscriptions.py" ]; then
-        daemon_src="${cur_script_dir}/tuna-sub-server/tuna-subscriptions.py"
-    elif [ -f "/root/x-manager/tuna-sub-server/tuna-subscriptions.py" ]; then
-        daemon_src="/root/x-manager/tuna-sub-server/tuna-subscriptions.py"
-    fi
-
-    if [ -n "$daemon_src" ] && [ -f "$daemon_src" ] && [ -f "/usr/local/bin/tuna-subscriptions" ]; then
-        if ! cmp -s "$daemon_src" "/usr/local/bin/tuna-subscriptions" 2>/dev/null; then
-            cp -f "$daemon_src" /usr/local/bin/tuna-subscriptions
-            chmod 0755 /usr/local/bin/tuna-subscriptions
-            systemctl restart tuna-subscriptions 2>/dev/null || true
-        fi
-    fi
-}
-
 sync_openflux_to_sub_server() {
     local sub_api="http://127.0.0.1:22217"
     if curl -s "${sub_api}/health" >/dev/null 2>&1; then
@@ -8010,10 +7982,9 @@ sync_openflux_to_sub_server() {
 
 menu_subscriptions() {
     local SUB_API="http://127.0.0.1:22217"
-    sync_tuna_sub_daemon
-    sync_openflux_to_sub_server
 
     while true; do
+        {
         clear
         local s_stat=$(get_sub_server_status)
         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
@@ -8037,7 +8008,9 @@ menu_subscriptions() {
         echo -e "  ${YELLOW}[12]${NC} 📥 ${BOLD}Установить / Обновить службу tuna-subscriptions${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-12]: " sub_act
+        } >/dev/null
+        xm_choose_action menu_subscriptions sub_act || return
+
         case "$sub_act" in
             1)
                 clear
@@ -8288,17 +8261,7 @@ print(json.dumps(data))
                 journalctl -u tuna-subscriptions -f -n 50
                 ;;
             12)
-                echo -e "${CYAN}[*] Запуск установки / обновления tuna-subscriptions...${NC}"
-                mkdir -p /tmp/tuna-sub-install
-                curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.py "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/tuna-subscriptions.py?v=$(date +%s)" 2>/dev/null || true
-                curl -fsSL -o /tmp/tuna-sub-install/config.toml.example "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/config.toml.example?v=$(date +%s)" 2>/dev/null || true
-                curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.service "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/tuna-subscriptions.service?v=$(date +%s)" 2>/dev/null || true
-                curl -fsSL -o /tmp/tuna-sub-install/install-sub-server.sh "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/install-sub-server.sh?v=$(date +%s)" 2>/dev/null || true
-                if [ -f /tmp/tuna-sub-install/install-sub-server.sh ]; then
-                    bash /tmp/tuna-sub-install/install-sub-server.sh || true
-                fi
-                rm -rf /tmp/tuna-sub-install
-                sleep 2
+                xm_release_update
                 ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
@@ -8333,7 +8296,7 @@ show_openflux_header() {
     echo -e "${CYAN}║${NC}  Режим сети:  ${CYAN}L4 (gVisor Userspace Proxy)${NC}  |  Маршрут: $(get_openflux_routing)"
     echo -e "${CYAN}║${NC}  Архитектура: $(get_openflux_pool_mode_label)"
     echo -e "${CYAN}║${NC}  Транспорт:   ${GREEN}${of_transport}${NC} (дефолт)  |  Кодек: ${MAGENTA}${of_codec}${NC} ${of_codec_desc}"
-    echo -e "${CYAN}║${NC}  Шифрование:  ${key_status}  |  Шлюз Xray: :12346 REDIRECT"
+    echo -e "${CYAN}║${NC}  Шифрование:  ${key_status}  |  Шлюз Xray: :${XRAY_REDIRECT_PORT:-12346} REDIRECT"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -8343,7 +8306,7 @@ openflux_manage_routing() {
     echo -e "${BOLD}--- Настройка маршрутизации OpenFlux (L4 gVisor) ---${NC}"
     echo -e "Текущий режим: $(get_openflux_routing)"
     echo ""
-    echo -e "  ${YELLOW}[1]${NC} 🌐 Маршрутизация Xray (REDIRECT :12346)"
+    echo -e "  ${YELLOW}[1]${NC} 🌐 Маршрутизация Xray (REDIRECT :${XRAY_REDIRECT_PORT:-12346})"
     echo -e "  ${YELLOW}[2]${NC} ⚡ Прямой выход (Direct WAN)"
     echo ""
     echo -e "  ${YELLOW}[0]${NC} Назад"
@@ -8354,7 +8317,7 @@ openflux_manage_routing() {
             mkdir -p /etc/openflux
             echo "xray" > /etc/openflux/routing.mode
             [ -x /usr/local/bin/openflux-routing.sh ] && /usr/local/bin/openflux-routing.sh
-            echo -e "${GREEN}✓ Маршрутизация OpenFlux: Xray (REDIRECT :12346)${NC}"
+            echo -e "${GREEN}✓ Маршрутизация OpenFlux: Xray (REDIRECT :${XRAY_REDIRECT_PORT:-12346})${NC}"
             sleep 2
             ;;
         2)
@@ -8370,176 +8333,7 @@ openflux_manage_routing() {
 }
 
 rebuild_openflux() {
-    clear
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${BOLD}          СБОРКА / ОБНОВЛЕНИЕ OPENFLUX ИЗ ИСХОДНИКОВ (GO)             ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    if ! command -v go >/dev/null 2>&1 && [ ! -x /usr/local/go/bin/go ]; then
-        echo -e "${YELLOW}Установка Go компилятора...${NC}"
-        apt-get update -qq && apt-get install -y -qq golang-go git >/dev/null 2>&1 || true
-        if ! command -v go >/dev/null 2>&1; then
-            local g_arch="amd64"
-            [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ] && g_arch="arm64"
-            curl -fsSL "https://dl.google.com/go/go1.22.6.linux-${g_arch}.tar.gz" -o /tmp/go.tar.gz 2>/dev/null || true
-            if [ -s /tmp/go.tar.gz ]; then
-                rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz && rm -f /tmp/go.tar.gz
-            fi
-        fi
-    fi
-    export PATH=$PATH:/usr/local/go/bin
-
-    if ! command -v go >/dev/null 2>&1; then
-        echo -e "${RED}Ошибка: компилятор Go не найден. Установите Go и повторите попытку.${NC}"
-        read -p "Нажмите Enter..." dummy
-        return 1
-    fi
-
-    id -u openflux &>/dev/null || useradd -r -s /usr/sbin/nologin openflux 2>/dev/null || true
-    mkdir -p /etc/openflux/instances /var/log/openflux
-
-    local tmp_dir="/tmp/openflux_build_$(date +%s)"
-    rm -rf "$tmp_dir"
-    echo -e "  -> Клонирование github.com/p1neappleXpress/OpenFlux..."
-    if git clone --depth 1 https://github.com/p1neappleXpress/OpenFlux.git "$tmp_dir"; then
-        local patch_file=""
-        if [ -f "/usr/local/share/x-manager/patches/openflux-multistream.patch" ]; then
-            patch_file="/usr/local/share/x-manager/patches/openflux-multistream.patch"
-        elif [ -f "$(dirname "$0")/../patches/openflux-multistream.patch" ]; then
-            patch_file="$(dirname "$0")/../patches/openflux-multistream.patch"
-        elif [ -f "/etc/x-manager/patches/openflux-multistream.patch" ]; then
-            patch_file="/etc/x-manager/patches/openflux-multistream.patch"
-        elif [ -f "/root/x-manager/patches/openflux-multistream.patch" ]; then
-            patch_file="/root/x-manager/patches/openflux-multistream.patch"
-        fi
-
-        if [ -n "$patch_file" ] && [ -f "$patch_file" ]; then
-            echo -e "  -> Применение патча Multi-Stream trunking ($(basename "$patch_file"))..."
-            if (cd "$tmp_dir" && git apply "$patch_file" 2>/dev/null); then
-                echo -e "  ${GREEN}✓ Патч Multi-Stream успешно применен!${NC}"
-            elif (cd "$tmp_dir" && patch -p1 < "$patch_file" 2>/dev/null); then
-                echo -e "  ${GREEN}✓ Патч Multi-Stream применен через patch -p1!${NC}"
-            else
-                echo -e "  ${YELLOW}⚠ Не удалось применить патч Multi-Stream, сборка продолжится из main.${NC}"
-            fi
-        fi
-
-        echo -e "  -> Компиляция бинарного файла OpenFlux (CGO_ENABLED=0)..."
-        (cd "$tmp_dir" && CGO_ENABLED=0 go build -v -trimpath -ldflags='-s -w' -o /usr/local/bin/openflux . && chmod +x /usr/local/bin/openflux)
-        rm -rf "$tmp_dir"
-        echo -e "${GREEN}✓ Бинарный файл /usr/local/bin/openflux успешно скомпилирован!${NC}"
-    else
-        echo -e "${RED}Ошибка клонирования репозитория OpenFlux!${NC}"
-        rm -rf "$tmp_dir"
-        read -p "Нажмите Enter..." dummy
-        return 1
-    fi
-
-    # Установка сервисов и скриптов
-    mkdir -p /usr/local/bin /etc/systemd/system
-    cat << 'EOF_RUNNER' > /usr/local/bin/openflux-runner.sh
-#!/usr/bin/env bash
-set -e
-INSTANCE="${1:-1}"
-if [ -n "$INSTANCE" ] && [ -f "/etc/openflux/instances/${INSTANCE}.env" ]; then
-    ENV_FILE="/etc/openflux/instances/${INSTANCE}.env"
-elif [ -n "$INSTANCE" ] && [ -f "$INSTANCE" ]; then
-    ENV_FILE="$INSTANCE"
-else
-    ENV_FILE="/etc/openflux/openflux.env"
-    INSTANCE="1"
-fi
-if [ -f "$ENV_FILE" ]; then
-    set -a
-    . "$ENV_FILE"
-    set +a
-fi
-ROLE="${ROLE:-exit}"
-MODE="${MODE:-l4}"
-TRANSPORT="${TRANSPORT:-mailru}"
-URL="${URL:-}"
-CODEC="${CODEC:-legacy}"
-DEBUG="${DEBUG:-1}"
-ENCRYPTION_KEY="${ENCRYPTION_KEY:-}"
-KEY_FILE="/etc/openflux/psk-${INSTANCE}.key"
-if [ -z "$URL" ]; then
-    echo "[OpenFlux #$INSTANCE] ВНИМАНИЕ: URL не настроен!"
-    sleep 30
-    exit 1
-fi
-ARGS=("--role=$ROLE" "--mode=$MODE" "--transport=$TRANSPORT" "--codec=$CODEC" "--url=$URL")
-[ "$DEBUG" = "1" ] || [ "$DEBUG" = "true" ] && ARGS+=("--debug")
-if [ -n "$ENCRYPTION_KEY" ]; then
-    mkdir -p /etc/openflux
-    echo -n "$ENCRYPTION_KEY" > "$KEY_FILE"
-    chmod 600 "$KEY_FILE"
-    ARGS+=("--encryption-key-file=$KEY_FILE")
-fi
-exec /usr/local/bin/openflux "${ARGS[@]}"
-EOF_RUNNER
-    chmod +x /usr/local/bin/openflux-runner.sh
-
-    cat << 'EOF_ROUTING' > /usr/local/bin/openflux-routing.sh
-#!/usr/bin/env bash
-set -e
-MODE_FILE="/etc/openflux/routing.mode"
-ENV_FILE="/etc/x-manager/gateways.env"
-XRAY_REDIRECT_PORT=12346
-if [ -f "$ENV_FILE" ]; then
-    val=$(grep -oP '^XRAY_REDIRECT_PORT=\K[0-9]+' "$ENV_FILE" 2>/dev/null || true)
-    [ -n "$val" ] && XRAY_REDIRECT_PORT="$val"
-fi
-MODE="xray"
-[ -f "$MODE_FILE" ] && MODE=$(cat "$MODE_FILE" | tr -d ' \r\n')
-SERVER_IP=$(ip -4 addr show scope global 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
-
-iptables -w 5 -t nat -D OUTPUT -m owner --uid-owner openflux -j OPENFLUX_OUT 2>/dev/null || true
-iptables -w 5 -t nat -F OPENFLUX_OUT 2>/dev/null || true
-iptables -w 5 -t nat -X OPENFLUX_OUT 2>/dev/null || true
-
-if [ "$MODE" = "xray" ]; then
-    iptables -w 5 -t nat -N OPENFLUX_OUT 2>/dev/null || true
-    iptables -w 5 -t nat -F OPENFLUX_OUT 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -d 127.0.0.0/8 -j RETURN
-    [ -n "$SERVER_IP" ] && iptables -w 5 -t nat -A OPENFLUX_OUT -d "$SERVER_IP" -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 5.45.192.0/18 -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 77.88.0.0/18 -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 87.250.250.0/24 -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 93.158.134.0/24 -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 178.154.131.0/24 -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 213.180.193.0/24 -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 94.100.180.0/24 -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -m multiport --dports 80,443 -d 217.69.139.0/24 -j RETURN 2>/dev/null || true
-    iptables -w 5 -t nat -A OPENFLUX_OUT -p tcp -j REDIRECT --to-ports "${XRAY_REDIRECT_PORT}"
-    iptables -w 5 -t nat -C OUTPUT -m owner --uid-owner openflux -j OPENFLUX_OUT 2>/dev/null || iptables -w 5 -t nat -I OUTPUT 1 -m owner --uid-owner openflux -j OPENFLUX_OUT
-fi
-EOF_ROUTING
-    chmod +x /usr/local/bin/openflux-routing.sh
-
-    cat << 'EOF_UNIT' > /etc/systemd/system/openflux@.service
-[Unit]
-Description=OpenFlux Exit-Node Service (Channel %i • L4 Mode)
-After=network.target network-online.target xray.service
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-User=openflux
-Group=openflux
-LimitNOFILE=65535
-ExecStartPre=+/usr/local/bin/openflux-routing.sh
-ExecStart=/usr/local/bin/openflux-runner.sh %i
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF_UNIT
-
-    systemctl daemon-reload
-    echo -e "${GREEN}✓ Системные службы и скрипты OpenFlux обновлены.${NC}"
-    read -p "Нажмите Enter для продолжения..." dummy
+    xm_release_update
 }
 
 # ==============================================================================
@@ -8620,8 +8414,8 @@ get_wdavtunnel_listen_port() {
     p=$(get_wdavtunnel_prop "SELFHOSTED_PORT" "")
     if [ -z "$p" ]; then
         local listen
-        listen=$(get_wdavtunnel_prop "WEBDAV_LISTEN" ":8443")
-        p=$(echo "$listen" | grep -oP ':\K[0-9]+$' || echo "8443")
+        listen=$(get_wdavtunnel_prop "WEBDAV_LISTEN" ":18080")
+        p=$(echo "$listen" | grep -oP ':\K[0-9]+$' || echo "18080")
     fi
     echo "$p"
 }
@@ -9169,30 +8963,7 @@ menu_webdav_tunnel_pool() {
 
 # Сборка webdav-tunnel из исходников
 build_webdav_tunnel_binary() {
-    echo -e "${YELLOW}  → Сборка webdav-tunnel из исходников (spkprsnts/webdav-tunnel)...${NC}"
-    export PATH=$PATH:/usr/local/go/bin
-    if ! command -v go >/dev/null 2>&1; then
-        echo -e "${RED}  ! Go компилятор не найден. Установите Go и попробуйте снова.${NC}"
-        return 1
-    fi
-    local tmp_dir="/tmp/webdav_tunnel_build_$(date +%s)"
-    rm -rf "$tmp_dir"
-    if git clone --depth 1 https://github.com/spkprsnts/webdav-tunnel.git "$tmp_dir" >/dev/null 2>&1; then
-        if (cd "$tmp_dir" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /usr/local/bin/webdav-tunnel . 2>/dev/null); then
-            chmod +x /usr/local/bin/webdav-tunnel
-            rm -rf "$tmp_dir"
-            echo -e "${GREEN}  ✓ /usr/local/bin/webdav-tunnel успешно скомпилирован${NC}"
-            return 0
-        else
-            rm -rf "$tmp_dir"
-            echo -e "${RED}  ! Ошибка компиляции.${NC}"
-            return 1
-        fi
-    else
-        rm -rf "$tmp_dir"
-        echo -e "${RED}  ! Не удалось клонировать репозиторий.${NC}"
-        return 1
-    fi
+    xm_release_update
 }
 
 # Диагностика и тестирование WebDAV-подключения (RFC 4918 PROPFIND)
@@ -9210,7 +8981,7 @@ test_webdav_account() {
             ep="https://webdav.yandex.ru/"
             ;;
         selfhosted)
-            local port=$(get_wdavtunnel_prop "SELFHOSTED_PORT" "8443")
+            local port=$(get_wdavtunnel_listen_port)
             ep="http://127.0.0.1:${port}/"
             ;;
         custom)
@@ -9261,9 +9032,9 @@ test_all_webdav_accounts() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    local s_port=$(get_wdavtunnel_prop "SELFHOSTED_PORT" "8443")
-    local s_user=$(get_wdavtunnel_prop "SELFHOSTED_LOGIN" "lesovoi")
-    local s_pass=$(get_wdavtunnel_prop "SELFHOSTED_PASSWORD" "")
+    local s_port=$(get_wdavtunnel_listen_port)
+    local s_user=$(get_wdavtunnel_prop "SELFHOSTED_LOGIN" "wdav")
+    local s_pass=$(get_wdavtunnel_prop "SELFHOSTED_PASSWORD" "$(get_wdavtunnel_prop "WEBDAV_PASSWORD" "")")
     echo -e " ${BOLD}1. Встроенный сервер VPS (Selfhosted :${s_port}):${NC} логин: ${s_user:-[нет]}"
     test_webdav_account "selfhosted" "$s_user" "$s_pass" "http://127.0.0.1:${s_port}/" || true
 
@@ -9290,103 +9061,12 @@ test_all_webdav_accounts() {
 
 menu_webdav_tunnel() {
     if ! is_webdav_tunnel_installed; then
-        clear
-        echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${YELLOW}║${BOLD}   WebDAV Tunnel — НЕ УСТАНОВЛЕН                                     ${YELLOW}║${NC}"
-        echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo -e "  WebDAV Tunnel — TCP-туннель поверх WebDAV (Selfhosted и Яндекс.Диск)."
-        echo -e "  Трафик маскируется под WebDAV-запросы к хранилищу."
-        echo ""
-        echo -e "  ${YELLOW}[1]${NC} 📦 Установить WebDAV Tunnel (скачать + собрать из исходников)"
-        echo -e "  ${BOLD}[0]${NC} ← Назад"
-        echo ""
-        read -p "Выберите действие [0-1]: " inst_ch
-        case "$inst_ch" in
-            1)
-                clear
-                echo -e "${CYAN}==> Установка WebDAV Tunnel...${NC}"
-                # Пользователь
-                id -u "$WDAVTUNNEL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$WDAVTUNNEL_USER" 2>/dev/null || true
-                # Директории
-                mkdir -p "$WDAVTUNNEL_DIR" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel"
-                chown -R "$WDAVTUNNEL_USER:$WDAVTUNNEL_USER" "$WDAVTUNNEL_DIR" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel" 2>/dev/null || true
-                # Go
-                export PATH=$PATH:/usr/local/go/bin
-                if ! command -v go >/dev/null 2>&1; then
-                    echo -e "${CYAN}  → Установка компилятора Go...${NC}"
-                    apt-get install -y -qq golang-go >/dev/null 2>&1 || true
-                fi
-                # Бинарник
-                if build_webdav_tunnel_binary; then
-                    # Дефолтный конфиг
-                    if [ ! -f "$WDAVTUNNEL_CONFIG_ENV" ]; then
-                        local rnd_pass
-                        rnd_pass=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 24 2>/dev/null || date +%s | sha256sum | head -c 24)
-                        cat > "$WDAVTUNNEL_CONFIG_ENV" <<EOF_CFG
-WEBDAV_MODE="selfhosted"
-SELFHOSTED_PORT="8443"
-SELFHOSTED_LOGIN="wdav"
-SELFHOSTED_PASSWORD="${rnd_pass}"
-WEBDAV_STORAGE="${WDAVTUNNEL_STORAGE}"
-
-MAILRU_LOGIN=""
-MAILRU_PASSWORD=""
-
-YANDEX_LOGIN=""
-YANDEX_PASSWORD=""
-
-CUSTOM_URL=""
-CUSTOM_LOGIN=""
-CUSTOM_PASSWORD=""
-
-MULTI_LOCAL_ENABLED="true"
-MULTI_MAILRU_ENABLED="true"
-MULTI_YANDEX_ENABLED="false"
-MULTI_CUSTOM_ENABLED="false"
-
-WEBDAV_ENC="false"
-ROUTING_MODE="xray"
-XRAY_REDIRECT_PORT="${XRAY_REDIRECT_PORT:-12346}"
-EOF_CFG
-                        chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_CONFIG_ENV"
-                        chmod 640 "$WDAVTUNNEL_CONFIG_ENV"
-                    fi
-                    # Runner script
-                    local sd
-                    sd=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-                    if [ -f "$sd/../scripts/webdav-tunnel-runner.sh" ]; then
-                        cp -f "$sd/../scripts/webdav-tunnel-runner.sh" "$WDAVTUNNEL_RUNNER"
-                    else
-                        curl -fsSL -o "$WDAVTUNNEL_RUNNER" \
-                            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/webdav-tunnel-runner.sh?v=$(date +%s)" 2>/dev/null || true
-                    fi
-                    chmod +x "$WDAVTUNNEL_RUNNER" 2>/dev/null || true
-                    # Routing script
-                    if [ -f "$sd/../scripts/webdav-tunnel-routing.sh" ]; then
-                        cp -f "$sd/../scripts/webdav-tunnel-routing.sh" "$WDAVTUNNEL_ROUTING"
-                    else
-                        curl -fsSL -o "$WDAVTUNNEL_ROUTING" \
-                            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/webdav-tunnel-routing.sh?v=$(date +%s)" 2>/dev/null || true
-                    fi
-                    chmod +x "$WDAVTUNNEL_ROUTING" 2>/dev/null || true
-                    # Systemd unit
-                    if [ -f "$sd/../systemd/webdav-tunnel.service" ]; then
-                        cp -f "$sd/../systemd/webdav-tunnel.service" "/etc/systemd/system/${WDAVTUNNEL_SERVICE}.service"
-                    else
-                        curl -fsSL -o "/etc/systemd/system/${WDAVTUNNEL_SERVICE}.service" \
-                            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/systemd/webdav-tunnel.service?v=$(date +%s)" 2>/dev/null || true
-                    fi
-                    systemctl daemon-reload
-                    echo -e "${GREEN}✓ WebDAV Tunnel установлен. Настройте логин/пароль и запустите из меню.${NC}"
-                fi
-                read -p "Нажмите Enter..."
-                ;;
-        esac
+        xm_release_update
         return
     fi
 
     while true; do
+        {
         clear
         local wdt_status
         wdt_status=$(get_wdavtunnel_status)
@@ -9495,7 +9175,9 @@ EOF_CFG
         echo -e "  ${PURPLE}[T]${NC} 🧪 ${BOLD}Экспресс-тест авторизации всех WebDAV-аккаунтов (PROPFIND)${NC}"
         echo -e "  ${BOLD}[0]${NC} ← Назад в главное меню"
         echo ""
-        read -p "Выберите действие [0-12, T]: " wdt_choice
+
+        } >/dev/null
+        xm_choose_action menu_webdav_tunnel wdt_choice || return
 
         case "$wdt_choice" in
             1)
@@ -9761,7 +9443,7 @@ EOF_CFG
                 elif [ "$wdt_mode" = "selfhosted" ]; then
                     echo ""
                     read -p "  Новый порт WebDAV-сервера (текущий: ${wdt_port}): " new_port
-                    if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ]; then
+                    if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ] && [ "$new_port" -ne 8443 ]; then
                         set_wdavtunnel_prop "SELFHOSTED_PORT" "${new_port}"
                         set_wdavtunnel_prop "WEBDAV_LISTEN" ":${new_port}"
                         echo -e "${GREEN}✓ Порт изменён на :${new_port}. Перезапустите для применения.${NC}"
@@ -10089,6 +9771,7 @@ menu_openflux() {
     init_openflux_profiles
 
     while true; do
+        {
         show_openflux_header
         local of_transport=$(get_openflux_prop "TRANSPORT" "vyandex")
         local of_codec=$(get_openflux_prop "CODEC" "legacy")
@@ -10134,7 +9817,9 @@ menu_openflux() {
         echo -e "  ${YELLOW}[12]${NC} 🔨 Скомпилировать / переустановить OpenFlux (Яндекс Доски + Multi-Stream)"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад в Главное Меню"
         echo ""
-        read -p "Выберите действие [0-12, M, T, B, или c1-c8]: " of_choice
+
+        } >/dev/null
+        xm_choose_action menu_openflux of_choice || return
 
         case "$of_choice" in
             1|c1|c2|c3|c4|c5|c6|c7|c8|C1|C2|C3|C4|C5|C6|C7|C8)
@@ -10508,7 +10193,6 @@ menu_openflux() {
 # ГЛАВНОЕ МЕНЮ ДИСПЕТЧЕРА
 # ==============================================================================
 main_hub() {
-    sync_active_firewall_rules >/dev/null 2>&1 || true
 
     local invoked=$(basename "$0")
     if [ "$invoked" = "x-snell" ]; then
@@ -10546,126 +10230,17 @@ main_hub() {
         exit 0
     fi
 
-    while true; do
-        clear
-        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║${BOLD}          ЦЕНТР УПРАВЛЕНИЯ ПРОКСИ-СЕРВИСАМИ             ${CYAN}║${NC}"
-        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
-        echo -e "${CYAN}║${NC}  Сервер: ${BOLD}${SERVER_IP}${NC}  |  Шлюзы: TPROXY :12345 [127.0.0.1] | SOCKS5 :10808 [127.0.0.1] 🔒"
-        echo -e "${CYAN}║${NC}  Система: BBR: $(get_bbr_short_status) | Swap: $(get_swap_short_status) | F2B: $(get_f2b_short_status) | SSL: $(get_ssl_short_status) | Sub: $(get_sub_server_short_status)"
-        echo -e "${CYAN}║${NC}"
-        if is_mieru_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[1] 🚀 Mieru (mita v$(get_mieru_version))${NC}   -> $(get_mieru_status)"
-            echo -e "${CYAN}║${NC}      Порты: ${BOLD}$(get_mieru_ports)${NC}  |  Фаервол: $(get_mieru_fw_status)"
-            echo -e "${CYAN}║${NC}      Маршрут: $(get_mieru_routing)  |  Профиль: $(get_mieru_preset)"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[1] 🚀 Mieru (mita)${NC}           -> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}║${NC}"
-        if is_snell_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[2] ⚡ Snell (v5.0.1)${NC}         -> $(get_snell_status)"
-            echo -e "${CYAN}║${NC}      Порт:  ${BOLD}$(get_snell_port)${NC} (TCP+UDP QUIC) |  Фаервол: $(get_snell_fw_status)"
-            echo -e "${CYAN}║${NC}      Маршрут: $(get_snell_routing)  |  Обфускация: $(get_snell_obfs)"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[2] ⚡ Snell (v5.0.1)${NC}         -> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}║${NC}"
-        if is_webdav_tunnel_installed; then
-            local w_prov=$(get_wdavtunnel_provider_label)
-            echo -e "${CYAN}║${NC}  ${BOLD}[3] 📦 WebDAV Tunnel (WireTurn)${NC}  -> $(get_wdavtunnel_status)"
-            echo -e "${CYAN}║${NC}      Провайдер: ${w_prov} | Маршрут: $(get_wdavtunnel_routing)"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[3] 📦 WebDAV Tunnel (WireTurn)${NC}  -> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}║${NC}"
-        if is_openflux_installed; then
-            local of_cnt=$(get_openflux_counts)
-            local of_a=$(echo "$of_cnt" | cut -d':' -f1)
-            local of_pm=$(get_openflux_pool_mode_label)
-            echo -e "${CYAN}║${NC}  ${BOLD}[4] 📡 OpenFlux${NC} [${of_pm}] -> $(get_openflux_status)"
-            echo -e "${CYAN}║${NC}      Каналы: ${of_a}/8 активных  |  Шлюз: Xray REDIRECT  |  Маршрут: $(get_openflux_routing)"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[4] 📡 OpenFlux (Мультиплекс 1-8)${NC} -> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}║${NC}"
-        if is_dns_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[5] 🌐 DNS-Туннель (MasterDnsVPN)${NC}  -> $(get_dns_status)"
-            echo -e "${CYAN}║${NC}      Домен: ${BOLD}$(get_dns_domain)${NC} (:53 UDP/TCP) | Фаервол WAN: $(get_dns_wan_status)"
-            echo -e "${CYAN}║${NC}      Маршрут: $(get_dns_routing)"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[5] 🌐 DNS-Туннель (MasterDnsVPN)${NC}  -> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}║${NC}"
-        if is_wdtt_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[6] 🛡️ WDTT / qwdtt${NC}          -> $(get_wdtt_status)"
-            echo -e "${CYAN}║${NC}      Порт:   :${BOLD}$(get_wdtt_peer_port)/UDP${NC}   |  Фаервол: $(get_wdtt_fw_status)"
-            echo -e "${CYAN}║${NC}      Профиль: ${BOLD}$(get_wdtt_profile_name)${NC}  |  Пароль: ${GREEN}$(get_wdtt_password)${NC}"
-            echo -e "${CYAN}║${NC}      Маршрут: $(get_wdtt_routing)"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[6] 🛡️ WDTT / qwdtt${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}║${NC}"
-        if is_csqtt_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[7] 🔒 CSQTT (VPN & Web-панель)${NC}-> $(get_csqtt_status)"
-            echo -e "${CYAN}║${NC}      VPN порт:   :${BOLD}$(get_csqtt_peer_port)/UDP${NC}   |  Фаервол: $(get_csqtt_tunnel_status)"
-            echo -e "${CYAN}║${NC}      Веб-панель: :${BOLD}$(get_csqtt_web_port)/TCP${NC}   |  Защита: $(get_csqtt_protect_status)"
-            echo -e "${CYAN}║${NC}      Веб-вход:   Логин: ${GREEN}$(get_csqtt_user)${NC}  |  Пароль: ${GREEN}$(get_csqtt_pass)${NC}"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[7] 🔒 CSQTT (VPN & Web-панель)${NC}-> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}║${NC}"
-        if is_sub_server_installed; then
-            echo -e "${CYAN}║${NC}  ${BOLD}[8] 📋 Подписки TUNA${NC}          -> $(get_sub_server_status)"
-            echo -e "${CYAN}║${NC}      API: http://127.0.0.1:22217   |  Порт: :22217 [127.0.0.1] 🔒"
-        else
-            echo -e "${CYAN}║${NC}  ${BOLD}[8] 📋 Подписки TUNA${NC}          -> ${RED}НЕ УСТАНОВЛЕН${NC}"
-        fi
-        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo -e "  ${BOLD}─── БЛОК 1: СЕТЕВЫЕ ПРОКСИ И ТУННЕЛИ (L4/L7) ───${NC}"
-        echo -e "  ${GREEN}${BOLD}[1]${NC} 🚀 ${BOLD}Управление Mieru${NC} (Anti-TSPU, Egress, пользователи, порты, фаервол)"
-        echo -e "  ${BLUE}${BOLD}[2]${NC} ⚡ ${BOLD}Управление Snell v5${NC} (0-RTT, Egress Xray/Direct, HTTP-obfs, фаервол)"
-        echo -e "  ${CYAN}${BOLD}[3]${NC} 📦 ${BOLD}Управление WebDAV Tunnel${NC} (Mail.ru / Selfhosted / Яндекс.Диск • WireTurn)"
-        echo -e "  ${YELLOW}${BOLD}[4]${NC} 📡 ${BOLD}Управление OpenFlux${NC} [$(get_openflux_pool_mode_label)]"
-        echo -e "  ${YELLOW}${BOLD}[5]${NC} 🌐 ${BOLD}Управление DNS-туннелями${NC} (MasterDnsVPN / CottenDNS, stormdns://, WAN)"
-        echo -e "  ${PURPLE}${BOLD}[6]${NC} 🛡️  ${BOLD}Управление WDTT / qwdtt${NC} (Egress в ядро / Прямой выход, клиенты, фаервол)"
-        echo -e "  ${CYAN}${BOLD}[7]${NC} 🔒 ${BOLD}Управление CSQTT${NC} (Защита веб-панели, туннель фаервол, логин/пароли)"
-        echo ""
-        echo -e "  ${BOLD}─── БЛОК 2: КЛИЕНТСКИЕ ПОДПИСКИ ───${NC}"
-        echo -e "  ${CYAN}${BOLD}[8]${NC} 📋 ${BOLD}Сервер подписок TUNA${NC} (Профили, выдача Base64-ссылок, ротация токенов)"
-        echo ""
-        echo -e "  ${BOLD}─── БЛОК 3: БЕЗОПАСНОСТЬ И ОПТИМИЗАЦИЯ СЕРВЕРА ───${NC}"
-        echo -e "  ${RED}${BOLD}[9]${NC} 🛡️  ${BOLD}Центр управления фаерволом портов${NC} (Включение/Выключение протоколов, Локдаун)"
-        echo -e "  ${PURPLE}${BOLD}[10]${NC} 🔒 ${BOLD}Управление SSL-сертификатами${NC} (Cloudflare Wildcard / Standalone :80 / ACME / 3X-UI)"
-        echo -e "  ${GREEN}${BOLD}[11]${NC} ⚙️  ${BOLD}Оптимизация и безопасность${NC} (DNS с пингом, BBR/буферы под RAM, Swap 2/4G, Fail2ban)"
-        echo ""
-        echo -e "  ${BOLD}─── БЛОК 4: СЕРВИС, ДИАГНОСТИКА И ОБСЛУЖИВАНИЕ ───${NC}"
-        echo -e "  ${BOLD}[12]${NC} 📊 Сводный статус всех служб и портов сервера"
-        echo -e "  ${BOLD}[13]${NC} 🔍 ${BOLD}Пересканировать и подхватить протоколы${NC} (Автоопределение установленных служб)"
-        echo -e "  ${BOLD}[14]${NC} 🔄 Перезапустить все сервисы (Mieru + Snell + WebDAV + OpenFlux + DNS + WDTT + CSQTT)"
-        echo -e "  ${BOLD}[0]${NC} 🚪 Выход"
-        echo ""
-        read -p "Выберите раздел [0-14]: " top_choice
-        case "$top_choice" in
-            1) menu_mieru ;;
-            2) menu_snell ;;
-            3) menu_webdav_tunnel ;;
-            4) menu_openflux ;;
-            5) menu_dns ;;
-            6) menu_wdtt ;;
-            7) menu_csqtt ;;
-            8) menu_subscriptions ;;
-            9) menu_firewall ;;
-            10) menu_ssl ;;
-            11) menu_system_opt ;;
-            12) view_global_status ;;
-            13) rescan_and_adopt_protocols ;;
-            14) restart_all_services ;;
-            0) clear; exit 0 ;;
-            *) echo "Неверный выбор"; sleep 1 ;;
-        esac
-    done
+    xm_home
+
 }
+
+# Load the installed menu module, or the complete checkout when run locally.
+XM_UI=/usr/local/share/x-manager/scripts/menu-v2.sh
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/../scripts/menu-v2.sh" ]; then
+    XM_UI="$(dirname "${BASH_SOURCE[0]}")/../scripts/menu-v2.sh"
+fi
+[ -r "$XM_UI" ] || { echo 'Incomplete X-Manager distribution: menu module missing' >&2; exit 1; }
+. "$XM_UI"
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     main_hub

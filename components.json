@@ -1,0 +1,30 @@
+{
+  "repository": "lesovoi53/xray-manager",
+  "release": "v2026.09.25.1",
+  "versions": {
+    "snell": "5.0.1",
+    "mieru": "3.38.0",
+    "openflux": "d13aa5b7 + multistream/boards patch",
+    "webdav": "b1af4c05",
+    "cottendns": "v2026.09.01.221444-530ffbf",
+    "masterdns": "v2026.06.13.234407-7de2476"
+  },
+  "sha256": {
+    "cottendns-amd64.tar.gz": "e40a51672bdfeeaf11a332a23873fb087e1c7b426e0950dfe6f5a78c6a504e25",
+    "snell-amd64.zip": "9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539",
+    "masterdns-amd64.tar.gz": "597bdc510b896a3b4ac89865ee7cefa73191025c64093f5e0f85c76a70430de9",
+    "mita-amd64.deb": "5170555aace38f76862541587b632d61848bba12f2e845b057977c9f9257e59a",
+    "webdav-tunnel-amd64": "aedfe85812c254ee51ebbb2cffbab3680d9cba2108c8a8323ab529ebd025137a",
+    "openflux-amd64": "fb527d160c7a85d82247663618b0bdf40374520e4f86f47abb95e1a636b5d561",
+    "mita-source.tar.gz": "73f0885f63e929a35d7ab8358d21913bc96020a7ffaf830cc0a69772dcd834cf",
+    "openflux-source.tar.gz": "2d3077bb48f02d8623264fa60143b12035383dc57707b0b27d4946c1019e9951",
+    "webdav-tunnel-source.tar.gz": "f4b9c2abcf96a7fd6d0783d4bbfd8e8c8e98c74c909a6e169a2ba03441f78a9a"
+  },
+  "platform": {
+    "os": [
+      "debian12",
+      "debian13"
+    ],
+    "architecture": "amd64"
+  }
+}

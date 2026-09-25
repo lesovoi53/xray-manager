@@ -57,5 +57,5 @@ else
     rm -f "$KEY_FILE" 2>/dev/null || true
 fi
 
-echo "[OpenFlux #$INSTANCE] Запуск: /usr/local/bin/openflux ${ARGS[*]}"
+echo "[OpenFlux #$INSTANCE] Запуск: role=$ROLE mode=$MODE transport=$TRANSPORT codec=$CODEC (URL and key hidden)"
 exec /usr/local/bin/openflux "${ARGS[@]}"

@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Version-2.8.0-blue.svg?style=for-the-badge" alt="Version">
-  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20Debian%20%7C%20Ubuntu-orange.svg?style=for-the-badge" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-Debian%2012%20%7C%20Debian%2013-orange.svg?style=for-the-badge" alt="Platform">
   <img src="https://img.shields.io/badge/Architecture-x86__64%20%7C%20ARM64-brightgreen.svg?style=for-the-badge" alt="Architecture">
   <img src="https://img.shields.io/badge/Egress-Xray%20Core%20%7C%20Direct%20WAN-purple.svg?style=for-the-badge" alt="Egress">
   <img src="https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge" alt="License">
@@ -137,8 +137,8 @@ X-Manager организует взаимодействие всех прокс�
 ## 🚀 Быстрая установка
 
 ### Требования к серверу:
-* **Операционная система:** Debian 11 / 12 / 13, Ubuntu 20.04 / 22.04 / 24.04
-* **Архитектура:** x86_64 (amd64) или ARM64 (aarch64)
+* **Операционная система:** Debian 12 / 13
+* **Архитектура:** x86_64 (amd64)
 * Права суперпользователя `root`
 
 ---

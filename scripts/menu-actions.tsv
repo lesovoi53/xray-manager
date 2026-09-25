@@ -1,0 +1,104 @@
+menu_mieru|Mieru|Подключения|4|Пользователи и пароли
+menu_mieru|Mieru|Подключения|5|Имя подключения
+menu_mieru|Mieru|Подключения|7|Ссылка и QR-код
+menu_mieru|Mieru|Настройки|2|Маршрутизация Xray / Direct
+menu_mieru|Mieru|Настройки|3|Обфускация и паттерн
+menu_mieru|Mieru|Настройки|6|Порты
+menu_mieru|Mieru|Настройки|10|Доступ через фаервол
+menu_mieru|Mieru|Обслуживание|1|Статус и сокеты
+menu_mieru|Mieru|Обслуживание|8|Живые логи
+menu_mieru|Mieru|Обслуживание|9|Перезапустить
+menu_mieru|Mieru|Обслуживание|11|Обновить полный выпуск
+menu_snell|Snell|Подключения|4|Имя подключения
+menu_snell|Snell|Подключения|5|Управление PSK
+menu_snell|Snell|Подключения|7|Ссылка, параметры и QR-код
+menu_snell|Snell|Настройки|2|Маршрутизация Xray / Direct
+menu_snell|Snell|Настройки|3|HTTP-обфускация
+menu_snell|Snell|Настройки|6|Порт
+menu_snell|Snell|Настройки|10|Доступ через фаервол
+menu_snell|Snell|Обслуживание|1|Статус и сокеты
+menu_snell|Snell|Обслуживание|8|Живые логи
+menu_snell|Snell|Обслуживание|9|Перезапустить
+menu_wdtt|WDTT / qwdtt|Подключения|3|Устройства и трафик
+menu_wdtt|WDTT / qwdtt|Подключения|4|Ссылка и QR-код
+menu_wdtt|WDTT / qwdtt|Подключения|5|Имя подключения
+menu_wdtt|WDTT / qwdtt|Настройки|2|Маршрутизация Xray / Direct
+menu_wdtt|WDTT / qwdtt|Настройки|8|Доступ через фаервол
+menu_wdtt|WDTT / qwdtt|Обслуживание|1|Статус и сокеты
+menu_wdtt|WDTT / qwdtt|Обслуживание|6|Живые логи
+menu_wdtt|WDTT / qwdtt|Обслуживание|7|Перезапустить
+menu_csqtt|CSQTT|Подключения|5|Команда SSH-туннеля
+menu_csqtt|CSQTT|Подключения|6|Показать реквизиты
+menu_csqtt|CSQTT|Подключения|9|Сменить логин и пароль
+menu_csqtt|CSQTT|Подключения|10|Имя подключения
+menu_csqtt|CSQTT|Подключения|11|Ссылка и QR-код
+menu_csqtt|CSQTT|Доступ|2|Закрыть веб-панель за SSH-туннелем
+menu_csqtt|CSQTT|Доступ|3|Открыть веб-панель извне
+menu_csqtt|CSQTT|Доступ|4|Доступ к VPN-туннелю
+menu_csqtt|CSQTT|Обслуживание|1|Статус и сокеты
+menu_csqtt|CSQTT|Обслуживание|7|Живые логи
+menu_csqtt|CSQTT|Обслуживание|8|Перезапустить
+menu_dns|DNS-туннели|Подключения|1|Три профиля: ссылки и QR-коды
+menu_dns|DNS-туннели|Настройки|2|Переключить движок
+menu_dns|DNS-туннели|Настройки|3|Доступ из WAN
+menu_dns|DNS-туннели|Настройки|4|Домен, ключ, маршрут
+menu_dns|DNS-туннели|Обслуживание|5|Живые логи
+menu_dns|DNS-туннели|Обслуживание|6|Перезапустить
+menu_dns|DNS-туннели|Обслуживание|7|Установка и удаление движков
+menu_ssl|SSL-сертификаты|Сертификаты|1|Найти локальные сертификаты
+menu_ssl|SSL-сертификаты|Сертификаты|3|Проверить срок действия
+menu_ssl|SSL-сертификаты|Панель 3X-UI|2|Синхронизировать сертификат в панель
+menu_ssl|SSL-сертификаты|Панель 3X-UI|4|Памятка для панели
+menu_firewall|Фаервол|Доступ к службам|1|Mieru
+menu_firewall|Фаервол|Доступ к службам|2|Snell
+menu_firewall|Фаервол|Доступ к службам|3|WDTT
+menu_firewall|Фаервол|Доступ к службам|4|CSQTT VPN
+menu_firewall|Фаервол|Доступ к службам|5|CSQTT веб-панель
+menu_firewall|Фаервол|Доступ к службам|6|DNS-туннель
+menu_firewall|Фаервол|Массовые действия|7|Заблокировать все протоколы
+menu_firewall|Фаервол|Массовые действия|8|Открыть штатный доступ ко всем протоколам
+menu_system_opt|Система|Настройки|1|DNS системы
+menu_system_opt|Система|Настройки|2|BBR и сетевые буферы
+menu_system_opt|Система|Настройки|3|Swap
+menu_system_opt|Система|Настройки|4|Fail2ban
+menu_system_opt|Система|Диагностика|5|Характеристики сервера и сети
+menu_subscriptions|Подписки TUNA|Пользователи|1|Список и ссылки подписок
+menu_subscriptions|Подписки TUNA|Пользователи|2|Создать из служб сервера
+menu_subscriptions|Подписки TUNA|Пользователи|3|Создать со своими ссылками
+menu_subscriptions|Подписки TUNA|Пользователи|4|Редактировать / группы URL-test и Speedtest
+menu_subscriptions|Подписки TUNA|Пользователи|7|Включить / отключить подписку
+menu_subscriptions|Подписки TUNA|Каталоги|8|Группы OpenFlux v2
+menu_subscriptions|Подписки TUNA|Каталоги|9|Подключения WebDAV
+menu_subscriptions|Подписки TUNA|Обслуживание|10|Перезапустить службу
+menu_subscriptions|Подписки TUNA|Обслуживание|11|Живые логи
+menu_subscriptions|Подписки TUNA|Обслуживание|12|Обновить полный выпуск
+menu_subscriptions|Подписки TUNA|Опасные действия|5|Удалить пользователя
+menu_subscriptions|Подписки TUNA|Опасные действия|6|Отозвать старую ссылку: ротация токена
+menu_webdav_tunnel|WebDAV Tunnel|Подключения|4|Режим работы
+menu_webdav_tunnel|WebDAV Tunnel|Подключения|5|Учётные записи / хранилища пула
+menu_webdav_tunnel|WebDAV Tunnel|Подключения|6|URL или порт Selfhosted
+menu_webdav_tunnel|WebDAV Tunnel|Подключения|9|Ссылка и QR-код
+menu_webdav_tunnel|WebDAV Tunnel|Настройки|7|Шифрование AES-256-GCM
+menu_webdav_tunnel|WebDAV Tunnel|Настройки|8|Маршрутизация Xray / Direct
+menu_webdav_tunnel|WebDAV Tunnel|Диагностика|T|Проверить авторизацию PROPFIND
+menu_webdav_tunnel|WebDAV Tunnel|Диагностика|10|Последние логи
+menu_webdav_tunnel|WebDAV Tunnel|Диагностика|11|Живые логи
+menu_webdav_tunnel|WebDAV Tunnel|Обслуживание|1|Запустить
+menu_webdav_tunnel|WebDAV Tunnel|Обслуживание|2|Остановить
+menu_webdav_tunnel|WebDAV Tunnel|Обслуживание|3|Перезапустить
+menu_webdav_tunnel|WebDAV Tunnel|Обслуживание|12|Обновить полный выпуск
+menu_openflux|OpenFlux|Каналы|1|Выбрать и настроить канал
+menu_openflux|OpenFlux|Каналы|2|Мастер всех 8 каналов
+menu_openflux|OpenFlux|Каналы|M|Классический / Multi-Stream
+menu_openflux|OpenFlux|Настройки|3|Транспорт
+menu_openflux|OpenFlux|Настройки|4|Кодек
+menu_openflux|OpenFlux|Настройки|5|Ключ шифрования
+menu_openflux|OpenFlux|Настройки|6|Отладка
+menu_openflux|OpenFlux|Настройки|7|Маршрутизация Xray / Direct
+menu_openflux|OpenFlux|Диагностика|T|Экспресс-тест ссылок
+menu_openflux|OpenFlux|Диагностика|B|Бенчмарк API облака
+menu_openflux|OpenFlux|Диагностика|10|Последние логи
+menu_openflux|OpenFlux|Диагностика|11|Живые логи
+menu_openflux|OpenFlux|Обслуживание|8|Запустить / перезапустить настроенные каналы
+menu_openflux|OpenFlux|Обслуживание|9|Остановить каналы
+menu_openflux|OpenFlux|Обслуживание|12|Обновить полный выпуск

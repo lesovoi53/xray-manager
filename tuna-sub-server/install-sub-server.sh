@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # TUNA Subscription Server — Installation Script
-# Target OS: Debian 12 / 13 (Ubuntu 22.04 / 24.04 compatible)
+# Target OS: Debian 12 / 13, amd64
 # ==============================================================================
 set -euo pipefail
 
@@ -31,6 +31,26 @@ fi
 PYTHON_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 echo -e "${GREEN}[✓] Обнаружен Python ${PYTHON_VER}${NC}"
 
+if [[ "${XM_PARENT_TRANSACTION:-0}" != 1 ]]; then
+    SUB_SCRIPT_DIR=$SCRIPT_DIR
+    SCRIPT_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+    [[ -f "$SCRIPT_DIR/scripts/installer-common.sh" ]] || { echo 'Run from a complete x-manager checkout' >&2; exit 1; }
+    source "$SCRIPT_DIR/scripts/installer-common.sh"
+    xm_preflight
+    xm_begin
+    SCRIPT_DIR=$SUB_SCRIPT_DIR
+fi
+python3 - "$SCRIPT_DIR/tuna-subscriptions.py" <<'PY'
+import importlib.util, pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
+spec = importlib.util.spec_from_file_location('tuna_validate', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+config = pathlib.Path('/etc/tuna-subscriptions/config.toml')
+if config.exists():
+    module.load_config(str(config))
+PY
+
 # 2. Создание системного пользователя tuna-sub
 if ! id -u tuna-sub >/dev/null 2>&1; then
     echo -e "${CYAN}[*] Создание системного пользователя 'tuna-sub'...${NC}"
@@ -38,6 +58,11 @@ if ! id -u tuna-sub >/dev/null 2>&1; then
 else
     echo -e "${GREEN}[✓] Пользователь 'tuna-sub' уже существует.${NC}"
 fi
+for provider_group in openflux wdavtunnel; do
+    if getent group "$provider_group" >/dev/null; then
+        usermod -a -G "$provider_group" tuna-sub
+    fi
+done
 
 # 3. Создание директорий с ограниченными правами
 echo -e "${CYAN}[*] Настройка защищенных директорий...${NC}"
@@ -55,6 +80,8 @@ chown tuna-sub:tuna-sub /var/log/tuna-subscriptions
 
 # 4. Копирование исполняемого скрипта
 echo -e "${CYAN}[*] Установка исполняемого файла /usr/local/bin/tuna-subscriptions...${NC}"
+install -m 0644 "$SCRIPT_DIR/tuna_connection_groups.py" /usr/local/bin/tuna_connection_groups.py
+install -m 0755 "$SCRIPT_DIR/tuna-groups.py" /usr/local/bin/tuna-groups
 cp -f "${SCRIPT_DIR}/tuna-subscriptions.py" /usr/local/bin/tuna-subscriptions
 chmod 0755 /usr/local/bin/tuna-subscriptions
 chown root:root /usr/local/bin/tuna-subscriptions
@@ -98,7 +125,11 @@ chown root:root /etc/systemd/system/tuna-subscriptions.service
 
 systemctl daemon-reload
 systemctl enable tuna-subscriptions.service
-systemctl restart tuna-subscriptions.service
+if [[ "${XM_PARENT_TRANSACTION:-0}" == 1 ]]; then
+    source "$SCRIPT_DIR/../scripts/installer-common.sh"
+    XM_BACKUP=$XM_PARENT_BACKUP
+fi
+xm_service tuna-subscriptions.service
 
 sleep 1
 
@@ -116,8 +147,6 @@ if systemctl is-active --quiet tuna-subscriptions.service; then
     echo -e "Статус службы:"
     echo -e "  systemctl status tuna-subscriptions"
 else
-    echo -e "${RED}[ERROR] Служба tuna-subscriptions не смогла запуститься!${NC}" >&2
-    systemctl status tuna-subscriptions --no-pager || true
-    journalctl -u tuna-subscriptions -n 20 --no-pager || true
-    exit 1
+    echo 'Сохранено ранее остановленное состояние tuna-subscriptions. Запуск доступен в меню.'
 fi
+XM_TRANSACTION=0

@@ -5,7 +5,30 @@
 # Репозиторий: https://github.com/lesovoi53/xray-manager
 # ==============================================================================
 
-set -e
+set -eE
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Preserve the standalone download workflow by staging one complete distribution.
+if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
+    command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
+    bundle=$(mktemp -d)
+    trap 'rm -rf -- "$bundle"' EXIT
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.25.1.tar.gz" -o "$bundle/source.tar.gz"
+    mkdir "$bundle/source"
+    tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
+    bash "$bundle/source/install.sh" "$@"
+    exit $?
+fi
+. "$SCRIPT_DIR/scripts/installer-common.sh"
+xm_preflight
+# systemd/automation may omit HOME; Go must not depend on an interactive shell.
+export GOPATH="${GOPATH:-/var/cache/x-manager/go}"
+export GOCACHE="${GOCACHE:-/var/cache/x-manager/go-build}"
+if [ "${1:-}" = --rollback ]; then
+    [ -n "${2:-}" ] || xm_die 'Usage: install.sh --rollback /var/backups/x-manager-XXXXXXXX'
+    python3 "$2/installer-state.py" restore "$2"
+    exit
+fi
+case "${1:-}" in ''|--quick|--update|--direct|--manual|-m|--interactive|-i) ;; *) xm_die 'Unknown option';; esac
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -40,11 +63,23 @@ echo -e "${CYAN}║${NC}  Snell v5 | Mieru Anti-TSPU | WDTT (qwdtt) | OpenFlux L
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
+echo 'Checking system dependencies...'
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq curl wget jq unzip iptables qrencode openssl python3 iproute2 ca-certificates
+for dependency in curl wget jq unzip iptables iptables-save iptables-restore openssl python3 ip runuser; do
+    command -v "$dependency" >/dev/null || xm_die "Missing dependency: $dependency"
+done
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "Python 3.9 or newer is required before installation")'
+port_plan=$(python3 "$SCRIPT_DIR/scripts/plan-ports.py")
+eval "$port_plan"
+WORK_DIR=$(mktemp -d)
+export GOTOOLCHAIN=auto
+
 # Архитектура и сетевой интерфейс
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64) SNELL_ARCH="linux-amd64"; MIERU_ARCH="linux-amd64" ;;
-    aarch64|arm64) SNELL_ARCH="linux-aarch64"; MIERU_ARCH="linux-arm64" ;;
     *) echo -e "${RED}Неподдерживаемая архитектура: $ARCH${NC}"; exit 1 ;;
 esac
 
@@ -74,20 +109,18 @@ fi
 
 # Значения по умолчанию
 INSTALL_SNELL="yes"
-SNELL_PORT="1488"
-SNELL_PSK=$(openssl rand -base64 24 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 30 || echo "snell_secret_pass_$(date +%s)")
+SNELL_PSK=$(openssl rand -hex 15)
 SNELL_OBFS="off"
 
 INSTALL_MIERU="yes"
-MIERU_PORTS="2020-2030"
-MIERU_PROTO="TCP"
 MIERU_USER="ADMIN"
-MIERU_PASS="mita_pass_$(openssl rand -hex 4 2>/dev/null || echo "2026")"
+MIERU_PASS="mita_pass_$(openssl rand -hex 4)"
 MIERU_ENTROPY_MODE="LOW_ENTROPY_MODE_48"
 MIERU_MASK_ROTATION="LOW_ENTROPY_MASK_ROTATE_RIGHT_7"
 
 INSTALL_OPENFLUX="yes"
-DEFAULT_ROUTING="xray"
+DEFAULT_ROUTING="${DEFAULT_ROUTING:-xray}"
+[ "${1:-}" != --direct ] || DEFAULT_ROUTING=direct
 
 # Если ручной режим — задаем вопросы
 if [ "$MODE" = "manual" ]; then
@@ -131,177 +164,29 @@ if [ "$MODE" = "manual" ]; then
     [ "$rt_choice" = "2" ] && DEFAULT_ROUTING="direct"
 fi
 
-echo ""
-echo -e "${CYAN}==> Шаг 1: Проверка и установка системных утилит...${NC}"
-export DEBIAN_FRONTEND=noninteractive
-echo -e "  -> Обновление списков пакетов (apt-get update)..."
-apt-get update -qq || true
-echo -e "  -> Проверка необходимых утилит (curl, wget, jq, unzip, python3...)..."
-apt-get install -y -qq curl wget jq unzip iptables qrencode openssl python3 iproute2 git golang-go >/dev/null 2>&1 || apt-get install -y -qq curl wget jq unzip iptables qrencode openssl python3 iproute2 git >/dev/null 2>&1 || true
-echo -e "  ✓ Системные утилиты готовы"
-
-echo -e "${CYAN}==> Шаг 2: Анализ и настройка шлюзов ядра Xray (3X-UI)...${NC}"
+xm_validate_ports
+if [ "$DEFAULT_ROUTING" = xray ] && [ ! -f /etc/x-ui/x-ui.db ]; then
+    python3 "$SCRIPT_DIR/scripts/xray-discovery.py" --verify >/dev/null
+    for gateway in "$XRAY_SOCKS_PORT" "$XRAY_REDIRECT_PORT" "$XRAY_TPROXY_PORT"; do
+        ss -H -lnt "sport = :$gateway" | grep -q . || xm_die "Xray gateway :$gateway is not listening. Configure Xray first, or explicitly use --direct for a clean direct-routing installation."
+    done
+fi
+# Stage and verify the complete selected component set before managed changes.
+asset() { python3 "$SCRIPT_DIR/scripts/release-assets.py" "$1" "$WORK_DIR/$2"; }
+[ "$INSTALL_SNELL" != yes ] || asset 'snell-{arch}.zip' snell-package.zip
+[ "$INSTALL_MIERU" != yes ] || asset 'mita-{arch}.deb' mita.deb
+[ "$INSTALL_OPENFLUX" != yes ] || asset 'openflux-{arch}' openflux
+[ "${INSTALL_WEBDAV_TUNNEL:-yes}" != yes ] || asset 'webdav-tunnel-{arch}' webdav-tunnel
+xm_begin
+echo -e "${CYAN}==> Шаг 2: Анализ и настройка шлюзов ядра Xray (панель / standalone / заданные шлюзы)...${NC}"
 mkdir -p /etc/x-manager
 ENV_FILE="/etc/x-manager/gateways.env"
 
-XRAY_TPROXY_PORT=12345
-XRAY_REDIRECT_PORT=12346
-XRAY_SOCKS_PORT=10808
 
 XUI_DB="/etc/x-ui/x-ui.db"
 if [ -f "$XUI_DB" ]; then
     # Запуск умного Python скрипта детекции и внедрения
-    DETECTION_OUT=$(python3 - << 'EOF'
-import sqlite3, json, sys
-
-db_path = "/etc/x-ui/x-ui.db"
-tproxy_port = None
-redirect_port = None
-socks_port = None
-
-try:
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-
-    # 1. Проверяем таблицу inbounds (шлюзы, созданные через панель)
-    try:
-        for row in c.execute("SELECT id, port, protocol, stream_settings, settings, tag FROM inbounds"):
-            port, proto, stream_s, settings, tag = row[1], row[2], str(row[3]), str(row[4]), str(row[5])
-            if proto == "socks" and not socks_port:
-                socks_port = port
-            elif proto == "dokodemo-door":
-                if "tproxy" in stream_s.lower() or "tproxy" in tag.lower():
-                    tproxy_port = port
-                elif "redirect" in settings.lower() or "redirect" in tag.lower() or "snell" in tag.lower():
-                    redirect_port = port
-    except Exception:
-        pass
-
-    # 1.1 Обеспечиваем наличие и корректную конфигурацию ВСЕХ 3 шлюзов в таблице inbounds базы 3X-UI
-    try:
-        # Порт 10808: protocol mixed, UDP включен, без авторизации, sniffing выключен
-        mixed_settings = json.dumps({"auth": "noauth", "udp": True, "ip": "127.0.0.1"})
-        row_10808 = c.execute("SELECT id FROM inbounds WHERE port=10808").fetchone()
-        if row_10808:
-            c.execute("""
-                UPDATE inbounds 
-                SET protocol='mixed', remark='Mixed Gateway', settings=?, stream_settings='{}',
-                    tag='in-mixed-gateway', listen='127.0.0.1', enable=1, sniffing='{"enabled":false}'
-                WHERE id=?
-            """, (mixed_settings, row_10808[0]))
-            print("UPDATED_INBOUNDS_MIXED=10808")
-        else:
-            c.execute("""
-                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'Mixed Gateway', 1, 0, '127.0.0.1', 10808, 'mixed', ?, '{}', 'in-mixed-gateway', '{"enabled":false}')
-            """, (mixed_settings,))
-            print("INSERTED_INBOUNDS_MIXED=10808")
-
-        # Порт 12345: protocol dokodemo-door (TPROXY)
-        tproxy_settings = json.dumps({"network": "tcp,udp", "followRedirect": True})
-        tproxy_stream = json.dumps({"sockopt": {"tproxy": "tproxy"}})
-        tproxy_sniffing = json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
-        row_12345 = c.execute("SELECT id FROM inbounds WHERE port=12345").fetchone()
-        if row_12345:
-            c.execute("""
-                UPDATE inbounds
-                SET protocol='dokodemo-door', remark='TPROXY Gateway', settings=?, stream_settings=?,
-                    tag='in-tproxy-gateway', listen='127.0.0.1', enable=1, sniffing=?
-                WHERE id=?
-            """, (tproxy_settings, tproxy_stream, tproxy_sniffing, row_12345[0]))
-            print("UPDATED_INBOUNDS_TPROXY=12345")
-        else:
-            c.execute("""
-                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'TPROXY Gateway', 1, 0, '127.0.0.1', 12345, 'dokodemo-door', ?, ?, 'in-tproxy-gateway', ?)
-            """, (tproxy_settings, tproxy_stream, tproxy_sniffing))
-            print("INSERTED_INBOUNDS_TPROXY=12345")
-
-        # Порт 12346: protocol dokodemo-door (REDIRECT TCP + UDP)
-        redirect_settings = json.dumps({"network": "tcp,udp", "followRedirect": True})
-        redirect_sniffing = json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True})
-        row_12346 = c.execute("SELECT id FROM inbounds WHERE port=12346").fetchone()
-        if row_12346:
-            c.execute("""
-                UPDATE inbounds
-                SET protocol='dokodemo-door', remark='REDIRECT Gateway', settings=?, stream_settings='{}',
-                    tag='in-redirect-gateway', listen='127.0.0.1', enable=1, sniffing=?
-                WHERE id=?
-            """, (redirect_settings, redirect_sniffing, row_12346[0]))
-            print("UPDATED_INBOUNDS_REDIRECT=12346")
-        else:
-            c.execute("""
-                INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-                VALUES (1, 0, 0, 0, 'REDIRECT Gateway', 1, 0, '127.0.0.1', 12346, 'dokodemo-door', ?, '{}', 'in-redirect-gateway', ?)
-            """, (redirect_settings, redirect_sniffing))
-            print("INSERTED_INBOUNDS_REDIRECT=12346")
-
-        conn.commit()
-    except Exception as e_ib:
-        print(f"ERROR_INBOUNDS_TABLE={e_ib}")
-
-    # 2. Проверяем xrayTemplateConfig в таблице settings
-    c.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig'")
-    row = c.fetchone()
-    if row:
-        cfg = json.loads(row[0])
-        inbounds = cfg.setdefault("inbounds", [])
-        
-        modified = False
-        # ВАЖНО: Все 3 шлюза (10808, 12345, 12346) живут в таблице inbounds базы 3X-UI.
-        # Чтобы исключить дублирование сокетов (Address already in use) при объединении конфига ядром 3X-UI,
-        # удаляем их дубликаты из массива inbounds шаблона.
-        gateway_ports = {10808, 12345, 12346}
-        gateway_tags = {
-            "in-mieru-socks", "in-mieru-gateway", "in-mixed-gateway",
-            "in-wdtt-tproxy", "in-tproxy-gateway",
-            "in-snell-redirect", "in-redirect-gateway"
-        }
-        
-        inbounds_clean = [ib for ib in inbounds if ib.get("port") not in gateway_ports and ib.get("tag") not in gateway_tags]
-        if len(inbounds_clean) != len(inbounds):
-            cfg["inbounds"] = inbounds_clean
-            inbounds = inbounds_clean
-            modified = True
-            print("REMOVED_GATEWAYS_FROM_TEMPLATE=1")
-
-        socks_port = 10808
-        tproxy_port = 12345
-        redirect_port = 12346
-        print(f"FOUND_SOCKS={socks_port}")
-        print(f"FOUND_TPROXY={tproxy_port}")
-        print(f"FOUND_REDIRECT={redirect_port}")
-
-        # Обеспечиваем наличие blackhole outbound 'blocked'
-        outbound_tags = [o.get("tag") for o in cfg.get("outbounds", [])]
-        if "blocked" not in outbound_tags:
-            cfg.setdefault("outbounds", []).append({
-                "protocol": "blackhole",
-                "tag": "blocked",
-                "settings": {}
-            })
-            modified = True
-            print("CREATED_BLOCKED_OUTBOUND=1")
-
-        # Настройка Kill Switch для всех балансировщиков (fallbackTag: blocked)
-        balancers = cfg.get("routing", {}).get("balancers", [])
-        for b in balancers:
-            if b.get("fallbackTag") != "blocked":
-                b["fallbackTag"] = "blocked"
-                modified = True
-                print(f"PATCHED_BALANCER_FALLBACK={b.get('tag', 'balancer')}")
-
-        if modified:
-            new_val = json.dumps(cfg, indent=2, ensure_ascii=False)
-            c.execute("UPDATE settings SET value=? WHERE key='xrayTemplateConfig'", (new_val,))
-            conn.commit()
-            print("RELOAD_XUI=1")
-
-    conn.close()
-except Exception as e:
-    print(f"ERROR={e}")
-EOF
-)
+    DETECTION_OUT=$(python3 "$SCRIPT_DIR/scripts/detect-gateways.py" "$XUI_DB")
 
     # Парсим вывод детекции
     for line in $DETECTION_OUT; do
@@ -347,39 +232,39 @@ EOF
                 echo -e "  ${GREEN}✓ Добавлен защитный шлюз сброса трафика 'blocked' (blackhole)${NC}"
                 ;;
             RELOAD_XUI=1)
-                systemctl restart x-ui 2>/dev/null || true
+                xm_service x-ui
                 sleep 2
                 ;;
         esac
     done
 else
-    echo -e "${YELLOW}  ! Локальная база Xray не обнаружена. Используем стандартные порты шлюзов ядра.${NC}"
+    echo -e "${YELLOW}  ! База панели отсутствует. Используем проверенные шлюзы Xray или прямой выход.${NC}"
 fi
 
 # Сохраняем переменные окружения шлюзов
+if [ ! -f "$ENV_FILE" ]; then
 cat << EOF > "$ENV_FILE"
 XRAY_TPROXY_PORT=${XRAY_TPROXY_PORT}
 XRAY_REDIRECT_PORT=${XRAY_REDIRECT_PORT}
 XRAY_SOCKS_PORT=${XRAY_SOCKS_PORT}
 EOF
+else
+    . "$ENV_FILE"
+fi
 
 # Установка Snell v5.0.1
 if [ "$INSTALL_SNELL" = "yes" ]; then
     echo -e "${CYAN}==> Шаг 3: Установка и настройка Snell v5.0.1 (Hybrid TCP + UDP/QUIC)...${NC}"
-    id -u snell &>/dev/null || useradd -r -s /usr/sbin/nologin snell 2>/dev/null || true
+    id -u snell &>/dev/null || useradd -r -s /usr/sbin/nologin snell
     mkdir -p /etc/snell /usr/local/bin
 
-    SNELL_URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-${SNELL_ARCH}.zip"
-    tmp_snell="/tmp/snell.zip"
-    echo -e "  -> Загрузка Snell v5.0.1 (${SNELL_ARCH})..."
-    if curl -fL --progress-bar -o "$tmp_snell" "$SNELL_URL" || curl -fsSL -o "$tmp_snell" "$SNELL_URL"; then
-        echo -e "  -> Распаковка и установка в /usr/local/bin/..."
-        unzip -qo "$tmp_snell" -d /usr/local/bin/
-        chmod +x /usr/local/bin/snell-server
-        rm -f "$tmp_snell"
-    else
-        echo -e "${RED}  ✗ Не удалось скачать Snell v5 с dl.nssurge.com! Пропускаем.${NC}"
-    fi
+    tmp_snell="$WORK_DIR/snell.zip"
+    cp "$WORK_DIR/snell-package.zip" "$tmp_snell"
+    unzip -tq "$tmp_snell"
+    mkdir "$WORK_DIR/snell"
+    unzip -q "$tmp_snell" -d "$WORK_DIR/snell"
+    install -m 0755 "$WORK_DIR/snell/snell-server" /usr/local/bin/snell-server.new
+    mv -f /usr/local/bin/snell-server.new /usr/local/bin/snell-server
 
     # Конфигурация Snell
     if [ ! -f "/etc/snell/snell-server.conf" ]; then
@@ -392,44 +277,16 @@ obfs = ${SNELL_OBFS}
 EOF
     fi
 
-    echo "Snell-v5" > /etc/snell/tag.txt
-    echo "$DEFAULT_ROUTING" > /etc/snell/routing.mode
+    [ -f /etc/snell/tag.txt ] || echo "Snell-v5" > /etc/snell/tag.txt
+    [ -f /etc/snell/routing.mode ] || echo "$DEFAULT_ROUTING" > /etc/snell/routing.mode
     chown -R snell:snell /etc/snell
-    chmod 644 /etc/snell/snell-server.conf
+    chmod 640 /etc/snell/snell-server.conf
+    SNELL_PORT=$(sed -nE 's/^listen[[:space:]]*=[[:space:]]*.*:([0-9]+)$/\1/p' /etc/snell/snell-server.conf)
+    [[ "$SNELL_PORT" =~ ^[0-9]+$ ]] || xm_die "Invalid Snell listen port"
 
     # Скрипт маршрутизации snell-routing.sh с использованием подхваченного REDIRECT порта (TCP + UDP)
-    cat << EOF > /usr/local/bin/snell-routing.sh
-#!/usr/bin/env bash
-MODE_FILE="/etc/snell/routing.mode"
-MODE="xray"
-[ -f "\$MODE_FILE" ] && MODE=\$(cat "\$MODE_FILE" | tr -d ' \r\n')
 
-iptables -w 5 -t nat -D OUTPUT -m owner --uid-owner snell -j SNELL_OUT 2>/dev/null || true
-iptables -w 5 -t nat -F SNELL_OUT 2>/dev/null || true
-iptables -w 5 -t nat -X SNELL_OUT 2>/dev/null || true
-
-if [ "\$MODE" = "xray" ]; then
-    SNELL_PORT=\$(grep -oP '^listen\s*=\s*.*:\K[0-9]+' /etc/snell/snell-server.conf 2>/dev/null || echo "1488")
-
-    iptables -w 5 -t nat -N SNELL_OUT 2>/dev/null || true
-    iptables -w 5 -t nat -F SNELL_OUT 2>/dev/null || true
-    
-    # Исключения: локальный трафик и IP сервера
-    iptables -w 5 -t nat -A SNELL_OUT -d 127.0.0.0/8 -j RETURN
-    iptables -w 5 -t nat -A SNELL_OUT -d ${SERVER_IP} -j RETURN 2>/dev/null || true
-    
-    # Исключения: установленные соединения и ответы клиентам с собственного порта Snell (TCP/QUIC)
-    iptables -w 5 -t nat -A SNELL_OUT -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null || true
-    [ -n "\$SNELL_PORT" ] && iptables -w 5 -t nat -A SNELL_OUT -p udp --sport "\$SNELL_PORT" -j RETURN 2>/dev/null || true
-    [ -n "\$SNELL_PORT" ] && iptables -w 5 -t nat -A SNELL_OUT -p tcp --sport "\$SNELL_PORT" -j RETURN 2>/dev/null || true
-
-    # Перехват исходящего TCP и UDP трафика в REDIRECT шлюз Xray
-    iptables -w 5 -t nat -A SNELL_OUT -p tcp -j REDIRECT --to-ports ${XRAY_REDIRECT_PORT}
-    iptables -w 5 -t nat -A SNELL_OUT -p udp -j REDIRECT --to-ports ${XRAY_REDIRECT_PORT}
-
-    iptables -w 5 -t nat -C OUTPUT -m owner --uid-owner snell -j SNELL_OUT 2>/dev/null || iptables -w 5 -t nat -I OUTPUT 1 -m owner --uid-owner snell -j SNELL_OUT
-fi
-EOF
+    xm_install_asset scripts/snell-routing.sh /usr/local/bin/snell-routing.sh 0755
     chmod +x /usr/local/bin/snell-routing.sh
 
     # Служба snell.service
@@ -454,66 +311,27 @@ WantedBy=multi-user.target
 EOF
 
     # Открытие TCP и UDP в iptables для Snell
-    iptables -I INPUT 1 -p tcp --dport "$SNELL_PORT" -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT 1 -p udp --dport "$SNELL_PORT" -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p tcp --dport "$SNELL_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport "$SNELL_PORT" -j ACCEPT
+    iptables -C INPUT -p udp --dport "$SNELL_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport "$SNELL_PORT" -j ACCEPT
 
     systemctl daemon-reload
-    systemctl enable snell 2>/dev/null || true
-    systemctl restart snell 2>/dev/null || true
+    systemctl enable snell
+    xm_service snell
     echo -e "  ✓ Snell v5.0.1 запущен на порту ${SNELL_PORT} (TCP + UDP QUIC)"
 fi
 
 # Установка Mieru
 if [ "$INSTALL_MIERU" = "yes" ]; then
     echo -e "${CYAN}==> Шаг 4: Установка и настройка Mieru (mita) с Anti-TSPU пресетом...${NC}"
-    id -u mita &>/dev/null || useradd -r -s /usr/sbin/nologin mita 2>/dev/null || true
+    id -u mita &>/dev/null || useradd -r -s /usr/sbin/nologin mita
     mkdir -p /etc/mita /usr/local/bin
-    ln -sfn /etc/mita /etc/mieru
+    if [ ! -e /etc/mieru ] && [ ! -L /etc/mieru ]; then ln -s /etc/mita /etc/mieru; fi
 
-    echo -e "  -> Проверка последней доступной версии Mieru (mita) на GitHub..."
-    latest_tag=$(curl -fsSL -I -o /dev/null -w '%{url_effective}' https://github.com/enfein/mieru/releases/latest 2>/dev/null | sed -e 's#.*/tag/##' -e 's#.*/tag/v##' -e 's#^v##')
-    if [ -z "$latest_tag" ] || [[ "$latest_tag" =~ "github.com" ]]; then
-        latest_tag=$(curl -fsSL https://api.github.com/repos/enfein/mieru/releases/latest 2>/dev/null | grep -o '"tag_name": *"[^"]*' | sed -e 's/"tag_name": *"//' -e 's/^v//')
-    fi
-    mita_ver="${latest_tag:-3.37.0}"
-    echo -e "  -> Актуальная версия Mieru: ${GREEN}v${mita_ver}${NC}"
-
-    case "$ARCH" in
-        x86_64) DEB_ARCH="amd64" ;;
-        aarch64|arm64) DEB_ARCH="arm64" ;;
-        *) DEB_ARCH="amd64" ;;
-    esac
-
-    need_download=false
-    if ! command -v mita &>/dev/null; then
-        need_download=true
-    else
-        cur_mita_ver=$(mita version 2>/dev/null | head -n1 | tr -d 'v[:space:]')
-        if [ "$cur_mita_ver" != "$mita_ver" ]; then
-            echo -e "  -> Обнаружена версия v${cur_mita_ver}. Обновляем до последней v${mita_ver}..."
-            need_download=true
-        else
-            echo -e "  ✓ Mieru уже установлен актуальной версии (v${cur_mita_ver})."
-        fi
-    fi
-
-    if $need_download; then
-        echo -e "  -> Скачивание пакета Mieru v${mita_ver} с GitHub (~30 MB, подождите)..."
-        if curl -fL --progress-bar -o /tmp/mita.deb "https://github.com/enfein/mieru/releases/download/v${mita_ver}/mita_${mita_ver}_${DEB_ARCH}.deb" || curl -fsSL -o /tmp/mita.deb "https://github.com/enfein/mieru/releases/download/v${mita_ver}/mita_${mita_ver}_${DEB_ARCH}.deb"; then
-            if [ -s /tmp/mita.deb ]; then
-                echo -e "  -> Распаковка и установка пакета mita через dpkg..."
-                dpkg -i /tmp/mita.deb 2>/dev/null || apt-get install -f -y 2>/dev/null || true
-                rm -f /tmp/mita.deb
-            fi
-        fi
-        if ! command -v mita &>/dev/null || [ "$(mita version 2>/dev/null | head -n1 | tr -d 'v[:space:]')" != "$mita_ver" ]; then
-            echo -e "  -> Резервный канал: скачивание архива tar.gz..."
-            curl -fL --progress-bar "https://github.com/enfein/mieru/releases/download/v${mita_ver}/mita_${mita_ver}_linux_${DEB_ARCH}.tar.gz" | tar -xz -C /usr/local/bin/ mita 2>/dev/null || true
-            chmod +x /usr/local/bin/mita 2>/dev/null || true
-        fi
-    fi
-    ln -sf /usr/bin/mita /usr/local/bin/mita 2>/dev/null || true
-    ln -sf /usr/local/bin/mita /usr/bin/mita 2>/dev/null || true
+    dpkg-deb -x "$WORK_DIR/mita.deb" "$WORK_DIR/mita"
+    test -x "$WORK_DIR/mita/usr/bin/mita" || xm_die 'Mieru package has no executable'
+    install -m 0755 "$WORK_DIR/mita/usr/bin/mita" /usr/local/bin/mita.new
+    mv -f /usr/local/bin/mita.new /usr/local/bin/mita
+    /usr/local/bin/mita version
     echo -e "  -> Формирование конфигурации Anti-TSPU (Low-Entropy, Nonce, Padding)..."
 
     # Конфигурация Mieru с использованием подхваченного SOCKS5 порта
@@ -592,15 +410,17 @@ EOF
     fi
 
     if [ ! -f "/etc/mita/users_db.json" ]; then
-        echo "{\"${MIERU_USER}\": \"${MIERU_PASS}\"}" > /etc/mita/users_db.json
+        jq -e 'reduce .users[] as $u ({}; .[$u.name] = $u.password)' /etc/mita/config.json > /etc/mita/users_db.json
     fi
-    echo "$SERVER_IP" > /etc/mita/server_ip.txt
-    echo "Mieru-Home" > /etc/mita/tag.txt
+    [ -f /etc/mita/server_ip.txt ] || echo "$SERVER_IP" > /etc/mita/server_ip.txt
+    [ -f /etc/mita/tag.txt ] || echo "Mieru-Home" > /etc/mita/tag.txt
 
     chown -R mita:mita /etc/mita
-    chmod 664 /etc/mita/config.json /etc/mita/users_db.json 2>/dev/null || true
+    chmod 640 /etc/mita/config.json /etc/mita/users_db.json
+    jq -e . /etc/mita/config.json >/dev/null
+    jq -e . /etc/mita/users_db.json >/dev/null
 
-    which_mita=$(command -v mita || echo "/usr/bin/mita")
+    which_mita=/usr/local/bin/mita
     cat << EOF > /etc/systemd/system/mita.service
 [Unit]
 Description=Mieru proxy server
@@ -638,80 +458,23 @@ EOF
     if [[ "$MIERU_PORTS" =~ - ]]; then
         p_s=$(echo "$MIERU_PORTS" | cut -d'-' -f1)
         p_e=$(echo "$MIERU_PORTS" | cut -d'-' -f2)
-        iptables -I INPUT 1 -p "$ipt_proto" --dport "${p_s}:${p_e}" -j ACCEPT 2>/dev/null || true
+        iptables -C INPUT -p "$ipt_proto" --dport "${p_s}:${p_e}" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p "$ipt_proto" --dport "${p_s}:${p_e}" -j ACCEPT
     else
-        iptables -I INPUT 1 -p "$ipt_proto" --dport "$MIERU_PORTS" -j ACCEPT 2>/dev/null || true
+        iptables -C INPUT -p "$ipt_proto" --dport "$MIERU_PORTS" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p "$ipt_proto" --dport "$MIERU_PORTS" -j ACCEPT
     fi
 
     echo -e "  -> Запуск и проверка службы mita..."
     systemctl daemon-reload
-    systemctl enable mita 2>/dev/null || true
-    systemctl restart mita 2>/dev/null || true
+    systemctl enable mita
+    xm_service mita
     echo -e "  ✓ Mieru запущен на портах ${MIERU_PORTS}/${MIERU_PROTO} (Anti-TSPU Balanced)"
 fi
 
 # Интеграция qwdtt с использованием подхваченного TPROXY порта
 echo -e "${CYAN}==> Шаг 5: Интеграция qwdtt / WDTT TPROXY...${NC}"
 echo -e "  -> Настройка скрипта wdtt-tproxy.sh и правил перехвата..."
-cat << EOF > /usr/local/bin/wdtt-tproxy.sh
-#!/usr/bin/env bash
-set -e
-WAN_IF="${WAN_IF}"
-TPROXY_PORT="${XRAY_TPROXY_PORT}"
-SERVER_IP="${SERVER_IP}"
 
-MODE_FILE="/etc/wdtt/routing.mode"
-MODE="xray"
-[ -f "\$MODE_FILE" ] && MODE=\$(cat "\$MODE_FILE" | tr -d ' \r\n')
-
-# Очистка предыдущих хуков
-iptables -w 5 -t mangle -D PREROUTING -i wdtt0 -j WDTT_TPROXY 2>/dev/null || true
-iptables -w 5 -t mangle -D PREROUTING -i wdttraw0 -j WDTT_TPROXY 2>/dev/null || true
-iptables -w 5 -t mangle -F WDTT_TPROXY 2>/dev/null || true
-iptables -w 5 -t mangle -X WDTT_TPROXY 2>/dev/null || true
-
-if [ "\$MODE" = "xray" ]; then
-    # 1. Routing table 100
-    ip rule show | grep -q "lookup 100" || ip rule add fwmark 1 table 100
-    ip route show table 100 | grep -q "local default dev lo" || ip route add local 0.0.0.0/0 dev lo table 100
-
-    # 2. iptables MANGLE rules
-    iptables -w 5 -t mangle -N WDTT_TPROXY 2>/dev/null || true
-    iptables -w 5 -t mangle -F WDTT_TPROXY 2>/dev/null || true
-
-    # Exclude local/internal
-    iptables -w 5 -t mangle -A WDTT_TPROXY -d 10.66.0.0/16 -j RETURN
-    iptables -w 5 -t mangle -A WDTT_TPROXY -d 10.70.0.0/16 -j RETURN
-    iptables -w 5 -t mangle -A WDTT_TPROXY -d 127.0.0.0/8 -j RETURN
-    [ -n "\$SERVER_IP" ] && iptables -w 5 -t mangle -A WDTT_TPROXY -d "\$SERVER_IP" -j RETURN 2>/dev/null || true
-
-    # TPROXY to 127.0.0.1
-    iptables -w 5 -t mangle -A WDTT_TPROXY -p tcp -j TPROXY --on-port \${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark 1
-    iptables -w 5 -t mangle -A WDTT_TPROXY -p udp -j TPROXY --on-port \${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark 1
-
-    # Hook to PREROUTING
-    iptables -w 5 -t mangle -I PREROUTING 1 -i wdtt0 -j WDTT_TPROXY 2>/dev/null || true
-    iptables -w 5 -t mangle -I PREROUTING 1 -i wdttraw0 -j WDTT_TPROXY 2>/dev/null || true
-
-    # 3. Block external access from internet
-    iptables -w 5 -C INPUT -i "\${WAN_IF}" -p tcp --dport "\${TPROXY_PORT}" -j DROP 2>/dev/null || iptables -w 5 -I INPUT 1 -i "\${WAN_IF}" -p tcp --dport "\${TPROXY_PORT}" -j DROP
-    iptables -w 5 -C INPUT -i "\${WAN_IF}" -p udp --dport "\${TPROXY_PORT}" -j DROP 2>/dev/null || iptables -w 5 -I INPUT 1 -i "\${WAN_IF}" -p udp --dport "\${TPROXY_PORT}" -j DROP
-
-    # 4. Remove direct MASQUERADE (Kill Switch for direct leak)
-    while iptables -w 5 -t nat -D POSTROUTING -s 10.66.0.0/16 -j MASQUERADE 2>/dev/null; do :; done
-    while iptables -w 5 -t nat -D POSTROUTING -s 10.66.0.0/16 -o "\${WAN_IF}" -j MASQUERADE 2>/dev/null; do :; done
-    while iptables -w 5 -t nat -D POSTROUTING -s 10.66.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_MANAGED -j MASQUERADE 2>/dev/null; do :; done
-    while iptables -w 5 -t nat -D POSTROUTING -s 10.70.0.0/16 -j MASQUERADE 2>/dev/null; do :; done
-    while iptables -w 5 -t nat -D POSTROUTING -s 10.70.0.0/16 -o "\${WAN_IF}" -j MASQUERADE 2>/dev/null; do :; done
-    while iptables -w 5 -t nat -D POSTROUTING -s 10.70.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_RAW_MANAGED -j MASQUERADE 2>/dev/null; do :; done
-else
-    # Режим Direct WAN: Включаем прямой MASQUERADE
-    iptables -w 5 -t nat -C POSTROUTING -s 10.66.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_MANAGED -j MASQUERADE 2>/dev/null || \
-        iptables -w 5 -t nat -A POSTROUTING -s 10.66.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_MANAGED -j MASQUERADE
-    iptables -w 5 -t nat -C POSTROUTING -s 10.70.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_RAW_MANAGED -j MASQUERADE 2>/dev/null || \
-        iptables -w 5 -t nat -A POSTROUTING -s 10.70.0.0/16 -o "\${WAN_IF}" -m comment --comment WDTT_RAW_MANAGED -j MASQUERADE
-fi
-EOF
+xm_install_asset scripts/wdtt-tproxy.sh /usr/local/bin/wdtt-tproxy.sh 0755
 chmod +x /usr/local/bin/wdtt-tproxy.sh
 
 cat << 'EOF' > /etc/systemd/system/wdtt-tproxy.service
@@ -731,10 +494,10 @@ ExecStart=/usr/local/bin/wdtt-tproxy.sh
 WantedBy=multi-user.target wdtt.service
 EOF
 
-if [ "$DEFAULT_ROUTING" = "xray" ]; then
+if [ "$DEFAULT_ROUTING" = "xray" ] && [ -f /etc/systemd/system/wdtt.service ]; then
     systemctl daemon-reload
-    systemctl enable wdtt-tproxy 2>/dev/null || true
-    systemctl restart wdtt-tproxy 2>/dev/null || true
+    systemctl enable wdtt-tproxy
+    xm_service wdtt-tproxy
     echo -e "  ✓ WDTT TPROXY маршрутизация активирована (TPROXY :${XRAY_TPROXY_PORT})"
 else
     echo -e "  ✓ WDTT маршрутизация: Прямой выход"
@@ -743,76 +506,14 @@ fi
 # Установка OpenFlux (8 каналов, gVisor L4, Яндекс / Mail.ru Документы)
 if [ "$INSTALL_OPENFLUX" = "yes" ]; then
     echo -e "${CYAN}==> Шаг 6: Установка OpenFlux (8 каналов, gVisor L4, Яндекс/Mail.ru)...${NC}"
-    id -u openflux &>/dev/null || useradd -r -s /usr/sbin/nologin openflux 2>/dev/null || true
+    id -u openflux &>/dev/null || useradd -r -s /usr/sbin/nologin openflux
     mkdir -p /etc/openflux/instances /var/log/openflux
     
-    # Проверка компилятора Go
-    if ! command -v go >/dev/null 2>&1 && [ ! -x /usr/local/go/bin/go ]; then
-        echo -e "  -> Установка компилятора Go для сборки OpenFlux..."
-        apt-get install -y -qq golang-go >/dev/null 2>&1 || true
-        if ! command -v go >/dev/null 2>&1; then
-            g_arch="amd64"
-            [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ] && g_arch="arm64"
-            curl -fsSL "https://dl.google.com/go/go1.22.6.linux-${g_arch}.tar.gz" -o /tmp/go.tar.gz 2>/dev/null || true
-            if [ -s /tmp/go.tar.gz ]; then
-                rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz && rm -f /tmp/go.tar.gz
-            fi
-        fi
-    fi
-    export PATH=$PATH:/usr/local/go/bin
-
-    # Компиляция OpenFlux если бинарник отсутствует
-    if [ ! -f "/usr/local/bin/openflux" ]; then
-        if command -v go >/dev/null 2>&1; then
-            tmp_of="/tmp/openflux_build_$(date +%s)"
-            rm -rf "$tmp_of"
-            echo -e "  -> Клонирование и компиляция p1neappleXpress/OpenFlux..."
-            if git clone --depth 1 https://github.com/p1neappleXpress/OpenFlux.git "$tmp_of" >/dev/null 2>&1; then
-                patch_file=""
-                if [ -f "$SCRIPT_DIR/patches/openflux-multistream.patch" ]; then
-                    patch_file="$SCRIPT_DIR/patches/openflux-multistream.patch"
-                elif [ -f "/usr/local/share/x-manager/patches/openflux-multistream.patch" ]; then
-                    patch_file="/usr/local/share/x-manager/patches/openflux-multistream.patch"
-                fi
-                if [ -n "$patch_file" ] && [ -f "$patch_file" ]; then
-                    echo -e "  -> Применение патча Multi-Stream trunking..."
-                    (cd "$tmp_of" && git apply "$patch_file" 2>/dev/null || patch -p1 < "$patch_file" 2>/dev/null) || true
-                fi
-                (cd "$tmp_of" && CGO_ENABLED=0 go build -v -trimpath -ldflags='-s -w' -o /usr/local/bin/openflux . && chmod +x /usr/local/bin/openflux)
-                rm -rf "$tmp_of"
-                echo -e "  ✓ /usr/local/bin/openflux успешно скомпилирован"
-            else
-                echo -e "${YELLOW}  ! Не удалось клонировать OpenFlux. Скомпилировать можно позже через x-manager.${NC}"
-                rm -rf "$tmp_of"
-            fi
-        else
-            echo -e "${YELLOW}  ! Компилятор Go недоступен. Сборку OpenFlux можно выполнить позже через x-manager.${NC}"
-        fi
-    else
-        echo -e "  ✓ Бинарный файл /usr/local/bin/openflux уже установлен"
-    fi
-
-    # Установка runner и routing скриптов
-    SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-    if [ -f "$SCRIPT_DIR/scripts/openflux-routing.sh" ]; then
-        cp -f "$SCRIPT_DIR/scripts/openflux-routing.sh" /usr/local/bin/openflux-routing.sh
-    else
-        curl -fsSL -o /usr/local/bin/openflux-routing.sh "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/openflux-routing.sh?v=$(date +%s)" 2>/dev/null || true
-    fi
-    chmod +x /usr/local/bin/openflux-routing.sh 2>/dev/null || true
-
-    if [ -f "$SCRIPT_DIR/scripts/openflux-runner.sh" ]; then
-        cp -f "$SCRIPT_DIR/scripts/openflux-runner.sh" /usr/local/bin/openflux-runner.sh
-    else
-        curl -fsSL -o /usr/local/bin/openflux-runner.sh "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/openflux-runner.sh?v=$(date +%s)" 2>/dev/null || true
-    fi
-    chmod +x /usr/local/bin/openflux-runner.sh 2>/dev/null || true
-
-    if [ -f "$SCRIPT_DIR/systemd/openflux@.service" ]; then
-        cp -f "$SCRIPT_DIR/systemd/openflux@.service" /etc/systemd/system/openflux@.service
-    else
-        curl -fsSL -o /etc/systemd/system/openflux@.service "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/systemd/openflux@.service?v=$(date +%s)" 2>/dev/null || true
-    fi
+    install -m 0755 "$WORK_DIR/openflux" /usr/local/bin/openflux.new
+    mv -f /usr/local/bin/openflux.new /usr/local/bin/openflux
+    xm_install_asset scripts/openflux-routing.sh /usr/local/bin/openflux-routing.sh 0755
+    xm_install_asset scripts/openflux-runner.sh /usr/local/bin/openflux-runner.sh 0755
+    xm_install_asset systemd/openflux@.service /etc/systemd/system/openflux@.service 0644
 
     # Инициализация конфигураций 8 каналов
     for ch in 1 2 3 4 5 6 7 8; do
@@ -828,11 +529,13 @@ URL=""
 EOF_CH
         fi
     done
-    echo "xray" > /etc/openflux/routing.mode 2>/dev/null || true
-    chown -R openflux:openflux /etc/openflux 2>/dev/null || true
+    [ -f /etc/openflux/routing.mode ] || echo "$DEFAULT_ROUTING" > /etc/openflux/routing.mode
+    chown -R openflux:openflux /etc/openflux
+    chmod 0750 /etc/openflux /etc/openflux/instances
+    chmod 0640 /etc/openflux/instances/*.env
 
     # Применение правил маршрутизации
-    [ -x /usr/local/bin/openflux-routing.sh ] && /usr/local/bin/openflux-routing.sh 2>/dev/null || true
+    /usr/local/bin/openflux-routing.sh
     systemctl daemon-reload
     echo -e "  ✓ 8 каналов OpenFlux инициализированы (L4, Xray REDIRECT :${XRAY_REDIRECT_PORT})"
 fi
@@ -844,94 +547,55 @@ if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = "yes" ]; then
     WDAVTUNNEL_DIR="/etc/webdav-tunnel"
     WDAVTUNNEL_STORAGE="/var/lib/webdav-tunnel/data"
 
-    id -u "$WDAVTUNNEL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$WDAVTUNNEL_USER" 2>/dev/null || true
+    id -u "$WDAVTUNNEL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$WDAVTUNNEL_USER"
     mkdir -p "$WDAVTUNNEL_DIR" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel"
 
-    # Проверка/установка Go (используем тот же компилятор, что и для OpenFlux)
-    export PATH=$PATH:/usr/local/go/bin
-    if ! command -v go >/dev/null 2>&1 && [ ! -x /usr/local/go/bin/go ]; then
-        apt-get install -y -qq golang-go >/dev/null 2>&1 || true
-    fi
-
-    # Компиляция webdav-tunnel если бинарник отсутствует
-    if [ ! -f "/usr/local/bin/webdav-tunnel" ]; then
-        if command -v go >/dev/null 2>&1; then
-            tmp_wdt="/tmp/webdav_tunnel_build_$(date +%s)"
-            rm -rf "$tmp_wdt"
-            echo -e "  -> Клонирование и компиляция spkprsnts/webdav-tunnel..."
-            if git clone --depth 1 https://github.com/spkprsnts/webdav-tunnel.git "$tmp_wdt" >/dev/null 2>&1; then
-                (cd "$tmp_wdt" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /usr/local/bin/webdav-tunnel . && chmod +x /usr/local/bin/webdav-tunnel)
-                rm -rf "$tmp_wdt"
-                echo -e "  ✓ /usr/local/bin/webdav-tunnel успешно скомпилирован"
-            else
-                echo -e "${YELLOW}  ! Не удалось клонировать webdav-tunnel. Установите позже через x-manager [3].${NC}"
-                rm -rf "$tmp_wdt"
-            fi
-        else
-            echo -e "${YELLOW}  ! Компилятор Go недоступен. Сборку webdav-tunnel можно выполнить позже через x-manager [3].${NC}"
-        fi
-    else
-        echo -e "  ✓ Бинарный файл /usr/local/bin/webdav-tunnel уже установлен"
-    fi
-
-    # Runner script
-    if [ -f "$SCRIPT_DIR/scripts/webdav-tunnel-runner.sh" ]; then
-        cp -f "$SCRIPT_DIR/scripts/webdav-tunnel-runner.sh" /usr/local/bin/webdav-tunnel-runner.sh
-    else
-        curl -fsSL -o /usr/local/bin/webdav-tunnel-runner.sh \
-            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/webdav-tunnel-runner.sh?v=$(date +%s)" 2>/dev/null || true
-    fi
-    chmod +x /usr/local/bin/webdav-tunnel-runner.sh 2>/dev/null || true
-
-    # Routing script
-    if [ -f "$SCRIPT_DIR/scripts/webdav-tunnel-routing.sh" ]; then
-        cp -f "$SCRIPT_DIR/scripts/webdav-tunnel-routing.sh" /usr/local/bin/webdav-tunnel-routing.sh
-    else
-        curl -fsSL -o /usr/local/bin/webdav-tunnel-routing.sh \
-            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/scripts/webdav-tunnel-routing.sh?v=$(date +%s)" 2>/dev/null || true
-    fi
-    chmod +x /usr/local/bin/webdav-tunnel-routing.sh 2>/dev/null || true
-
-    # Systemd unit
-    if [ -f "$SCRIPT_DIR/systemd/webdav-tunnel.service" ]; then
-        cp -f "$SCRIPT_DIR/systemd/webdav-tunnel.service" /etc/systemd/system/webdav-tunnel.service
-    else
-        curl -fsSL -o /etc/systemd/system/webdav-tunnel.service \
-            "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/systemd/webdav-tunnel.service?v=$(date +%s)" 2>/dev/null || true
-    fi
+    install -m 0755 "$WORK_DIR/webdav-tunnel" /usr/local/bin/webdav-tunnel.new
+    mv -f /usr/local/bin/webdav-tunnel.new /usr/local/bin/webdav-tunnel
+    xm_install_asset scripts/webdav-tunnel-runner.sh /usr/local/bin/webdav-tunnel-runner.sh 0755
+    xm_install_asset scripts/webdav-tunnel-routing.sh /usr/local/bin/webdav-tunnel-routing.sh 0755
+    xm_install_asset systemd/webdav-tunnel.service /etc/systemd/system/webdav-tunnel.service 0644
 
     # Конфиг по умолчанию (если ещё нет)
     if [ ! -f "$WDAVTUNNEL_DIR/config.env" ]; then
-        wdav_pass=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 24 2>/dev/null || date +%s | sha256sum | head -c 24)
+        wdav_pass=$(openssl rand -hex 12)
         cat > "$WDAVTUNNEL_DIR/config.env" <<EOF_WDAV
 WEBDAV_MODE="selfhosted"
-WEBDAV_LISTEN=":8443"
+WEBDAV_LISTEN=":${WDAV_PORT}"
+SELFHOSTED_PORT="${WDAV_PORT}"
 WEBDAV_STORAGE="${WDAVTUNNEL_STORAGE}"
 WEBDAV_URL="https://webdav.yandex.ru"
 WEBDAV_LOGIN="wdav"
 WEBDAV_PASSWORD="${wdav_pass}"
 WEBDAV_ENC="false"
-ROUTING_MODE="xray"
+ROUTING_MODE="${DEFAULT_ROUTING}"
 XRAY_REDIRECT_PORT="${XRAY_REDIRECT_PORT}"
 EOF_WDAV
         chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_DIR/config.env"
         chmod 640 "$WDAVTUNNEL_DIR/config.env"
     fi
 
-    chown -R "$WDAVTUNNEL_USER:$WDAVTUNNEL_USER" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel" 2>/dev/null || true
+    chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_DIR" "$WDAVTUNNEL_DIR/config.env"
+    chmod 0770 "$WDAVTUNNEL_DIR"
+    chmod 0640 "$WDAVTUNNEL_DIR/config.env"
+    if [ -f "$WDAVTUNNEL_DIR/webdav-tunnel.yaml" ]; then
+        chown root:"$WDAVTUNNEL_USER" "$WDAVTUNNEL_DIR/webdav-tunnel.yaml"
+        chmod 0660 "$WDAVTUNNEL_DIR/webdav-tunnel.yaml"
+    fi
+    chown -R "$WDAVTUNNEL_USER:$WDAVTUNNEL_USER" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel"
     # Symlinks
     ln -sf /usr/local/bin/x-manager /usr/local/bin/x-webdav 2>/dev/null || true
     ln -sf /usr/local/bin/x-manager /usr/local/bin/x-wdav 2>/dev/null || true
     systemctl daemon-reload
-    echo -e "  ✓ WebDAV Tunnel инициализирован (selfhosted :8443, Xray REDIRECT :${XRAY_REDIRECT_PORT})"
+    echo -e "  ✓ WebDAV Tunnel инициализирован (selfhosted :${WDAV_PORT}, Xray REDIRECT :${XRAY_REDIRECT_PORT})"
     echo -e "  ✓ Управление: x-webdav | x-manager → пункт [3]"
 fi
 
 # Настройка безопасности (Блокировка шлюзов извне и открытие портов протоколов)
 echo -e "${CYAN}==> Шаг 7: Настройка сетевой безопасности...${NC}"
-iptables -I INPUT 1 -i "$WAN_IF" -p tcp --dport "${XRAY_TPROXY_PORT}" -j DROP 2>/dev/null || true
-iptables -I INPUT 1 -i "$WAN_IF" -p udp --dport "${XRAY_TPROXY_PORT}" -j DROP 2>/dev/null || true
-iptables -I INPUT 1 -i "$WAN_IF" -p tcp --dport "${XRAY_REDIRECT_PORT}" -j DROP 2>/dev/null || true
+iptables -C INPUT -i "$WAN_IF" -p tcp --dport "${XRAY_TPROXY_PORT}" -j DROP 2>/dev/null || iptables -I INPUT 1 -i "$WAN_IF" -p tcp --dport "${XRAY_TPROXY_PORT}" -j DROP
+iptables -C INPUT -i "$WAN_IF" -p udp --dport "${XRAY_TPROXY_PORT}" -j DROP 2>/dev/null || iptables -I INPUT 1 -i "$WAN_IF" -p udp --dport "${XRAY_TPROXY_PORT}" -j DROP
+iptables -C INPUT -i "$WAN_IF" -p tcp --dport "${XRAY_REDIRECT_PORT}" -j DROP 2>/dev/null || iptables -I INPUT 1 -i "$WAN_IF" -p tcp --dport "${XRAY_REDIRECT_PORT}" -j DROP
 echo -e "  ✓ Внутренние порты ядра Xray (${XRAY_TPROXY_PORT}, ${XRAY_REDIRECT_PORT}) защищены от внешнего доступа"
 
 if command -v wdtt >/dev/null 2>&1 || [ -f "/etc/systemd/system/wdtt.service" ] || [ -d "/etc/wdtt" ]; then
@@ -964,26 +628,18 @@ done
 if [ -n "$existing_cert" ]; then
     echo -e "  ✓ Обнаружен SSL сертификат: ${GREEN}${existing_cert}${NC}"
 else
-    echo -e "  ℹ️ SSL сертификат не найден локально (выпускается штатно в панели 3X-UI)"
+    echo -e "  ℹ️ SSL сертификат не найден локально. Укажите существующий сертификат в меню SSL."
 fi
 
 # Установка диспетчера x-manager
 echo -e "${CYAN}==> Шаг 9: Развертывание диспетчера x-manager...${NC}"
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-if [ -f "$SCRIPT_DIR/bin/x-manager" ]; then
-    echo -e "  -> Установка x-manager из локального каталога..."
-    cp -f "$SCRIPT_DIR/bin/x-manager" /usr/local/bin/x-manager
-else
-    echo -e "  -> Загрузка диспетчера x-manager с GitHub..."
-    curl -fL --progress-bar -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/bin/x-manager?v=$(date +%s)" || curl -fsSL -o /usr/local/bin/x-manager "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/bin/x-manager?v=$(date +%s)" 2>/dev/null || true
-fi
-chmod +x /usr/local/bin/x-manager
-
-mkdir -p /usr/local/share/x-manager/patches
-if [ -d "$SCRIPT_DIR/patches" ]; then
-    cp -rf "$SCRIPT_DIR/patches"/* /usr/local/share/x-manager/patches/ 2>/dev/null || true
-fi
-
+xm_install_asset bin/x-manager /usr/local/bin/x-manager 0755
+install -d -m 0755 /usr/local/share/x-manager /usr/local/share/x-manager/patches /usr/local/share/x-manager/scripts
+install -m 0644 "$SCRIPT_DIR/patches/openflux-multistream.patch" /usr/local/share/x-manager/patches/
+install -m 0644 "$SCRIPT_DIR/scripts/"{webdav-config.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/components.json" /usr/local/share/x-manager/components.json
+install -m 0644 "$SCRIPT_DIR/scripts/menu-actions.tsv" /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/scripts/installer-state.py" /usr/local/share/x-manager/scripts/
 echo -e "  -> Создание системных алиасов (x-snell, x-mieru, x-wdtt, x-csqtt, x-dns, x-ssl, x-fw)..."
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-snell
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-mieru
@@ -1004,20 +660,28 @@ ln -sf /usr/local/bin/x-manager /usr/local/bin/x-flux
 echo -e "  ✓ Диспетчер x-manager успешно развернут"
 
 echo -e "${CYAN}==> Шаг 10: Развертывание сервера подписок TUNA (tuna-subscriptions)...${NC}"
-if [ -f "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" ]; then
-    bash "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh" || true
-else
-    echo -e "  -> Загрузка компонентов сервера подписок с GitHub..."
-    mkdir -p /tmp/tuna-sub-install
-    curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.py "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/tuna-subscriptions.py?v=$(date +%s)" 2>/dev/null || true
-    curl -fsSL -o /tmp/tuna-sub-install/config.toml.example "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/config.toml.example?v=$(date +%s)" 2>/dev/null || true
-    curl -fsSL -o /tmp/tuna-sub-install/tuna-subscriptions.service "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/tuna-subscriptions.service?v=$(date +%s)" 2>/dev/null || true
-    curl -fsSL -o /tmp/tuna-sub-install/install-sub-server.sh "https://raw.githubusercontent.com/lesovoi53/xray-manager/main/tuna-sub-server/install-sub-server.sh?v=$(date +%s)" 2>/dev/null || true
-    if [ -f /tmp/tuna-sub-install/install-sub-server.sh ]; then
-        bash /tmp/tuna-sub-install/install-sub-server.sh || true
-    fi
-    rm -rf /tmp/tuna-sub-install
+XM_PARENT_TRANSACTION=1 XM_PARENT_BACKUP="$XM_BACKUP" bash "$SCRIPT_DIR/tuna-sub-server/install-sub-server.sh"
+if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = yes ]; then
+    systemctl enable webdav-tunnel
+    xm_service webdav-tunnel
 fi
+# Preserve existing instance enablement; start only channels with configured URLs.
+if [ "$INSTALL_OPENFLUX" = yes ]; then
+    for channel in {1..8}; do
+        if ( . "/etc/openflux/instances/$channel.env"; [ -n "${URL:-}" ] ); then
+            xm_service "openflux@$channel"
+        fi
+    done
+fi
+python3 - "$XM_BACKUP/state.json" <<'PY'
+import json, subprocess, sys
+for unit, previous in json.load(open(sys.argv[1]))['services'].items():
+    if previous['enabled'] == 'disabled':
+        subprocess.run(['systemctl', 'disable', unit], check=True)
+PY
+XM_TRANSACTION=0
+rm -rf -- "$WORK_DIR"
+echo "Rollback: bash $SCRIPT_DIR/install.sh --rollback $XM_BACKUP"
 
 echo ""
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════════════${NC}"
@@ -1040,50 +704,5 @@ echo -e "  • TPROXY:   127.0.0.1:${XRAY_TPROXY_PORT}"
 echo -e "  • REDIRECT: 127.0.0.1:${XRAY_REDIRECT_PORT}"
 echo -e "  • SOCKS5:   127.0.0.1:${XRAY_SOCKS_PORT}"
 echo ""
-if [ "$INSTALL_SNELL" = "yes" ]; then
-    echo -e "${BOLD}Параметры Snell v5 (Hybrid TCP + UDP/QUIC):${NC}"
-    echo -e "  • Сервер: ${SERVER_IP}:${SNELL_PORT}"
-    echo -e "  • PSK:    ${GREEN}${SNELL_PSK}${NC}"
-    echo -e "  • Режим:  Гибридный (NekoBox+: TCP, Surge: QUIC/UDP 0-RTT)"
-    echo -e "  • Ссылка: ${CYAN}snell://${SNELL_PSK}@${SERVER_IP}:${SNELL_PORT}/?version=5#Snell-v5${NC}"
-    echo ""
-fi
-if [ "$INSTALL_MIERU" = "yes" ]; then
-    echo -e "${BOLD}Параметры Mieru (mita):${NC}"
-    echo -e "  • Сервер: ${SERVER_IP} (Порты: ${MIERU_PORTS})"
-    echo -e "  • Логин:  ${MIERU_USER} | Пароль: ${GREEN}${MIERU_PASS}${NC}"
-    echo -e "  • Защита: Low-Entropy 48-bit + Rotate Right 7"
-    pattern=$(mita export traffic-pattern 2>/dev/null || echo "")
-    echo -e "  • Ссылка: ${CYAN}mierus://${MIERU_USER}:${MIERU_PASS}@${SERVER_IP}/?profile=Mieru-Home&port=${MIERU_PORTS}&protocol=${MIERU_PROTO}&multiplexing=MULTIPLEXING_HIGH&traffic-pattern=${pattern}&low-entropy-mode=LOW_ENTROPY_MODE_48&low-entropy-mask-rotation=LOW_ENTROPY_MASK_ROTATE_RIGHT_7${NC}"
-    echo ""
-fi
-if command -v wdtt >/dev/null 2>&1 || [ -f "/etc/systemd/system/wdtt.service" ] || [ -d "/etc/wdtt" ]; then
-    wdtt_p="56000"
-    [ -f "/etc/systemd/system/wdtt.service" ] && wdtt_p=$(grep -oP -- '(^|\s)-listen\s+[0-9.]+:\K[0-9]+' /etc/systemd/system/wdtt.service 2>/dev/null | head -n 1 || echo "56000")
-    wdtt_pass="sad_534188_sad"
-    [ -f "/etc/wdtt/main.password" ] && wdtt_pass=$(cat /etc/wdtt/main.password | tr -d '\r\n')
-    prof_name="WDTT-${SERVER_IP}"
-    [ -f "/etc/wdtt/profile_name.txt" ] && prof_name=$(cat /etc/wdtt/profile_name.txt | tr -d '\r\n')
-    
-    qwdtt_link=$(python3 -c "
-import urllib.parse, sys
-name, ip, port, password = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-print(f'qwdtt://config?name={urllib.parse.quote_plus(name)}&peer={ip}%3A{port}&hashes=&workers=18&port=9000&pass={urllib.parse.quote_plus(password)}')
-" "$prof_name" "$SERVER_IP" "$wdtt_p" "$wdtt_pass" 2>/dev/null || echo "")
-
-    echo -e "${BOLD}Параметры WDTT / qwdtt:${NC}"
-    echo -e "  • Сервер:   ${SERVER_IP}:${wdtt_p}"
-    echo -e "  • Профиль:  ${prof_name}"
-    echo -e "  • Пароль:   ${GREEN}${wdtt_pass}${NC}"
-    echo -e "  • Ссылка:   ${CYAN}${qwdtt_link}${NC}"
-    echo ""
-fi
-if [ "$INSTALL_OPENFLUX" = "yes" ]; then
-    echo -e "${BOLD}Параметры OpenFlux (Мультиплексирование 1-8):${NC}"
-    echo -e "  • Режим:      L4 (gVisor Userspace Proxy)"
-    echo -e "  • Транспорт:  Мульти-транспорт (Яндекс Волга / Mail.ru Документы)"
-    echo -e "  • Каналы:     8 независимых каналов (/etc/openflux/instances/1..8.env)"
-    echo -e "  • Управление: ${CYAN}x-openflux${NC} или в меню ${CYAN}x-manager [6]${NC}"
-    echo ""
-fi
-echo -e "${GREEN}Все службы запущены и работают в фоновом режиме.${NC}"
+echo 'Existing credentials and subscription formats are preserved. View connection cards in x-manager.'
+echo 'New/running services passed startup checks; previously stopped services remain stopped. Empty OpenFlux channels remain unstarted.'

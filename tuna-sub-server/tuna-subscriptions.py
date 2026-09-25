@@ -17,6 +17,8 @@ import sqlite3
 import datetime
 import time
 import shutil
+import ipaddress
+from tuna_connection_groups import Store as ConnectionGroupStore
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.parse
@@ -93,6 +95,8 @@ def load_config(config_path=None):
                 config_path = p
                 break
 
+    if config_path and not os.path.isfile(config_path):
+        raise ValueError("Subscription configuration file does not exist")
     if config_path and os.path.isfile(config_path):
         try:
             with open(config_path, "rb") as f:
@@ -119,13 +123,18 @@ def load_config(config_path=None):
                             elif v.lower() == "false":
                                 v = False
                             current_sec[k] = v
+                        else:
+                            raise ValueError("Invalid TOML configuration line")
                 for sec, vals in loaded.items():
                     if sec in cfg and isinstance(vals, dict):
                         cfg[sec].update(vals)
                     else:
                         cfg[sec] = vals
         except Exception as e:
-            sys.stderr.write(f"[WARN] Failed to parse config {config_path}: {e}\n")
+            raise ValueError("Invalid subscription configuration; refusing to use defaults") from e
+    port = cfg["server"]["port"]
+    if not isinstance(port, int) or not 1 <= port <= 65535 or port in (443, 8443):
+        raise ValueError("Invalid or forbidden subscription listener port")
     return cfg
 
 def init_database(db_path):
@@ -1651,6 +1660,9 @@ class SubscriptionApp:
         self.max_uri_len = config["limits"]["max_uri_length"]
         self.max_users = config["limits"]["max_users"]
         self.issuer_id = self.get_issuer_id()
+        self.connection_groups = ConnectionGroupStore(self.db_path, {
+            'WEBDAV': parse_webdav_uri, 'OPENFLUX': deserialize_openflux_v2_bundle,
+        })
 
     def get_issuer_id(self) -> str:
         c = self.conn.cursor()
@@ -4265,7 +4277,7 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         """
         msg = format % args
         # Замена токенов в путях /sub/...
-        sanitized = re.sub(r'/sub/[a-zA-Z0-9_\-]+', '/sub/[REDACTED_TOKEN]', msg)
+        sanitized = re.sub(r'/sub(?:-json)?/[^\s?]+', '/sub/[REDACTED_TOKEN]', msg)
         log_file = self.app.config.get("logging", {}).get("file")
         log_entry = f"[{self.log_date_time_string()}] {self.client_address[0]} {sanitized}\n"
         if log_file:
@@ -4286,9 +4298,13 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def read_json_body(self) -> dict:
+    def read_json_body(self, limit=None) -> dict:
         content_len = int(self.headers.get("Content-Length", 0))
         max_size = self.app.config["server"]["max_request_body_size"]
+        if limit is not None:
+            max_size = min(max_size, limit)
+        if content_len < 0:
+            raise ValueError("Invalid Content-Length")
         if content_len > max_size:
             raise ValueError("Payload Too Large")
         if content_len <= 0:
@@ -4302,6 +4318,30 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+
+        if path.startswith('/sub-json/'):
+            token = path[len('/sub-json/'):]
+            status, headers, payload = self.app.connection_groups.publish(token)
+            if status != 200:
+                self.send_json(status, {'error': headers.get('error', 'Subscription unavailable')})
+                return
+            self.send_response(200)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        group_editor = re.fullmatch(r'/api/users/([^/]+)/connection-groups', path)
+        if group_editor:
+            if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                self.send_json(403, {'error': 'Group administration is local only'})
+                return
+            uid = unquote(group_editor.group(1))
+            status, result = self.app.connection_groups.editor(uid)
+            self.send_json(status, result)
+            return
 
         # Публичная выдача подписки: /sub/<secret-token>
         if path.startswith("/sub/"):
@@ -4448,6 +4488,7 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
                 "nickname": res["nickname"],
                 "token": res.get("token", ""),
                 "subscription_url": res.get("subscription_url", ""),
+                "structured_subscription_url": res.get("subscription_url", "").replace('/sub/', '/sub-json/', 1),
             })
             return
 
@@ -4577,6 +4618,20 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+
+        group_editor = re.fullmatch(r'/api/users/([^/]+)/connection-groups', path)
+        if group_editor:
+            if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                self.send_json(403, {'error': 'Group administration is local only'})
+                return
+            try:
+                data = self.read_json_body(limit=2 * 1024 * 1024)
+            except (ValueError, TypeError):
+                self.send_json(400, {'error': 'Invalid or oversized group document'})
+                return
+            status, result = self.app.connection_groups.save(unquote(group_editor.group(1)), data)
+            self.send_json(status, result)
+            return
 
         # PUT /api/openflux/groups/<id>
         m_of_grp = re.match(r"^/api/openflux/groups/([^/]+)$", path)
