@@ -1,285 +1,111 @@
-# TUNA Subscription Server (tuna-subscriptions)
+# TUNA Subscription Server
 
-Легковесный, автономный локальный HTTP-сервис подписок для панели TUNA на чистом Python 3.
+Локальный HTTP-сервис подписок в составе X-Manager v2026.09.25.2. Хранит пользователей, ссылки, каталоги OpenFlux/WebDAV и клиентские группы автовыбора. Реализация: Python 3, стандартная библиотека, SQLite WAL, `ThreadingHTTPServer`.
 
-## 🎯 Назначение и границы
+## Развёртывание и доступ
 
-Сервис решает задачу безопасного хранения и выдачи персональных ссылок для клиентов TUNA:
-1. Хранит ник пользователя и 5 протокольных ссылок (`csqtt`, `qwdtt`, `snell`, `mieru`, `masterdnsvpn`).
-2. Генерирует уникальный криптостойкий URL подписки для каждого пользователя.
-3. Отдаёт клиенту или панели подписку в виде Base64-текста со строгим сохранением порядка и неизменности байтов.
-4. **Не зависит от внешних библиотек** (Zero Dependencies — работает на стандартной библиотеке Python 3.9+).
-5. Не взаимодействует с внутренними механизмами маршрутизации панели, не вмешивается в Xray или Sing-box.
+Основной установщик X-Manager устанавливает сервис и его модули вместе. Для согласованного обновления используйте [полный выпуск](../docs/USER_GUIDE.md#обновление-и-восстановление), а не замену одного Python-файла.
 
----
+Согласованная привязка — **127.0.0.1:22217**. Подписки получает другой локальный сервис владельца. Ни внешний HTTPS endpoint, ни доступ к этому порту с телефона для данной схемы не требуются.
 
-## 🏗 Архитектура и стек
+У API управления нет отдельной общей Bearer-аутентификации: его граница доверия — локальный доступ. Не публикуйте `/api/` через сервис-получатель. Обработчики connection-groups дополнительно проверяют loopback-адрес клиента; это не означает такой же прикладной проверки во всех старых обработчиках.
 
-* **Среда выполнения:** Python 3 (стандартные библиотеки `http.server`, `sqlite3`, `secrets`, `hashlib`, `base64`, `json`, `uuid`). Никаких сторонних pip-пакетов (полная совместимость с PEP 668 на Debian 12/13).
-* **База данных:** SQLite 3 в режиме **WAL** (`PRAGMA journal_mode=WAL`, `synchronous=NORMAL`) для гарантии высокой производительности и отсутствия блокировок при одновременных запросах.
-* **Безопасность хранения:** Токены пользователей генерируются через `secrets.token_urlsafe(32)` и сохраняются в БД **исключительно в виде SHA-256 хеша**. Открытый токен возвращается клиенту только один раз при создании или ротации.
-* **Неизменность URI:** Ссылки протоколов хранятся и выдаются как непрозрачные строки (*opaque strings*). Символы `+`, пустые хеш-параметры `#`, нестандартные схемы `stormdns://` передаются байт-в-байт без нормализации и URL-декодирования.
-* **Логирование:** В логах (`/var/log/tuna-subscriptions/service.log`) токены и тела ссылок полностью маскируются.
+| Файл | Назначение |
+|---|---|
+| `/usr/local/bin/tuna-subscriptions` | Демон |
+| `/usr/local/bin/tuna_connection_groups.py` | Валидатор, хранение и публикация групп |
+| `/usr/local/bin/tuna-groups` | Терминальный редактор |
+| `/etc/tuna-subscriptions/config.toml` | Конфигурация |
+| `/var/lib/tuna-subscriptions/subscriptions.db` | База по умолчанию |
+| `/var/log/tuna-subscriptions/service.log` | Журнал HTTP-сервиса |
 
----
+Рабочая конфигурация сохраняется при обновлении. Актуальный шаблон — [config.toml.example](config.toml.example): bind_address `127.0.0.1`, port `22217`, max_request_body_size `2097152`, max_nickname_length `64`, max_uri_length `4096`, max_users `1000`. Поведение зависит от фактического config.toml, а не только от шаблона.
 
-## 📂 Структура компонентов
+Служба работает от `tuna-sub` с ограничениями systemd; точные параметры — [tuna-subscriptions.service](tuna-subscriptions.service). WAL помогает конкурентному доступу, но не является гарантией отсутствия блокировок или неограниченной производительности.
 
-```text
-tuna-sub-server/
-├── tuna-subscriptions.py      # Исполняемый демон сервиса
-├── config.toml.example        # Пример конфигурации
-├── tuna-subscriptions.service # Systemd юнит с изоляцией
-├── install-sub-server.sh      # Скрипт автоматической установки
-├── README.md                  # Документация сервиса
-└── tests/
-    └── test_sub_server.py     # 16 приемочных тестов из ТЗ
-```
+## Модель данных
 
----
+- Пользователь: стабильный ID, ник, enabled, revision, даты, протокольные поля.
+- Основные поля URI: `csqtt_uri`, `qwdtt_uri`, `snell_uri`, `mieru_uri`, `masterdnsvpn_uri`, `custom_uri`. Они могут содержать несколько строк.
+- OpenFlux: общий каталог групп и персональная конфигурация bundle пользователя.
+- WebDAV: общий каталог подключений/backends и персональный выбор пользователя.
+- Connection groups: отдельный JSON-документ `profiles`/`groups` в таблице `user_connection_groups`.
 
-## 🚀 Установка на Debian 12 / 13
+У профиля connection-groups есть ID, имя и URI; членство хранится через ID, что позволяет использовать профиль в нескольких группах. Эта коллекция не является автоматической копией старых полей URI: импорт запускается явно.
 
-Для установки выполните:
+### Токены и секреты
+
+Токен генерируется через `secrets.token_urlsafe(32)`. В базе хранятся **открытый subscription_token и subscription_token_hash (SHA-256)**. По хешу проверяется выдача подписки; открытый токен используется локальным API для повторного показа ссылки. Прежнее описание «токен хранится только как хеш и доступен один раз» не соответствует текущему коду.
+
+Ротация заменяет токен, увеличивает ревизию и делает старую ссылку недействительной для обоих форматов. Отключённый пользователь не получает подписку. URI, ключи, токены и резервные копии базы содержат секреты; шифрования базы на диске этот модуль не реализует. HTTP-журнал маскирует секретные пути, но это не обещание скрыть реквизиты во всех выводах меню/сторонних программ.
+
+## Форматы выдачи
+
+| Запрос | Успешная выдача | Особенности |
+|---|---|---|
+| `GET /sub/TOKEN` | Base64 от UTF-8 списка URI, разделённых переводом строки | text/plain; ETag и If-None-Match, 304 при совпадении, 204 если список пуст |
+| `GET /sub-json/TOKEN` | Прямой JSON `tuna.subscription` | schemaVersion 1, complete true, capability connection-groups-v1; Cache-Control no-store; ETag/304 здесь не реализованы |
+
+Для обоих форматов неизвестный/отключённый токен возвращает 404. Невалидный включённый OpenFlux/WebDAV или невалидный итоговый JSON не должен превращаться в тихую неполную выдачу: возвращается ошибка. Ошибки HTTP нужно обрабатывать до декодирования тела.
+
+Обычная подписка собирается в порядке CSQTT → QWDTT → Snell → Mieru → MasterDNS → Custom → OpenFlux → WebDAV. Протокольные строки не преобразуются в конфигурацию чужого клиента. Для OpenFlux формируется bundle v2, для WebDAV — собственные URI; принимающий клиент должен понимать эти расширения.
+
+JSON групп содержит отдельную коллекцию профилей и групп. Схема и ограничения зафиксированы в [tuna_connection_groups.py](tuna_connection_groups.py) и [контракте rc11](../docs/CONNECTION_GROUPS_RC11.md). Равенство формата переданному fixture проверено тестами; это не равно проведённому импорту в телефон.
+
+## Карта локального API
+
+Базовый URL: `http://127.0.0.1:22217`. Тела запросов — JSON с `Content-Type: application/json`. Таблица описывает реализованные маршруты, а не обещает единый набор полей для всех моделей.
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET | `/health`, `/api/health` | HTTP-проверка: status ok |
+| GET / POST | `/api/users` | Список / создание пользователя |
+| GET / PUT / DELETE | `/api/users/USER_ID` | Получить / изменить / удалить пользователя |
+| GET | `/api/users/USER_ID/subscription-url` | Обычная и структурированная ссылки; ответ содержит секрет |
+| POST | `/api/users/USER_ID/rotate-token` | Отозвать старый токен и выдать новый |
+| GET / POST | `/api/openflux/groups` | Список / создание группы каталога |
+| GET / PUT / DELETE | `/api/openflux/groups/GROUP_ID` | Работа с группой каталога |
+| POST | `/api/openflux/import-local` | Импорт настроенных локальных групп |
+| GET / PUT | `/api/users/USER_ID/openflux` | Выбор групп, параметры и публикация bundle пользователя |
+| GET / POST | `/api/users/USER_ID/openflux/export`, `/api/users/USER_ID/openflux/import` | Экспорт (GET) / импорт (POST) |
+| GET / POST | `/api/webdav/connections` | Список / создание подключения каталога |
+| GET / PUT / DELETE | `/api/webdav/connections/CONNECTION_ID` | Работа с подключением |
+| POST | `/api/webdav/import-uri`, `/api/webdav/import-server` | Импорт URI / существующей локальной конфигурации |
+| GET / PUT | `/api/users/USER_ID/webdav` | Персональный набор подключений и публикация |
+| GET | `/api/users/USER_ID/webdav/preview` | Предпросмотр выдачи |
+| GET / POST | `/api/users/USER_ID/webdav/export`, `/api/users/USER_ID/webdav/import` | Экспорт (GET) / импорт (POST) |
+| GET / PUT | `/api/users/USER_ID/connection-groups` | Прочитать / атомарно заменить документ внешних групп |
+
+Состояние службы, включение каталожной записи и включение компонента у пользователя — разные признаки. GET конкретного пользователя возвращает в том числе данные, нужные меню для отображения OpenFlux/WebDAV; не следует угадывать его структуру по ответу другого endpoint.
+
+### Создание и редактирование
+
+Для создания пользователя передаются `nickname` и необходимые поля URI. Для изменения используются PUT конкретного пользователя и только требуемые поля. Выключение выполняется через `enabled: false`. Не вставляйте реальные URI/токены в общедоступные примеры, историю команд или отчёты.
+
+Для точных полей импортируемых объектов и валидаторов см. [tuna-subscriptions.py](tuna-subscriptions.py). Экспорт/импорт каталога и замена документа connection-groups — разные операции; их payload не взаимозаменяемы.
+
+### Сохранение connection-groups
+
+1. GET документа пользователя возвращает `profiles`, `groups`, `revision`, `subscriptionId`.
+2. Клиент редактирования формирует PUT с `profiles`, `groups`, `expectedRevision`, равным прочитанной ревизии.
+3. Сервер валидирует документ, проверяет ревизию и записывает его транзакцией.
+4. Ответ содержит `success`, `changed`, `revision`. Повтор полностью идентичного документа возвращает changed false без лишней ревизии.
+5. HTTP 409 означает конфликт: нужно перечитать документ; 400 — неверное содержимое, 404 — нет пользователя, 500 — ошибка транзакции/публикации. Нельзя скрывать эти ответы сообщением об успехе.
+
+Лимиты: 2 MiB, до 1000 профилей, до 100 групп, 2–1000 участников одной группы, имена до 200 UTF-16 единиц. Допустимые семейства: VPN, CSQTT_QWDTT, WEBDAV, OPENFLUX; категория BYPASS относится к последним трём и не является отдельным семейством.
+
+## Проверка и обслуживание
+
+Без вывода секретов:
+
 ```bash
-sudo bash tuna-sub-server/install-sub-server.sh
+systemctl is-active tuna-subscriptions
+ss -lnt 'sport = :22217'
+curl -f http://127.0.0.1:22217/health
 ```
 
-Инсталлятор автоматически:
-1. Создаст системного пользователя `tuna-sub` без доступа к шеллу.
-2. Настроит права доступа к каталогам `/etc/tuna-subscriptions`, `/var/lib/tuna-subscriptions`, `/var/log/tuna-subscriptions`.
-3. Скопирует демон в `/usr/local/bin/tuna-subscriptions`.
-4. Создаст и запустит системную службу `tuna-subscriptions.service`.
+`/health` проверяет HTTP-обработчик, не качество VPN или доступность облачных backend.
 
-### Управление службой:
-```bash
-systemctl status tuna-subscriptions
-systemctl restart tuna-subscriptions
-journalctl -u tuna-subscriptions -f
-```
+Резервирование основной установкой использует SQLite backup API, учитывающий WAL. Нельзя считать простое копирование только работающего файла .db полной согласованной копией. Область отката и команды — в [руководстве](../docs/USER_GUIDE.md#обновление-и-восстановление).
 
----
-
-## ⚙️ Конфигурация (`/etc/tuna-subscriptions/config.toml`)
-
-```toml
-[server]
-bind_address = "127.0.0.1"
-port = 22217
-max_request_body_size = 65536
-
-[database]
-path = "/var/lib/tuna-subscriptions/subscriptions.db"
-
-[limits]
-max_nickname_length = 64
-max_uri_length = 4096
-max_users = 1000
-
-[logging]
-file = "/var/log/tuna-subscriptions/service.log"
-level = "INFO"
-```
-
----
-
-## 📡 Спецификация API
-
-### 1. Выдача подписки клиенту: `GET /sub/<token>`
-
-* **Аутентификация:** По секретному токену в пути URL.
-* **Успешный ответ (200 OK):**
-  * `Content-Type: text/plain; charset=utf-8`
-  * `Cache-Control: private, no-store`
-  * `ETag: "<revision>-<hash>"`
-  * `Profile-Title: <nickname>`
-  * **Тело:** Base64-строка, внутри которой ссылки разделены символом `\n` в строгом порядке:
-    1. `csqtt`
-    2. `qwdtt`
-    3. `snell`
-    4. `mieru`
-    5. `masterdnsvpn`
-* **Кэширование:** Если передан заголовок `If-None-Match` и ETag совпадает — сервис возвращает `304 Not Modified` без тела.
-* **Ошибки:**
-  * Неверный токен или деактивированный пользователь: `401 Unauthorized` или `404 Not Found`.
-  * Если у пользователя не задана ни одна ссылка: `204 No Content`.
-
----
-
-### 2. Локальное управление (Localhost API)
-
-#### 🔹 Создать пользователя
-```bash
-curl -X POST http://127.0.0.1:22217/api/users \
-  -H "Content-Type: application/json" \
-  -d '{
-    "nickname": "alex_travel",
-    "csqtt_uri": "csqtt://1.2.3.4:443?key=abc+def#CSQTT",
-    "qwdtt_uri": "qwdtt://1.2.3.4:8443#",
-    "snell_uri": "snell://1.2.3.4:9000?psk=pass&version=5#Snell",
-    "mieru_uri": "mieru://1.2.3.4:10000?user=alex#Mieru",
-    "masterdnsvpn_uri": "stormdns://1.2.3.4:53?k=val#MasterDNS"
-  }'
-```
-*Ответ (201 Created):*
-```json
-{
-  "id": "c1f7a012-...",
-  "nickname": "alex_travel",
-  "subscription_token": "u_K7...",
-  "subscription_url": "http://127.0.0.1:22217/sub/u_K7...",
-  "enabled": true,
-  "revision": 1
-}
-```
-*(Внимание: `subscription_token` возвращается только один раз!)*
-
-#### 🔹 Список всех пользователей
-```bash
-curl -s http://127.0.0.1:22217/api/users | jq .
-```
-
-#### 🔹 Просмотр профиля пользователя
-```bash
-curl -s http://127.0.0.1:22217/api/users/<USER_ID> | jq .
-```
-
-#### 🔹 Обновление ссылок или статуса пользователя
-```bash
-curl -X PUT http://127.0.0.1:22217/api/users/<USER_ID> \
-  -H "Content-Type: application/json" \
-  -d '{
-    "snell_uri": "snell://1.2.3.4:9005?psk=newpass&version=5#Snell-Updated",
-    "enabled": true
-  }'
-```
-
-#### 🔹 Ротация токена подписки
-Если ссылка скомпрометирована, старый токен аннулируется мгновенно:
-```bash
-curl -X POST http://127.0.0.1:22217/api/users/<USER_ID>/rotate-token
-```
-*Ответ:* возвращает новый `subscription_token` и обновленный `subscription_url`.
-
-#### 🔹 Удаление пользователя
-```bash
-curl -X DELETE http://127.0.0.1:22217/api/users/<USER_ID>
-```
-
----
-
-### 3. OpenFlux v2 Bundle (Контракт TUNA VPN)
-
-Сервис подписок поддерживает спецификацию **OpenFlux v2** для клиента TUNA VPN:
-* **Формат строки:** `openflux-bundle://v2/<Base64URL-NoPadding(UTF8(JSON_payload))>`
-* **Включение в подписку:** Бандл v2 добавляется отдельной строкой в общий Base64-ответ `GET /sub/<token>`. Клиент TUNA объединяет группы бандла в **одно общее подключение** с балансировкой (`roundRobin` или `leastPing`).
-* **Поддерживаемые транспорты (v2):** Строго `"mailru"`, `"boards"`, `"cupsonline"`. Любые устаревшие/неподдерживаемые транспорты (включая `vyandex`) отклоняются валидатором.
-* **Режимы:**
-  * `classic`: от 1 до 8 групп, в каждой группе ровно 1 URL.
-  * `multistream`: от 1 до 8 групп, в каждой группе от 1 до 4 URL (суммарно до 32 URL на бандл).
-* **Кодеки:** `legacy` (OpenFlux standard) или `batched`.
-* **Шифрование:** Опциональный `encryption_key` (AES-GCM base64 или строка) на уровне каждой отдельной группы.
-* **Синхронизация ETag:** При редактировании группы в каталоге или настроек пользователя автоматически инкрементируется ревизия профиля (`revision`) и инвалидируется `ETag`, гарантируя немедленное получение свежей подписки клиентом.
-
-#### 🔹 Каталог групп: `GET /api/openflux/groups`
-Возвращает список всех групп OpenFlux в каталоге сервера:
-```json
-[
-  {
-    "id": "mailru-pool-1",
-    "name": "Mail.Ru Primary",
-    "mode": "classic",
-    "transport": "mailru",
-    "urls": ["https://cloud.mail.ru/public/abcd/1234"],
-    "codec": "legacy",
-    "encryption_key": null,
-    "source_slot": 1
-  }
-]
-```
-
-#### 🔹 Добавление группы: `POST /api/openflux/groups`
-```bash
-curl -X POST http://127.0.0.1:22217/api/openflux/groups \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "mailru-pool-1",
-    "name": "Mail.Ru Primary",
-    "mode": "classic",
-    "transport": "mailru",
-    "urls": ["https://cloud.mail.ru/public/abcd/1234"],
-    "codec": "legacy"
-  }'
-```
-
-#### 🔹 Импорт локальных групп: `POST /api/openflux/import-local`
-Безопасно считывает экземпляры `/etc/openflux/instances/*.env` и режим `/etc/openflux/pool.mode` на хосте, отфильтровывает несовместимые транспорты (vyandex) и регистрирует группы в каталоге:
-```bash
-curl -X POST http://127.0.0.1:22217/api/openflux/import-local
-```
-
-#### 🔹 Настройка OpenFlux для пользователя: `GET /api/users/<id>/openflux`
-Возвращает конфигурацию бандла пользователя и список выбранных групп:
-```json
-{
-  "user_id": "c1f7a012-...",
-  "enabled": true,
-  "connection_id": "3f90117a-24ea-4c40-bd20-00d9841f3d32",
-  "name": "TUNA Multi-Stream",
-  "mode": "multistream",
-  "balancer_strategy": "leastPing",
-  "revision": 3,
-  "selected_group_ids": ["mailru-pool-1", "boards-pool-2"],
-  "groups": [...]
-}
-```
-
-#### 🔹 Обновление настроек OpenFlux: `PUT /api/users/<id>/openflux`
-Позволяет включить/отключить публикацию бандла, изменить имя подключения, режим, стратегию балансировки и набор выбранных групп (от 1 до 8):
-```bash
-curl -X PUT http://127.0.0.1:22217/api/users/<id>/openflux \
-  -H "Content-Type: application/json" \
-  -d '{
-    "enabled": true,
-    "name": "Office OpenFlux Cluster",
-    "mode": "classic",
-    "balancer_strategy": "roundRobin",
-    "group_ids": ["mailru-pool-1"]
-  }'
-```
-
----
-
-## 🧪 Тестирование
-
-Сервис сопровождается полным комплектом из 33 автоматических приемочных тестов, проверяющих:
-1. Создание пользователя и выдачу ссылок базовых протоколов.
-2. Уникальность токенов и изоляцию данных между пользователями.
-3. Жесткий порядок протоколов и фильтрацию пустых записей.
-4. Валидность Base64 и UTF-8 заголовка `Profile-Title`.
-5. Сохранение сырых спецсимволов (`+`, `#`, `stormdns://`).
-6. Работу ETag и HTTP 304 Not Modified.
-7. Недоступность деактивированных пользователей.
-8. Маскирование конфиденциальных данных в логах.
-9. Сериализацию и валидацию спецификации OpenFlux v2 Bundle.
-10. Строгую отбраковку неподдерживаемых транспортов (например, vyandex).
-11. Ограничения режимов classic (1 URL) и multistream (1-4 URL, до 8 групп на бандл).
-12. Инвалидацию ETag и ревизии пользователя при изменении групп.
-13. Безопасный импорт локальных конфигураций OpenFlux без shell eval.
-14. Соответствие синтетическим фикстурам контракта TUNA.
-
-Запуск тестов:
-```bash
-python3 -m unittest discover -s tuna-sub-server/tests -v
-```
-
----
-
-## 🛡 Безопасность и отказоустойчивость
-
-* **Права процесса:** Служба работает под непривилегированным пользователем `tuna-sub` с `ProtectSystem=strict` и `NoNewPrivileges=true`.
-* **Доступ к сети:** Сервис слушает локальный интерфейс (`127.0.0.1`), исключая внешний доступ без reverse proxy (например, Nginx с SSL или локального редиректа панели).
-* **Резервное копирование базы:**
-  ```bash
-  sqlite3 /var/lib/tuna-subscriptions/subscriptions.db ".backup /root/tuna_sub_backup.db"
-  ```
+Реализация и проверки: [tests](tests), [валидатор и хранение групп](tuna_connection_groups.py), [редактор](tuna-groups.py), [отчёт приёмки](../docs/VPS_DEPLOYMENT_20260925.md). Сервер хранит параметры URL-test/Speedtest, а измерения выполняет клиент.
