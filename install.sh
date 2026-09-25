@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.25.1.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.25.2.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -20,9 +20,6 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
 fi
 . "$SCRIPT_DIR/scripts/installer-common.sh"
 xm_preflight
-# systemd/automation may omit HOME; Go must not depend on an interactive shell.
-export GOPATH="${GOPATH:-/var/cache/x-manager/go}"
-export GOCACHE="${GOCACHE:-/var/cache/x-manager/go-build}"
 if [ "${1:-}" = --rollback ]; then
     [ -n "${2:-}" ] || xm_die 'Usage: install.sh --rollback /var/backups/x-manager-XXXXXXXX'
     python3 "$2/installer-state.py" restore "$2"
@@ -74,7 +71,6 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "Python 3.
 port_plan=$(python3 "$SCRIPT_DIR/scripts/plan-ports.py")
 eval "$port_plan"
 WORK_DIR=$(mktemp -d)
-export GOTOOLCHAIN=auto
 
 # Архитектура и сетевой интерфейс
 ARCH=$(uname -m)
@@ -673,6 +669,15 @@ if [ "$INSTALL_OPENFLUX" = yes ]; then
         fi
     done
 fi
+# Keep the full verified source for repeat installation and manual rollback.
+# This directory is included in installer-state.py's managed backup scope.
+distribution=/usr/local/share/x-manager/distribution
+staged_distribution=$(mktemp -d /usr/local/share/x-manager/.distribution-XXXXXXXX)
+( set -o pipefail; tar -C "$SCRIPT_DIR" --exclude=__pycache__ -cf - install.sh components.json bin scripts systemd tuna-sub-server patches licenses | tar -C "$staged_distribution" -xf - )
+bash -n "$staged_distribution/install.sh"
+rm -rf -- "$distribution"
+mv "$staged_distribution" "$distribution"
+chmod 0755 "$distribution"
 python3 - "$XM_BACKUP/state.json" <<'PY'
 import json, subprocess, sys
 for unit, previous in json.load(open(sys.argv[1]))['services'].items():
@@ -681,7 +686,7 @@ for unit, previous in json.load(open(sys.argv[1]))['services'].items():
 PY
 XM_TRANSACTION=0
 rm -rf -- "$WORK_DIR"
-echo "Rollback: bash $SCRIPT_DIR/install.sh --rollback $XM_BACKUP"
+echo "Rollback: bash /usr/local/share/x-manager/distribution/install.sh --rollback $XM_BACKUP"
 
 echo ""
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════════════${NC}"

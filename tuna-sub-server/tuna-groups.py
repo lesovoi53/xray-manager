@@ -51,9 +51,12 @@ def test_url(kind):
         value = input('HTTPS URL файла Speedtest (0 — отмена): ').strip()
         if value == '0':
             raise Invalid('Создание отменено')
-        parsed = urllib.parse.urlsplit(value)
-        if parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password and not any(c.isspace() for c in value):
-            return value
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            if parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password and not parsed.fragment and not any(c.isspace() for c in value):
+                return value
+        except ValueError:
+            pass
         print('Для Speedtest нужен непустой HTTPS URL файла. Группа ещё не сохранена.')
 
 
@@ -318,6 +321,6 @@ if __name__ == '__main__':
     try:
         main()
     except (EOFError, KeyboardInterrupt):
-        print('\nВыход без несохранённых изменений.')
+        print('\nВыход. Несохранённый черновик не записан на сервер.')
     except (OSError, Invalid):
         sys.exit('API групп недоступен. Проверьте локальную службу подписок.')

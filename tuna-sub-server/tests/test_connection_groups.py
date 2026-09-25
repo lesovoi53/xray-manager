@@ -26,7 +26,7 @@ class ConnectionGroupsTests(unittest.TestCase):
     def test_speedtest_blank_url_reprompts_and_settings_use_choices(self):
         tui = importlib.import_module('tuna-groups')
         output = io.StringIO()
-        with patch('builtins.input', side_effect=['', 'http://invalid.test/file', 'https://example.test/file']), redirect_stdout(output):
+        with patch('builtins.input', side_effect=['', 'http://invalid.test/file', 'https://[broken', 'https://example.test/file#fragment', 'https://example.test/file']), redirect_stdout(output):
             self.assertEqual(tui.test_url('SPEEDTEST'), 'https://example.test/file')
         self.assertIn('непустой HTTPS URL', output.getvalue())
         group = dict(groups.DEFAULTS, type='URL_TEST', testOnConnect=True, testUrl='https://example.test/probe')

@@ -1,3 +1,5 @@
+> Поддерживаются Debian 12–13 amd64. Компоненты закреплены выпуском; инструкции установки и обновления: [RELEASES_AND_MENU.md](docs/RELEASES_AND_MENU.md).
+
 # 🌐 X-Manager
 
 <p align="center">
