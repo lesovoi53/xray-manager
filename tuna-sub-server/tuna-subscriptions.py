@@ -4277,7 +4277,7 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         """
         msg = format % args
         # Замена токенов в путях /sub/...
-        sanitized = re.sub(r'/sub(?:-json)?/[^\s?]+', '/sub/[REDACTED_TOKEN]', msg)
+        sanitized = re.sub(r'/sub(?:-json|-groups)?/[^\s?]+', '/sub/[REDACTED_TOKEN]', msg)
         log_file = self.app.config.get("logging", {}).get("file")
         log_entry = f"[{self.log_date_time_string()}] {self.client_address[0]} {sanitized}\n"
         if log_file:
@@ -4319,9 +4319,12 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        if path.startswith('/sub-json/'):
-            token = path[len('/sub-json/'):]
-            status, headers, payload = self.app.connection_groups.publish(token)
+        if path.startswith(('/sub-json/', '/sub-groups/')):
+            transport = path.startswith('/sub-groups/')
+            prefix = '/sub-groups/' if transport else '/sub-json/'
+            token = path[len(prefix):]
+            publish = self.app.connection_groups.publish_uri if transport else self.app.connection_groups.publish
+            status, headers, payload = publish(token)
             if status != 200:
                 self.send_json(status, {'error': headers.get('error', 'Subscription unavailable')})
                 return
@@ -4489,6 +4492,7 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
                 "token": res.get("token", ""),
                 "subscription_url": res.get("subscription_url", ""),
                 "structured_subscription_url": res.get("subscription_url", "").replace('/sub/', '/sub-json/', 1),
+                "group_transport_subscription_url": res.get("subscription_url", "").replace('/sub/', '/sub-groups/', 1),
             })
             return
 

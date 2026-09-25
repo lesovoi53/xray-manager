@@ -1,4 +1,5 @@
 import copy
+import base64
 import hashlib
 import importlib
 import io
@@ -23,6 +24,57 @@ FIXTURE = json.loads((ROOT / 'fixtures/group-subscription-demo.json').read_text(
 
 
 class ConnectionGroupsTests(unittest.TestCase):
+    def test_group_uri_roundtrip_empty_disabled_and_limits(self):
+        token = self.user['token']
+        def decoded():
+            status, _, body = self.store.publish_uri(token)
+            self.assertEqual(status, 200)
+            lines = base64.b64decode(body, validate=True).decode('ascii').splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith(groups.GROUP_URI_PREFIX))
+            payload = lines[0][len(groups.GROUP_URI_PREFIX):]
+            self.assertRegex(payload, r'^[A-Za-z0-9_-]+$')
+            actual = base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4))
+            self.assertEqual(actual, self.store.publish(token)[2])
+            return json.loads(actual)
+        self.assertEqual(decoded()['groups'], [])  # Empty snapshot removes old groups.
+        legacy = self.app.get_subscription_payload(token)[2]
+        self.assertEqual(self.save()[0], 200)
+        self.assertEqual(len(decoded()['groups']), 8)
+        self.assertEqual(self.app.get_subscription_payload(token)[2], legacy)
+        with patch.object(groups, 'MAX_BODY', 45000), patch.object(self.store, 'publish', return_value=(200, {}, b'x' * 30000)):
+            self.assertEqual(self.store.publish_uri(token)[0], 500)  # Double encoding must fit too.
+            self.assertEqual(self.store.publish_uri(token)[2], b'')
+        self.assertEqual(self.store.publish_uri('not-a-token')[0], 404)
+        with self.app.conn:
+            self.app.conn.execute('UPDATE user_connection_groups SET document_json=? WHERE user_id=?', ('{}', self.user['id']))
+        self.assertEqual(self.store.publish_uri(token)[0], 500)
+        with self.app.conn:
+            self.app.conn.execute('UPDATE users SET enabled=0 WHERE id=?', (self.user['id'],))
+        self.assertEqual(self.store.publish_uri(token)[0], 404)
+
+    def test_http_group_uri_and_link_discovery_hide_token(self):
+        self.assertEqual(self.save()[0], 200)
+        server = tuna.ThreadingHTTPServer(('127.0.0.1', 0), tuna.SubscriptionRequestHandler)
+        server.app = self.app
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            base = 'http://127.0.0.1:%d' % server.server_port
+            with urllib.request.urlopen(base + '/sub-groups/' + self.user['token']) as response:
+                self.assertEqual(response.headers.get_content_type(), 'text/plain')
+                body = response.read()
+                self.assertEqual(int(response.headers['Content-Length']), len(body))
+                self.assertEqual(body, self.store.publish_uri(self.user['token'])[2])
+            with urllib.request.urlopen(base + '/api/users/' + self.user['id'] + '/subscription-url') as response:
+                links = json.load(response)
+                self.assertEqual(links['group_transport_subscription_url'], links['subscription_url'].replace('/sub/', '/sub-groups/'))
+                self.assertEqual(links['structured_subscription_url'], links['subscription_url'].replace('/sub/', '/sub-json/'))
+            log = pathlib.Path(self.app.config['logging']['file']).read_text()
+            self.assertNotIn(self.user['token'], log)
+            self.assertNotIn(self.document['profiles'][0]['uri'], log)
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
+
     def test_speedtest_blank_url_reprompts_and_settings_use_choices(self):
         tui = importlib.import_module('tuna-groups')
         output = io.StringIO()
@@ -225,6 +277,58 @@ class ConnectionGroupsTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_http_legacy_and_group_documents_stay_separate(self):
+        # The aggregator must not treat the structured document as another URI.
+        before = self.app.get_subscription_payload(self.user['token'])[2]
+        uri = self.document['profiles'][0]['uri'].split('#', 1)[0]
+        uri += '#Literal%0A%22%5C%2F+%26%3D'
+        self.document['profiles'][0]['uri'] = uri
+        self.assertEqual(self.save()[0], 200)
+        server = tuna.ThreadingHTTPServer(('127.0.0.1', 0), tuna.SubscriptionRequestHandler)
+        server.app = self.app
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = 'http://127.0.0.1:%d' % server.server_port
+            with urllib.request.urlopen(base + '/sub/' + self.user['token']) as response:
+                legacy = response.read()
+                self.assertEqual(response.headers.get_content_type(), 'text/plain')
+            self.assertEqual(legacy, before)
+            with urllib.request.urlopen(base + '/sub-json/' + self.user['token']) as response:
+                body = response.read()
+                self.assertEqual(response.headers.get_content_type(), 'application/json')
+                self.assertEqual(int(response.headers['Content-Length']), len(body))
+            # A strict decoder must consume the entire response, not find an object
+            # buried among URI lines. Escapes inside URIs must remain literal.
+            text = body.decode('utf-8')
+            document, end = json.JSONDecoder().raw_decode(text)
+            self.assertEqual(end, len(text))
+            self.assertEqual(document['schema'], 'tuna.subscription')
+            self.assertEqual(document['requiredCapabilities'], ['connection-groups-v1'])
+            self.assertTrue(document['complete'])
+            self.assertEqual(document['profiles'][0]['uri'], uri)
+            self.assertEqual(len(document['groups']), len(self.document['groups']))
+            self.assertEqual(body, self.store.publish(self.user['token'])[2])
+            lines = base64.b64decode(legacy, validate=True).decode('utf-8')
+            self.assertNotIn('"groups":', lines)
+            self.assertNotIn('"schema":', lines)
+            mixed = base64.b64encode(lines.encode() + body)
+            # Reproduce the invalid envelope described by the public-response audit
+            # using only synthetic fixture data, not the real subscription.
+            with self.assertRaises(json.JSONDecodeError):
+                json.loads(base64.b64decode(mixed, validate=True))
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
+
+    def test_corrupt_group_document_does_not_contaminate_legacy(self):
+        before = self.app.get_subscription_payload(self.user['token'])[2]
+        self.assertEqual(self.save()[0], 200)
+        with self.app.conn:
+            self.app.conn.execute('UPDATE user_connection_groups SET document_json=? WHERE user_id=?',
+                                  ('{"profiles":[],"groups":[', self.user['id']))
+        self.assertEqual(self.store.publish(self.user['token'])[0], 500)
+        self.assertEqual(self.app.get_subscription_payload(self.user['token'])[2], before)
 
     def test_tui_create_rename_reorder_and_disable_over_http(self):
         server = tuna.ThreadingHTTPServer(('127.0.0.1', 0), tuna.SubscriptionRequestHandler)

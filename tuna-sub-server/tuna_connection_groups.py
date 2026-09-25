@@ -1,5 +1,6 @@
 """TUNA rc11 outer connection groups. No probes, networking, or URI rewriting."""
 import datetime
+import base64
 import hashlib
 import json
 import re
@@ -7,6 +8,7 @@ import sqlite3
 from urllib.parse import urlsplit
 
 MAX_BODY = 2 * 1024 * 1024
+GROUP_URI_PREFIX = 'tuna-groups://v1/'
 FAMILIES = {'VPN': 'VPN', 'CSQTT_QWDTT': 'BYPASS', 'WEBDAV': 'BYPASS', 'OPENFLUX': 'BYPASS'}
 SCHEMES = {scheme: 'VPN' for scheme in ('vless', 'hysteria2', 'hy2', 'snell', 'mieru', 'mierus', 'trojan', 'ss', 'tuic', 'anytls')}
 SCHEMES.update(csqtt='CSQTT_QWDTT', qwdtt='CSQTT_QWDTT', webdav='WEBDAV', webdavs='WEBDAV')
@@ -256,3 +258,19 @@ class Store:
             return 500, {'error': 'Invalid structured subscription; no partial snapshot was published'}, b''
         finally:
             db.close()
+
+    def publish_uri(self, token):
+        """Transport the exact complete JSON through a URI-only aggregator.
+
+        No compression, URL decoding, fragment or query: a panel may rename the
+        URI's fragment without touching the Base64URL payload. Always emit even
+        an empty snapshot so clients can remove groups previously imported.
+        """
+        status, headers, body = self.publish(token)
+        if status != 200:
+            return status, headers, body
+        line = GROUP_URI_PREFIX.encode('ascii') + base64.urlsafe_b64encode(body).rstrip(b'=') + b'\n'
+        payload = base64.b64encode(line)
+        if len(payload) > MAX_BODY:
+            return 500, {'error': 'Group URI subscription exceeds 2 MiB; no partial snapshot was published'}, b''
+        return 200, {'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store'}, payload
