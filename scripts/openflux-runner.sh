@@ -5,6 +5,9 @@
 
 set -e
 
+export GOMEMLIMIT=${GOMEMLIMIT:-150MiB}
+export GODEBUG=${GODEBUG:-madvdontneed=1}
+
 INSTANCE="${1:-1}"
 if [ -n "$INSTANCE" ] && [ -f "/etc/openflux/instances/${INSTANCE}.env" ]; then
     ENV_FILE="/etc/openflux/instances/${INSTANCE}.env"

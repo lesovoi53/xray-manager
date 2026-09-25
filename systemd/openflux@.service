@@ -5,6 +5,8 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+Environment="GOMEMLIMIT=150MiB"
+Environment="GODEBUG=madvdontneed=1"
 Type=simple
 User=openflux
 Group=openflux
