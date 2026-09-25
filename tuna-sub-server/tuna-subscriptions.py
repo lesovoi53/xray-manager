@@ -73,6 +73,7 @@ MAX_WEBDAV_STORAGE_URL_LEN = 8192
 MAX_WEBDAV_LOGIN_LEN = 2048
 MAX_WEBDAV_PASSWORD_LEN = 8192
 MAX_WEBDAV_BACKENDS = 8
+MAX_WEBDAV_CONNECTIONS = 8
 MAX_SUBSCRIPTION_RESPONSE_BYTES = 2097152
 ALLOWED_WEBDAV_QUERY_KEYS = {
     "timeout", "poll-min", "poll-max", "coalesce", "chunk-size",
@@ -281,6 +282,29 @@ def init_database(db_path):
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_user_wdav_sel_user ON user_webdav_selection(user_id, position);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_user_wdav_sel_conn ON user_webdav_selection(connection_id);")
+
+    # Аддитивная миграция для отслеживания источника импорта и канонических отпечатков
+    c.execute("PRAGMA table_info(openflux_groups);")
+    of_grp_cols = [r["name"] for r in c.fetchall()]
+    if "source_issuer_id" not in of_grp_cols:
+        c.execute("ALTER TABLE openflux_groups ADD COLUMN source_issuer_id TEXT;")
+    if "source_group_id" not in of_grp_cols:
+        c.execute("ALTER TABLE openflux_groups ADD COLUMN source_group_id TEXT;")
+
+    c.execute("PRAGMA table_info(user_openflux_config);")
+    of_u_cols = [r["name"] for r in c.fetchall()]
+    if "source_issuer_id" not in of_u_cols:
+        c.execute("ALTER TABLE user_openflux_config ADD COLUMN source_issuer_id TEXT;")
+    if "source_connection_id" not in of_u_cols:
+        c.execute("ALTER TABLE user_openflux_config ADD COLUMN source_connection_id TEXT;")
+    if "source_revision" not in of_u_cols:
+        c.execute("ALTER TABLE user_openflux_config ADD COLUMN source_revision INTEGER;")
+
+    c.execute("PRAGMA table_info(webdav_connections);")
+    wd_cols = [r["name"] for r in c.fetchall()]
+    if "fingerprint" not in wd_cols:
+        c.execute("ALTER TABLE webdav_connections ADD COLUMN fingerprint TEXT;")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_webdav_fingerprint ON webdav_connections(fingerprint);")
 
     conn.commit()
     return conn
@@ -1334,6 +1358,105 @@ def parse_webdav_uri(uri_str: str) -> tuple[bool, str, dict]:
     }
     return True, "", res
 
+def compute_webdav_canonical_fingerprint(conn: dict) -> str:
+    """
+    Вычисляет криптографический отпечаток (SHA256) канонической конфигурации WebDAV.
+    Используется для надежного распознавания повторного импорта идентичных подключений
+    без создания дубликатов и без зависимости от пользовательского имени или ID.
+    """
+    primary_spec = {
+        "url": conn.get("url", ""),
+        "username": conn.get("username", ""),
+        "password": conn.get("password", ""),
+    }
+    ok_p, _, p_clean = validate_storage_spec(primary_spec, is_primary=True)
+    if not ok_p:
+        p_clean = {
+            "url": str(conn.get("url", "")).strip(),
+            "username": str(conn.get("username", "")).strip(),
+            "password": str(conn.get("password", "")).strip(),
+        }
+
+    raw_backends = conn.get("backends", [])
+    if isinstance(raw_backends, str):
+        try:
+            raw_backends = json.loads(raw_backends)
+        except Exception:
+            raw_backends = []
+    if not isinstance(raw_backends, list):
+        raw_backends = []
+
+    clean_backends = []
+    for b in raw_backends:
+        if isinstance(b, dict):
+            clean_backends.append({
+                "url": str(b.get("url", "")).strip(),
+                "username": str(b.get("username", "")).strip(),
+                "password": str(b.get("password", "")).strip(),
+            })
+
+    ok_t, _, t_clean = validate_tuning_params(conn)
+    if not ok_t:
+        t_clean = {
+            "timeout": str(conn.get("timeout") or "60s").strip(),
+            "poll_min": str(conn.get("poll_min") or "200ms").strip(),
+            "poll_max": str(conn.get("poll_max") or "500ms").strip(),
+            "coalesce": str(conn.get("coalesce") or "10ms").strip(),
+            "chunk_size": int(conn.get("chunk_size") or 131071),
+            "puts": int(conn.get("puts") or 8),
+            "read_min": int(conn.get("read_min") or 3),
+            "read_max": int(conn.get("read_max") or 8),
+            "enc": 1 if conn.get("enc") else 0,
+            "dns": str(conn.get("dns") or "").strip(),
+        }
+
+    canon_obj = {
+        "primary": {
+            "url": p_clean.get("url", ""),
+            "username": p_clean.get("username", ""),
+            "password": p_clean.get("password", ""),
+        },
+        "backends": clean_backends,
+        "tuning": t_clean,
+    }
+    canon_bytes = json.dumps(canon_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canon_bytes).hexdigest()
+
+def mask_secret(val: str, prefix_len: int = 2, suffix_len: int = 2) -> str:
+    """Маскирование секретов (пароли, ключи шифрования) для безопасного предпросмотра."""
+    if not val:
+        return ""
+    val_str = str(val)
+    if len(val_str) <= 6:
+        return "******"
+    return f"{val_str[:prefix_len]}...{val_str[-suffix_len:]}"
+
+def compute_user_openflux_state_token(u_id: str, cfg: dict | None, groups: list) -> str:
+    """Вычисляет токен состояния конфигурации OpenFlux для оптимистичной блокировки."""
+    if not cfg:
+        token_data = f"empty:{u_id}"
+    else:
+        c_dict = dict(cfg) if not isinstance(cfg, dict) else cfg
+        g_ids = []
+        for g in groups:
+            gd = dict(g) if not isinstance(g, dict) else g
+            g_ids.append(str(gd.get("id", "")))
+        token_data = f"{u_id}:{c_dict.get('revision')}:{c_dict.get('connection_id')}:{','.join(g_ids)}:{c_dict.get('updated_at')}"
+    return hashlib.sha256(token_data.encode("utf-8")).hexdigest()
+
+def compute_user_webdav_state_token(u_id: str, cfg: dict | None, conns: list) -> str:
+    """Вычисляет токен состояния конфигурации WebDAV для оптимистичной блокировки."""
+    if not cfg:
+        token_data = f"empty:{u_id}"
+    else:
+        c_dict = dict(cfg) if not isinstance(cfg, dict) else cfg
+        c_ids = []
+        for c in conns:
+            cd = dict(c) if not isinstance(c, dict) else c
+            c_ids.append(str(cd.get("id") or cd.get("connection_id") or ""))
+        token_data = f"{u_id}:{c_dict.get('revision')}:{','.join(c_ids)}:{c_dict.get('updated_at')}"
+    return hashlib.sha256(token_data.encode("utf-8")).hexdigest()
+
 def import_server_webdav_config(env_path: str = "/etc/webdav-tunnel/config.env", server_ip: str = "127.0.0.1") -> tuple[bool, str, dict]:
     """
     Инспектирует активную конфигурацию сервера WebDAV (config.env) и строит
@@ -1617,6 +1740,7 @@ class SubscriptionApp:
             "nickname": nickname,
             "subscription_url": sub_url,
             "token": raw_token,
+            "subscription_token": raw_token,
             "revision": 1,
             "enabled": True,
             "total_uris": total_uris,
@@ -2534,6 +2658,301 @@ class SubscriptionApp:
 
         return self.get_user_openflux(u_id)
 
+    def export_user_openflux(self, user_id_or_nick: str) -> tuple[int, dict]:
+        """
+        Экспорт полного снимка настроек OpenFlux v2 для пользователя в виде переносимого URI.
+        Независим от флага публикации (enabled) в подписке: работает при включенной и выключенной публикации.
+        НЕ создает ленивых записей в БД (чистый read-only, вернет 404 если настройки нет).
+        НЕ изменяет revision, ID или данные.
+        Содержит неискаженные секреты (unmasked encryption_key) по каноническому контракту v2.
+        """
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id_or_nick, user_id_or_nick))
+        user = c.fetchone()
+        if not user:
+            return 404, {"error": "User not found"}
+
+        u_id = user["id"]
+        c.execute("SELECT * FROM user_openflux_config WHERE user_id = ?;", (u_id,))
+        of_cfg = c.fetchone()
+        if not of_cfg:
+            return 404, {"error": f"OpenFlux configuration not found for user '{user['nickname']}'"}
+
+        c.execute("""
+            SELECT g.* FROM user_openflux_selection s
+            JOIN openflux_groups g ON s.group_id = g.id
+            WHERE s.user_id = ?
+            ORDER BY s.position ASC;
+        """, (u_id,))
+        sel_groups = c.fetchall()
+        if not sel_groups or len(sel_groups) < 1:
+            return 400, {"error": f"No OpenFlux groups configured for user '{user['nickname']}'"}
+        if len(sel_groups) > MAX_BUNDLE_GROUPS:
+            return 400, {"error": f"Too many groups ({len(sel_groups)}) for OpenFlux bundle (max {MAX_BUNDLE_GROUPS})"}
+
+        wire_groups = []
+        for g in sel_groups:
+            try:
+                raw_urls = json.loads(g["urls_json"])
+            except Exception:
+                raw_urls = []
+            wire_groups.append({
+                "id": g["id"],
+                "name": g["name"],
+                "transport": g["transport"],
+                "urls": raw_urls,
+                "codec": g["codec"],
+                "encryption_key": g["encryption_key"] or "",
+            })
+
+        ok_b, err_b, payload = build_openflux_v2_payload(
+            self.issuer_id,
+            of_cfg["connection_id"],
+            int(of_cfg["revision"]),
+            of_cfg["name"],
+            of_cfg["mode"],
+            of_cfg["balancer_strategy"],
+            wire_groups
+        )
+        if not ok_b:
+            return 400, {"error": f"Failed to build OpenFlux export bundle: {err_b}"}
+
+        ok_s, err_s, full_uri = serialize_openflux_v2_bundle(payload)
+        if not ok_s:
+            return 500, {"error": f"Failed to serialize OpenFlux bundle URI: {err_s}"}
+
+        return 200, {
+            "success": True,
+            "uri": full_uri,
+            "payload": payload,
+            "user_id": u_id,
+            "nickname": user["nickname"],
+            "enabled": bool(of_cfg["enabled"]),
+            "revision": int(of_cfg["revision"]),
+        }
+
+    def import_user_openflux(self, user_id_or_nick: str, data: dict) -> tuple[int, dict]:
+        """
+        Импорт снимка подключения OpenFlux v2 с другого сервера:
+        - Двухфазный: preview_only (предпросмотр с маскировкой секретов) и commit (атомарное применение).
+        - Оптимистичная блокировка через expected_state_token: ошибка 409 при изменении состояния.
+        - Идентичный повторный импорт — no-op без создания дубликатов и без роста revision.
+        - Сохраняет локальный connection_id существующего пользователя и увеличивает локальную revision.
+        - Для нового пользователя создает локальный connection_id, начальную revision=1 и enabled=0.
+        - Сохраняет флаг публикации (enabled) существующего пользователя.
+        - Не привязывает импортированные группы к слотам /etc/openflux/instances (source_slot=NULL).
+        - Сохраняет source_issuer_id, source_connection_id, source_revision, source_group_id.
+        """
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id_or_nick, user_id_or_nick))
+        user = c.fetchone()
+        if not user:
+            return 404, {"error": "User not found"}
+        u_id = user["id"]
+
+        raw_uri = data.get("uri")
+        raw_payload = data.get("payload")
+        if raw_uri:
+            if not isinstance(raw_uri, str) or not raw_uri.strip():
+                return 400, {"error": "Field 'uri' must be a non-empty string"}
+            ok_d, err_d, payload = deserialize_openflux_v2_bundle(raw_uri.strip())
+            if not ok_d:
+                return 400, {"error": f"Failed to parse OpenFlux bundle URI: {err_d}"}
+        elif raw_payload and isinstance(raw_payload, dict):
+            ok_v, err_v = validate_openflux_v2_payload(raw_payload)
+            if not ok_v:
+                return 400, {"error": f"Invalid OpenFlux payload: {err_v}"}
+            payload = raw_payload
+        else:
+            return 400, {"error": "Either 'uri' or 'payload' is required"}
+
+        ok_v, err_v = validate_openflux_v2_payload(payload)
+        if not ok_v:
+            return 400, {"error": f"Invalid OpenFlux payload: {err_v}"}
+
+        # Текущая конфигурация пользователя
+        c.execute("SELECT * FROM user_openflux_config WHERE user_id = ?;", (u_id,))
+        cur_cfg = c.fetchone()
+        c.execute("""
+            SELECT g.* FROM user_openflux_selection s
+            JOIN openflux_groups g ON s.group_id = g.id
+            WHERE s.user_id = ?
+            ORDER BY s.position ASC;
+        """, (u_id,))
+        cur_groups = c.fetchall()
+
+        cur_state_token = compute_user_openflux_state_token(u_id, cur_cfg, cur_groups)
+
+        # Проверка полной идентичности (no-op)
+        is_identical = False
+        if cur_cfg and len(cur_groups) == len(payload.get("groups", [])):
+            if (cur_cfg["name"] == payload.get("name") and
+                cur_cfg["mode"] == payload.get("mode") and
+                cur_cfg["balancer_strategy"] == payload.get("balancer_strategy")):
+                all_match = True
+                for cg, ig in zip(cur_groups, payload.get("groups", [])):
+                    try:
+                        cg_urls = json.loads(cg["urls_json"])
+                    except Exception:
+                        cg_urls = []
+                    if (cg["name"] != ig.get("name") or
+                        cg["transport"] != ig.get("transport") or
+                        cg_urls != ig.get("urls", []) or
+                        cg["codec"] != ig.get("codec") or
+                        (cg["encryption_key"] or "") != (ig.get("encryption_key") or "")):
+                        all_match = False
+                        break
+                is_identical = all_match
+
+        is_commit = bool(data.get("commit", False))
+        if data.get("preview_only") is True:
+            is_commit = False
+
+        if not is_commit:
+            # ФАЗА ПРЕДПРОСМОТРА
+            masked_groups = []
+            for idx, g in enumerate(payload.get("groups", []), 1):
+                raw_urls = g.get("urls", [])
+                enc_key = g.get("encryption_key") or ""
+                masked_groups.append({
+                    "position": idx,
+                    "name": g.get("name", ""),
+                    "transport": g.get("transport", ""),
+                    "urls_count": len(raw_urls),
+                    "codec": g.get("codec", "legacy"),
+                    "has_encryption": bool(enc_key),
+                    "encryption_key_masked": mask_secret(enc_key),
+                })
+            cur_summary = None
+            if cur_cfg:
+                cur_summary = {
+                    "name": cur_cfg["name"],
+                    "mode": cur_cfg["mode"],
+                    "balancer_strategy": cur_cfg["balancer_strategy"],
+                    "groups_count": len(cur_groups),
+                    "revision": cur_cfg["revision"],
+                    "enabled": bool(cur_cfg["enabled"]),
+                }
+            return 200, {
+                "success": True,
+                "preview": True,
+                "is_identical": is_identical,
+                "state_token": cur_state_token,
+                "current_config": cur_summary,
+                "incoming_config": {
+                    "name": payload.get("name"),
+                    "mode": payload.get("mode"),
+                    "balancer_strategy": payload.get("balancer_strategy"),
+                    "groups_count": len(payload.get("groups", [])),
+                    "groups": masked_groups,
+                    "source_issuer_id": payload.get("issuer_id"),
+                    "source_connection_id": payload.get("id"),
+                    "source_revision": payload.get("revision"),
+                }
+            }
+
+        # ФАЗА КОММИТА
+        expected_token = data.get("expected_state_token")
+        if expected_token and expected_token != cur_state_token:
+            return 409, {"error": "Configuration changed since preview. Please request a new preview before committing."}
+
+        if is_identical:
+            # Идентичный повторный импорт — no-op
+            return 200, {
+                "success": True,
+                "no_op": True,
+                "message": "Identical configuration already active. No changes made.",
+                "user_id": u_id,
+                "revision": cur_cfg["revision"],
+                "connection_id": cur_cfg["connection_id"],
+            }
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            with self.conn:
+                if cur_cfg:
+                    target_conn_id = cur_cfg["connection_id"]
+                    target_rev = int(cur_cfg["revision"]) + 1
+                    target_enabled = cur_cfg["enabled"]
+                else:
+                    target_conn_id = str(uuid.uuid4()).lower()
+                    target_rev = 1
+                    target_enabled = 0
+
+                target_group_ids = []
+                for g in payload.get("groups", []):
+                    src_iss = payload.get("issuer_id", "")
+                    src_gid = g.get("id", "")
+                    g_urls = g.get("urls", [])
+                    g_urls_json = json.dumps(g_urls, separators=(",", ":"))
+                    g_codec = g.get("codec", "legacy")
+                    g_enc = g.get("encryption_key") or ""
+                    g_transport = g.get("transport", "")
+                    g_name = g.get("name", "")
+                    g_mode = payload.get("mode", "classic")
+
+                    c.execute("""
+                        SELECT id FROM openflux_groups
+                        WHERE (source_issuer_id = ? AND source_group_id = ?)
+                           OR (transport = ? AND mode = ? AND urls_json = ? AND codec = ? AND encryption_key = ?);
+                    """, (src_iss, src_gid, g_transport, g_mode, g_urls_json, g_codec, g_enc))
+                    existing_grp = c.fetchone()
+                    if existing_grp:
+                        target_group_ids.append(existing_grp["id"])
+                    else:
+                        new_gid = str(uuid.uuid4()).lower()
+                        c.execute("""
+                            INSERT INTO openflux_groups (
+                                id, name, mode, transport, urls_json, codec, encryption_key,
+                                source_slot, source_issuer_id, source_group_id, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?);
+                        """, (
+                            new_gid, g_name, g_mode, g_transport, g_urls_json, g_codec, g_enc,
+                            src_iss, src_gid, now_iso, now_iso
+                        ))
+                        target_group_ids.append(new_gid)
+
+                if cur_cfg:
+                    c.execute("""
+                        UPDATE user_openflux_config
+                        SET connection_id = ?, name = ?, mode = ?, balancer_strategy = ?,
+                            revision = ?, enabled = ?, source_issuer_id = ?, source_connection_id = ?,
+                            source_revision = ?, updated_at = ?
+                        WHERE user_id = ?;
+                    """, (
+                        target_conn_id, payload["name"], payload["mode"], payload["balancer_strategy"],
+                        target_rev, target_enabled, payload.get("issuer_id"), payload.get("id"),
+                        payload.get("revision"), now_iso, u_id
+                    ))
+                else:
+                    c.execute("""
+                        INSERT INTO user_openflux_config (
+                            user_id, enabled, connection_id, name, mode, balancer_strategy,
+                            revision, source_issuer_id, source_connection_id, source_revision, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """, (
+                        u_id, target_enabled, target_conn_id, payload["name"], payload["mode"],
+                        payload["balancer_strategy"], target_rev, payload.get("issuer_id"), payload.get("id"),
+                        payload.get("revision"), now_iso
+                    ))
+
+                c.execute("DELETE FROM user_openflux_selection WHERE user_id = ?;", (u_id,))
+                for pos, gid in enumerate(target_group_ids):
+                    c.execute("""
+                        INSERT INTO user_openflux_selection (user_id, group_id, position)
+                        VALUES (?, ?, ?);
+                    """, (u_id, gid, pos))
+
+                c.execute("""
+                    UPDATE users
+                    SET revision = revision + 1, updated_at = ?
+                    WHERE id = ?;
+                """, (now_iso, u_id))
+        except Exception as e:
+            return 500, {"error": f"Database transaction failed: {e}"}
+
+        return self.get_user_openflux(u_id)
+
     def import_local_openflux_groups(self, instances_dir: str = "/etc/openflux/instances", pool_mode_file: str = "/etc/openflux/pool.mode") -> tuple[int, dict]:
         """
         Безопасный импорт локально настроенных инстансов OpenFlux (слоты 1..8) в каталог БД.
@@ -2952,18 +3371,20 @@ class SubscriptionApp:
         enabled = 1 if data.get("enabled", True) in (True, 1, "true", "1") else 0
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+        fp = str(data.get("fingerprint") or compute_webdav_canonical_fingerprint(test_conn))
+
         with self.conn:
             self.conn.execute("""
                 INSERT INTO webdav_connections (
                     id, name, enabled, revision, url, username, password, backends_json,
                     timeout, poll_min, poll_max, coalesce, chunk_size, puts, read_min, read_max,
-                    enc, dns, created_at, updated_at
-                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    enc, dns, fingerprint, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
                 conn_id, name, enabled, clean_primary["url"], clean_primary["username"], clean_primary["password"],
                 json.dumps(clean_backends), clean_tuning["timeout"], clean_tuning["poll_min"], clean_tuning["poll_max"],
                 clean_tuning["coalesce"], clean_tuning["chunk_size"], clean_tuning["puts"], clean_tuning["read_min"],
-                clean_tuning["read_max"], clean_tuning["enc"], clean_tuning["dns"], now, now
+                clean_tuning["read_max"], clean_tuning["enc"], clean_tuning["dns"], fp, now, now
             ))
 
         return 201, {
@@ -2978,7 +3399,7 @@ class SubscriptionApp:
             **clean_tuning,
             "uri": uri,
             "created_at": now,
-            "updated_at": now
+            "updated_at": now,
         }
 
     def update_webdav_connection(self, conn_id: str, data: dict) -> tuple[int, dict]:
@@ -3068,6 +3489,7 @@ class SubscriptionApp:
         if not ok_ser:
             return 400, {"error": f"WebDAV URI serialization error: {err_ser}"}
 
+        fp = compute_webdav_canonical_fingerprint(test_conn)
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         new_rev = cur["revision"] + 1
 
@@ -3079,13 +3501,14 @@ class SubscriptionApp:
                 UPDATE webdav_connections SET
                     name = ?, enabled = ?, revision = ?, url = ?, username = ?, password = ?,
                     backends_json = ?, timeout = ?, poll_min = ?, poll_max = ?, coalesce = ?,
-                    chunk_size = ?, puts = ?, read_min = ?, read_max = ?, enc = ?, dns = ?, updated_at = ?
+                    chunk_size = ?, puts = ?, read_min = ?, read_max = ?, enc = ?, dns = ?,
+                    fingerprint = ?, updated_at = ?
                 WHERE id = ?;
             """, (
                 name, enabled, new_rev, clean_primary["url"], clean_primary["username"], clean_primary["password"],
                 json.dumps(clean_backends), clean_tuning["timeout"], clean_tuning["poll_min"], clean_tuning["poll_max"],
                 clean_tuning["coalesce"], clean_tuning["chunk_size"], clean_tuning["puts"], clean_tuning["read_min"],
-                clean_tuning["read_max"], clean_tuning["enc"], clean_tuning["dns"], now, conn_id
+                clean_tuning["read_max"], clean_tuning["enc"], clean_tuning["dns"], fp, now, conn_id
             ))
 
             for u_id in affected_users:
@@ -3135,6 +3558,49 @@ class SubscriptionApp:
         ok, err, parsed = parse_webdav_uri(uri)
         if not ok:
             return 400, {"error": f"Failed to parse WebDAV URI: {err}"}
+
+        fp = compute_webdav_canonical_fingerprint(parsed)
+        parsed["fingerprint"] = fp
+
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM webdav_connections WHERE fingerprint = ?;", (fp,))
+        existing = c.fetchone()
+        if existing:
+            try:
+                backends = json.loads(existing["backends_json"])
+            except Exception:
+                backends = []
+            exist_conn = {
+                "id": existing["id"],
+                "name": existing["name"],
+                "enabled": bool(existing["enabled"]),
+                "revision": existing["revision"],
+                "url": existing["url"],
+                "username": existing["username"],
+                "password": existing["password"],
+                "backends": backends,
+                "backends_count": len(backends),
+                "timeout": existing["timeout"],
+                "poll_min": existing["poll_min"],
+                "poll_max": existing["poll_max"],
+                "coalesce": existing["coalesce"],
+                "chunk_size": existing["chunk_size"],
+                "puts": existing["puts"],
+                "read_min": existing["read_min"],
+                "read_max": existing["read_max"],
+                "enc": existing["enc"],
+                "dns": existing["dns"],
+            }
+            return 200, {
+                "success": True,
+                "duplicate": True,
+                "existing": True,
+                "id": existing["id"],
+                "name": existing["name"],
+                "connection": exist_conn,
+                "parsed": parsed,
+                "message": f"Connection already exists in catalog as '{existing['name']}'"
+            }
 
         if data.get("save"):
             return self.create_webdav_connection(parsed)
@@ -3218,7 +3684,15 @@ class SubscriptionApp:
                 "backends_count": len(backends),
                 "backends": backends if isinstance(backends, list) else [],
                 "timeout": r["timeout"],
+                "poll_min": r["poll_min"],
+                "poll_max": r["poll_max"],
+                "coalesce": r["coalesce"],
+                "chunk_size": r["chunk_size"],
+                "puts": r["puts"],
+                "read_min": r["read_min"],
+                "read_max": r["read_max"],
                 "enc": r["enc"],
+                "dns": r["dns"],
             })
 
         return 200, {
@@ -3357,6 +3831,274 @@ class SubscriptionApp:
             "uris": uris,
             "count": len(uris)
         }
+
+    def export_user_webdav(self, user_id_or_nick: str, conn_id: str = None) -> tuple[int, dict]:
+        """
+        Экспорт подключений WebDAV для пользователя в каноническом формате TUNA rc9:
+        - Если передан conn_id: экспортирует ровно одну назначенную пользователю запись.
+        - Если conn_id не передан: экспортирует список всех назначенных пользователю записей.
+        - Независим от статуса публикации в подписке (чистый read-only).
+        - Полный WebDAV URI включает основной URL и все вложенные backends.
+        - НЕ использует вымышленную схему webdav-bundle:// (контракт rc9).
+        """
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id_or_nick, user_id_or_nick))
+        user = c.fetchone()
+        if not user:
+            return 404, {"error": "User not found"}
+        u_id = user["id"]
+
+        if conn_id:
+            c.execute("""
+                SELECT c.* FROM user_webdav_selection s
+                JOIN webdav_connections c ON s.connection_id = c.id
+                WHERE s.user_id = ? AND c.id = ?;
+            """, (u_id, conn_id))
+            row = c.fetchone()
+            if not row:
+                return 404, {"error": f"WebDAV connection '{conn_id}' is not assigned to user '{user['nickname']}'"}
+            conns = [row]
+        else:
+            c.execute("""
+                SELECT c.* FROM user_webdav_selection s
+                JOIN webdav_connections c ON s.connection_id = c.id
+                WHERE s.user_id = ?
+                ORDER BY s.position ASC;
+            """, (u_id,))
+            conns = c.fetchall()
+
+        items = []
+        uris = []
+        for r in conns:
+            try:
+                backends = json.loads(r["backends_json"])
+            except Exception:
+                backends = []
+            c_dict = {
+                "name": r["name"],
+                "url": r["url"],
+                "username": r["username"],
+                "password": r["password"],
+                "backends": backends,
+                "timeout": r["timeout"],
+                "poll_min": r["poll_min"],
+                "poll_max": r["poll_max"],
+                "coalesce": r["coalesce"],
+                "chunk_size": r["chunk_size"],
+                "puts": r["puts"],
+                "read_min": r["read_min"],
+                "read_max": r["read_max"],
+                "enc": r["enc"],
+                "dns": r["dns"],
+            }
+            ok_u, err_u, uri = serialize_webdav_uri(c_dict)
+            if not ok_u:
+                return 500, {"error": f"Failed to serialize WebDAV URI for '{r['name']}': {err_u}"}
+            items.append({
+                "id": r["id"],
+                "name": r["name"],
+                "uri": uri
+            })
+            uris.append(uri)
+
+        if conn_id:
+            return 200, {
+                "success": True,
+                "connection_id": items[0]["id"],
+                "name": items[0]["name"],
+                "uri": items[0]["uri"],
+                "user_id": u_id,
+                "nickname": user["nickname"],
+            }
+
+        return 200, {
+            "success": True,
+            "total": len(items),
+            "connections": items,
+            "uris": uris,
+            "user_id": u_id,
+            "nickname": user["nickname"],
+        }
+
+    def import_user_webdav(self, user_id_or_nick: str, data: dict) -> tuple[int, dict]:
+        """
+        Импорт одного или нескольких WebDAV URI и назначение текущему пользователю:
+        - Поддержка одиночного URI ('uri': str) или пачки ('uris': list[str]).
+        - Валидация всех URI до записи (атомарность, ошибка не оставляет полкаталога).
+        - Распознавание повторного импорта по каноническому отпечатку (SHA256).
+        - Предпросмотр с маскировкой паролей и токеном состояния (expected_state_token).
+        - Не создает дубликатов в каталоге и не перезаписывает по совпадению имени.
+        - Не назначает повторно уже привязанное к пользователю подключение.
+        - Контроль лимита: максимум 8 подключений на пользователя.
+        """
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id_or_nick, user_id_or_nick))
+        user = c.fetchone()
+        if not user:
+            return 404, {"error": "User not found"}
+        u_id = user["id"]
+
+        raw_uri = data.get("uri")
+        raw_uris = data.get("uris")
+        uris_to_process = []
+        if raw_uris and isinstance(raw_uris, list):
+            uris_to_process = [str(u).strip() for u in raw_uris if str(u).strip()]
+        elif raw_uri and isinstance(raw_uri, str) and raw_uri.strip():
+            uris_to_process = [raw_uri.strip()]
+        else:
+            return 400, {"error": "Field 'uri' (string) or 'uris' (list of strings) is required"}
+
+        if not uris_to_process:
+            return 400, {"error": "No non-empty WebDAV URI provided"}
+
+        # Валидация ВСЕХ URI до любых изменений
+        parsed_items = []
+        for idx, u_str in enumerate(uris_to_process, 1):
+            ok_p, err_p, parsed = parse_webdav_uri(u_str)
+            if not ok_p:
+                return 400, {"error": f"Invalid WebDAV URI at position #{idx}: {err_p}"}
+            fp = compute_webdav_canonical_fingerprint(parsed)
+            parsed["_fingerprint"] = fp
+            parsed_items.append(parsed)
+
+        # Текущие назначения пользователя и проверка лимита
+        c.execute("SELECT * FROM user_webdav_config WHERE user_id = ?;", (u_id,))
+        wd_cfg = c.fetchone()
+        c.execute("""
+            SELECT s.connection_id, c.fingerprint, c.name, s.position
+            FROM user_webdav_selection s
+            JOIN webdav_connections c ON s.connection_id = c.id
+            WHERE s.user_id = ?
+            ORDER BY s.position ASC;
+        """, (u_id,))
+        cur_sel = c.fetchall()
+        cur_conn_ids = [r["connection_id"] for r in cur_sel]
+        cur_fps = {r["fingerprint"] for r in cur_sel if r["fingerprint"]}
+
+        cur_state_token = compute_user_webdav_state_token(u_id, wd_cfg, cur_sel)
+
+        # Подсчет сколько подключений будет реально добавлено
+        new_unique_fps = set()
+        for p in parsed_items:
+            if p["_fingerprint"] not in cur_fps:
+                new_unique_fps.add(p["_fingerprint"])
+
+        total_after = len(cur_sel) + len(new_unique_fps)
+        if total_after > MAX_WEBDAV_CONNECTIONS:
+            return 400, {
+                "error": f"Import would result in {total_after} connections for user '{user['nickname']}', "
+                         f"which exceeds the maximum limit of {MAX_WEBDAV_CONNECTIONS} (currently assigned: {len(cur_sel)})."
+            }
+
+        is_commit = bool(data.get("commit", False))
+        if data.get("preview_only") is True:
+            is_commit = False
+
+        if not is_commit:
+            # ФАЗА ПРЕДПРОСМОТРА
+            preview_list = []
+            for p in parsed_items:
+                c.execute("SELECT id, name FROM webdav_connections WHERE fingerprint = ?;", (p["_fingerprint"],))
+                exist_cat = c.fetchone()
+                is_assigned = p["_fingerprint"] in cur_fps
+                backends_preview = []
+                for b in p.get("backends", []):
+                    backends_preview.append({
+                        "url": b.get("url"),
+                        "username": b.get("username"),
+                        "password_masked": mask_secret(b.get("password", "")),
+                        "label": b.get("label", ""),
+                    })
+                preview_list.append({
+                    "name": p.get("name"),
+                    "url": p.get("url"),
+                    "username": p.get("username"),
+                    "password_masked": mask_secret(p.get("password", "")),
+                    "backends_count": len(p.get("backends", [])),
+                    "backends": backends_preview,
+                    "timeout": p.get("timeout"),
+                    "enc": p.get("enc"),
+                    "dns": p.get("dns"),
+                    "exists_in_catalog": bool(exist_cat),
+                    "catalog_connection_id": exist_cat["id"] if exist_cat else None,
+                    "already_assigned_to_user": is_assigned,
+                })
+            return 200, {
+                "success": True,
+                "preview": True,
+                "state_token": cur_state_token,
+                "total_input_uris": len(parsed_items),
+                "new_connections_to_attach": len(new_unique_fps),
+                "total_after_import": total_after,
+                "connections": preview_list,
+            }
+
+        # ФАЗА КОММИТА
+        expected_token = data.get("expected_state_token")
+        if expected_token and expected_token != cur_state_token:
+            return 409, {"error": "Configuration changed since preview. Please request a new preview before committing."}
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            with self.conn:
+                max_pos = -1
+                if cur_sel:
+                    max_pos = max(r["position"] for r in cur_sel)
+
+                for p in parsed_items:
+                    fp = p["_fingerprint"]
+                    # 1. Поиск или создание в каталоге
+                    c.execute("SELECT id FROM webdav_connections WHERE fingerprint = ?;", (fp,))
+                    exist_row = c.fetchone()
+                    if exist_row:
+                        target_cid = exist_row["id"]
+                    else:
+                        target_cid = str(uuid.uuid4()).lower()
+                        c.execute("""
+                            INSERT INTO webdav_connections (
+                                id, name, enabled, revision, url, username, password, backends_json,
+                                timeout, poll_min, poll_max, coalesce, chunk_size, puts, read_min, read_max,
+                                enc, dns, fingerprint, created_at, updated_at
+                            ) VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """, (
+                            target_cid, p["name"], p["url"], p["username"], p["password"],
+                            json.dumps(p.get("backends", [])), p["timeout"], p["poll_min"], p["poll_max"],
+                            p["coalesce"], p["chunk_size"], p["puts"], p["read_min"], p["read_max"],
+                            p["enc"], p["dns"], fp, now_iso, now_iso
+                        ))
+
+                    # 2. Привязка к пользователю (если еще не привязано)
+                    if fp not in cur_fps and target_cid not in cur_conn_ids:
+                        max_pos += 1
+                        c.execute("""
+                            INSERT INTO user_webdav_selection (user_id, connection_id, position, enabled)
+                            VALUES (?, ?, ?, 1);
+                        """, (u_id, target_cid, max_pos))
+                        cur_fps.add(fp)
+                        cur_conn_ids.append(target_cid)
+
+                # 3. Обновление ревизии
+                if wd_cfg:
+                    c.execute("""
+                        UPDATE user_webdav_config
+                        SET revision = revision + 1, updated_at = ?
+                        WHERE user_id = ?;
+                    """, (now_iso, u_id))
+                else:
+                    c.execute("""
+                        INSERT INTO user_webdav_config (user_id, enabled, revision, updated_at)
+                        VALUES (?, 1, 1, ?);
+                    """, (u_id, now_iso))
+
+                c.execute("""
+                    UPDATE users
+                    SET revision = revision + 1, updated_at = ?
+                    WHERE id = ?;
+                """, (now_iso, u_id))
+        except Exception as e:
+            return 500, {"error": f"Database transaction failed: {e}"}
+
+        return self.get_user_webdav(u_id)
 
     def get_subscription_payload(self, token: str, if_none_match: str = None) -> tuple[int, dict, bytes]:
         """
@@ -3619,6 +4361,14 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             self.send_json(status, res)
             return
 
+        # OpenFlux user export: GET /api/users/<id_or_nickname>/openflux/export
+        m_of_export = re.match(r"^/api/users/([^/]+)/openflux/export$", path)
+        if m_of_export:
+            user_id = unquote(m_of_export.group(1))
+            status, res = self.app.export_user_openflux(user_id)
+            self.send_json(status, res)
+            return
+
         # GET /api/users/<id_or_nickname>/openflux
         m_of_user = re.match(r"^/api/users/([^/]+)/openflux$", path)
         if m_of_user:
@@ -3642,6 +4392,16 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             include_secrets = qs.get("secrets", ["0"])[0] in ("1", "true", "yes") or qs.get("include_secrets", ["0"])[0] in ("1", "true", "yes")
             status, res = self.app.get_webdav_connection(conn_id, include_secrets=include_secrets)
+            self.send_json(status, res)
+            return
+
+        # GET /api/users/<id_or_nickname>/webdav/export
+        m_wd_export = re.match(r"^/api/users/([^/]+)/webdav/export$", path)
+        if m_wd_export:
+            user_id = unquote(m_wd_export.group(1))
+            qs = parse_qs(parsed.query)
+            conn_id = qs.get("conn_id", [None])[0] or qs.get("connection_id", [None])[0]
+            status, res = self.app.export_user_webdav(user_id, conn_id=conn_id)
             self.send_json(status, res)
             return
 
@@ -3773,6 +4533,34 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
                 self.send_json(code, {"error": str(e)})
                 return
             status, res = self.app.create_user(data)
+            self.send_json(status, res)
+            return
+
+        # POST /api/users/<id_or_nickname>/openflux/import
+        m_of_import = re.match(r"^/api/users/([^/]+)/openflux/import$", path)
+        if m_of_import:
+            user_id = unquote(m_of_import.group(1))
+            try:
+                data = self.read_json_body()
+            except ValueError as e:
+                code = 413 if "Payload Too Large" in str(e) else 400
+                self.send_json(code, {"error": str(e)})
+                return
+            status, res = self.app.import_user_openflux(user_id, data)
+            self.send_json(status, res)
+            return
+
+        # POST /api/users/<id_or_nickname>/webdav/import
+        m_wd_import = re.match(r"^/api/users/([^/]+)/webdav/import$", path)
+        if m_wd_import:
+            user_id = unquote(m_wd_import.group(1))
+            try:
+                data = self.read_json_body()
+            except ValueError as e:
+                code = 413 if "Payload Too Large" in str(e) else 400
+                self.send_json(code, {"error": str(e)})
+                return
+            status, res = self.app.import_user_webdav(user_id, data)
             self.send_json(status, res)
             return
 

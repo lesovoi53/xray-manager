@@ -5468,6 +5468,182 @@ ${ul}"
     done
 }
 
+export_user_openflux_sub() {
+    local SUB_API="http://127.0.0.1:22217"
+    local uid="$1"
+    local u_nick="$2"
+    [ -z "$uid" ] && return
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ЭКСПОРТ РЕКВИЗИТОВ OPENFLUX ДЛЯ ДРУГОГО СЕРВЕРА             ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    local resp=$(curl -s -w "\n%{http_code}" "${SUB_API}/api/users/${uid}/openflux/export" 2>/dev/null)
+    local http_code=$(echo "$resp" | tail -n 1)
+    local body=$(echo "$resp" | sed '$d')
+
+    if [ "$http_code" -ne 200 ]; then
+        local err_msg=$(echo "$body" | jq -r '.error // "Неизвестная ошибка сервера"' 2>/dev/null || echo "Ошибка запроса")
+        echo -e "${RED}Ошибка экспорта: ${err_msg}${NC}"
+        echo ""
+        read -p "Нажмите Enter для возврата..."
+        return
+    fi
+
+    local exp_uri=$(echo "$body" | jq -r '.uri // ""')
+    local exp_name=$(echo "$body" | jq -r '.name // "OpenFlux"')
+    local exp_mode=$(echo "$body" | jq -r '.mode // "classic"')
+    local exp_bal=$(echo "$body" | jq -r '.balancer_strategy // "roundRobin"')
+    local exp_gcnt=$(echo "$body" | jq -r '.groups_count // 0')
+    local exp_urls=$(echo "$body" | jq -r '.total_urls // 0')
+    local exp_rev=$(echo "$body" | jq -r '.revision // 1')
+    local exp_en=$(echo "$body" | jq -r '.enabled // false')
+
+    local en_str="🟢 Включена"
+    [ "$exp_en" != "true" ] && en_str="🔴 Отключена (выгружено в read-only)"
+
+    echo -e "  Пользователь:  ${GREEN}${BOLD}${u_nick}${NC}"
+    echo -e "  Имя бандла:    ${BOLD}${exp_name}${NC}"
+    echo -e "  Режим:         ${YELLOW}${exp_mode}${NC} | Балансировщик: ${MAGENTA}${exp_bal}${NC}"
+    echo -e "  Групп:         ${YELLOW}${exp_gcnt}${NC} | Всего URL: ${YELLOW}${exp_urls}${NC} | Ревизия: ${exp_rev}"
+    echo -e "  Публикация:    ${en_str}"
+    echo ""
+    echo -e "${BOLD}Готовая переносимая ссылка подключения OpenFlux v2:${NC}"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}${exp_uri}${NC}"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${GRAY}Скопируйте эту ссылку целиком для импорта на целевом сервере подписок.${NC}"
+    echo ""
+
+    read -p "Сохранить ссылку в локальный файл? [y/N]: " save_f
+    case "$save_f" in
+        y|Y|д|Д)
+            local def_path="/root/openflux_${u_nick}.bundle"
+            read -p "Путь к файлу [${def_path}]: " target_path
+            target_path="${target_path:-$def_path}"
+            printf "%s\n" "$exp_uri" > "$target_path"
+            chmod 600 "$target_path"
+            echo -e "${GREEN}✓ Ссылка успешно сохранена в ${target_path} (права 0600)${NC}"
+            ;;
+    esac
+
+    echo ""
+    read -p "Нажмите Enter для возврата..."
+}
+
+import_user_openflux_sub() {
+    local SUB_API="http://127.0.0.1:22217"
+    local uid="$1"
+    local u_nick="$2"
+    [ -z "$uid" ] && return
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ИМПОРТ РЕКВИЗИТОВ OPENFLUX С ДРУГОГО СЕРВЕРА                ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "Импорт переносит настройки туннеля OpenFlux (режим, балансировщик,"
+    echo -e "группы, URL и ключи) в локальный каталог и привязывает их к пользователю."
+    echo -e "${YELLOW}Токен подписки пользователя и локальный issuer_id сохраняются.${NC}"
+    echo ""
+
+    read -p "Вставьте ссылку openflux-bundle://v2/... или путь к файлу: " raw_input
+    raw_input=$(echo "$raw_input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -z "$raw_input" ] && return
+
+    local uri_to_import=""
+    if [ -f "$raw_input" ]; then
+        uri_to_import=$(head -n 1 "$raw_input" | tr -d '\r\n[:space:]')
+    else
+        uri_to_import=$(echo "$raw_input" | tr -d '\r\n[:space:]')
+    fi
+
+    if [[ ! "$uri_to_import" =~ ^openflux-bundle://v2/ ]]; then
+        echo -e "${RED}Ошибка: строка должна начинаться с openflux-bundle://v2/ или указывать на существующий файл.${NC}"
+        echo ""
+        read -p "Нажмите Enter для возврата..."
+        return
+    fi
+
+    echo ""
+    echo -e "${CYAN}Запрос предварительного просмотра (dry-run)...${NC}"
+    local p_req=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'commit': False}))" "$uri_to_import")
+    local resp=$(curl -s -w "\n%{http_code}" -X POST "${SUB_API}/api/users/${uid}/openflux/import" \
+        -H "Content-Type: application/json" -d "$p_req" 2>/dev/null)
+    local http_code=$(echo "$resp" | tail -n 1)
+    local body=$(echo "$resp" | sed '$d')
+
+    if [ "$http_code" -ne 200 ]; then
+        local err_msg=$(echo "$body" | jq -r '.error // "Ошибка предпросмотра"' 2>/dev/null || echo "Ошибка запроса")
+        echo -e "${RED}Ошибка предпросмотра импорта: ${err_msg}${NC}"
+        echo ""
+        read -p "Нажмите Enter для возврата..."
+        return
+    fi
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ПРЕДПРОСМОТР ИМПОРТИРУЕМОЙ КОНФИГУРАЦИИ OPENFLUX           ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+print(f"  Пользователь:         \033[1;32m{sys.argv[2]}\033[0m")
+print(f"  Имя подключения:      \033[1m{data.get(\"name\", \"\")}\033[0m")
+print(f"  Режим:                \033[1;33m{data.get(\"mode\", \"\")}\033[0m")
+print(f"  Балансировщик:        \033[1;35m{data.get(\"balancer_strategy\", \"\")}\033[0m")
+grps = data.get("groups", [])
+print(f"  Групп в бандле:       \033[1;33m{len(grps)}\033[0m")
+print("")
+print("\033[1mГруппы и параметры туннелей:\033[0m")
+for i, g in enumerate(grps, 1):
+    gnm = g.get("name", "")
+    tr = g.get("transport", "")
+    md = g.get("mode", "")
+    cd = g.get("codec", "legacy")
+    urls = g.get("urls", [])
+    m_key = g.get("masked_encryption_key") or "(без ключа)"
+    print(f"  \033[1;33m[{i}]\033[0m \033[1;32m{gnm}\033[0m — {tr} | {md} | {cd} | URLs: {len(urls)} | ключ: \033[36m{m_key}\033[0m")
+' "$body" "$u_nick"
+
+    local state_token=$(echo "$body" | jq -r '.state_token // ""')
+
+    echo ""
+    echo -e "${YELLOW}⚠️  ВНИМАНИЕ: Настройки OpenFlux пользователя ${u_nick} будут полностью заменены.${NC}"
+    echo -e "${GRAY}Текущий статус публикации в подписке сохранится. Ревизия подписки будет увеличена.${NC}"
+    echo ""
+    read -p "Применить импортированную конфигурацию? [y/N]: " do_commit
+    case "$do_commit" in
+        y|Y|д|Д)
+            local c_req=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'commit': True, 'expected_state_token': sys.argv[2]}))" "$uri_to_import" "$state_token")
+            local c_resp=$(curl -s -w "\n%{http_code}" -X POST "${SUB_API}/api/users/${uid}/openflux/import" \
+                -H "Content-Type: application/json" -d "$c_req" 2>/dev/null)
+            local c_code=$(echo "$c_resp" | tail -n 1)
+            local c_body=$(echo "$c_resp" | sed '$d')
+
+            if [ "$c_code" -eq 200 ]; then
+                echo -e "${GREEN}✓ Конфигурация OpenFlux успешно импортирована и привязана к пользователю!${NC}"
+            elif [ "$c_code" -eq 409 ]; then
+                echo -e "${RED}Ошибка 409: Конфигурация пользователя изменилась параллельно. Повторите импорт.${NC}"
+            else
+                local c_err=$(echo "$c_body" | jq -r '.error // "Ошибка применения"' 2>/dev/null || echo "Ошибка запроса")
+                echo -e "${RED}Ошибка импорта: ${c_err}${NC}"
+            fi
+            ;;
+        *)
+            echo -e "${YELLOW}Импорт отменен.${NC}"
+            ;;
+    esac
+
+    echo ""
+    read -p "Нажмите Enter для возврата..."
+}
+
 edit_user_openflux_sub() {
     local SUB_API="http://127.0.0.1:22217"
     local uid="$1"
@@ -5532,9 +5708,11 @@ except Exception as e:
         echo -e "  ${YELLOW}[5]${NC} 📑 ${BOLD}Выбрать и упорядочить группы из каталога${NC} (1–8 групп)"
         echo -e "  ${YELLOW}[6]${NC} 🎲 ${BOLD}Сгенерировать новый connection_id (UUID)${NC}"
         echo -e "  ${YELLOW}[7]${NC} 👁️  ${BOLD}Предпросмотр бандла v2 (JSON payload и URI)${NC}"
+        echo -e "  ${YELLOW}[8]${NC} 📤 ${BOLD}Экспортировать ссылку подключения для другого сервера${NC}"
+        echo -e "  ${YELLOW}[9]${NC} 📥 ${BOLD}Импортировать ссылку подключения с другого сервера${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад к редактированию пользователя"
         echo ""
-        read -p "Выберите действие [0-7]: " of_act
+        read -p "Выберите действие [0-9]: " of_act
         case "$of_act" in
             1)
                 local new_en="true"
@@ -5716,6 +5894,12 @@ except Exception as e:
 ' "$cfg_json"
                 echo ""
                 read -p "Нажмите Enter для возврата..."
+                ;;
+            8)
+                export_user_openflux_sub "$uid" "$u_nick"
+                ;;
+            9)
+                import_user_openflux_sub "$uid" "$u_nick"
                 ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
@@ -6926,6 +7110,354 @@ for idx, u in enumerate(uris, 1):
     read -p "Нажмите Enter для возврата..."
 }
 
+export_user_webdav_sub() {
+    local SUB_API="http://127.0.0.1:22217"
+    local uid="$1"
+    local u_nick="$2"
+    [ -z "$uid" ] && return
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ЭКСПОРТ РЕКВИЗИТОВ WEBDAV ДЛЯ ДРУГОГО СЕРВЕРА               ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    local resp=$(curl -s -w "\n%{http_code}" "${SUB_API}/api/users/${uid}/webdav/export" 2>/dev/null)
+    local http_code=$(echo "$resp" | tail -n 1)
+    local body=$(echo "$resp" | sed '$d')
+
+    if [ "$http_code" -ne 200 ]; then
+        local err_msg=$(echo "$body" | jq -r '.error // "Ошибка сервера"' 2>/dev/null || echo "Ошибка запроса")
+        echo -e "${RED}Ошибка экспорта: ${err_msg}${NC}"
+        echo ""
+        read -p "Нажмите Enter для возврата..."
+        return
+    fi
+
+    local count=$(echo "$body" | jq -r '.count // 0')
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}У пользователя ${u_nick} нет привязанных подключений WebDAV.${NC}"
+        echo ""
+        read -p "Нажмите Enter для возврата..."
+        return
+    fi
+
+    if [ "$count" -eq 1 ]; then
+        local single_uri=$(echo "$body" | jq -r '.uris[0] // ""')
+        echo -e "  Пользователь: ${GREEN}${BOLD}${u_nick}${NC}"
+        echo -e "  Подключений:  ${YELLOW}1${NC}"
+        echo ""
+        echo -e "${BOLD}Готовая переносимая ссылка подключения WebDAV (TUNA rc9):${NC}"
+        echo -e "${CYAN}════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}${single_uri}${NC}"
+        echo -e "${CYAN}════════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        read -p "Сохранить ссылку в локальный файл? [y/N]: " save_f
+        case "$save_f" in
+            y|Y|д|Д)
+                local def_path="/root/webdav_${u_nick}.uri"
+                read -p "Путь к файлу [${def_path}]: " target_path
+                target_path="${target_path:-$def_path}"
+                printf "%s\n" "$single_uri" > "$target_path"
+                chmod 600 "$target_path"
+                echo -e "${GREEN}✓ Ссылка сохранена в ${target_path} (права 0600)${NC}"
+                ;;
+        esac
+    else
+        echo -e "  Пользователь: ${GREEN}${BOLD}${u_nick}${NC}"
+        echo -e "  Подключений:  ${YELLOW}${count}${NC}"
+        echo ""
+        echo -e "${BOLD}Доступные варианты экспорта:${NC}"
+        echo -e "  ${YELLOW}[a]${NC} 📁 ${BOLD}Экспортировать ВСЕ подключения в файл списком${NC} (по 1 строке на URI)"
+        python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+uris = data.get("uris", [])
+for idx, u in enumerate(uris, 1):
+    tag = u.split("#")[-1] if "#" in u else f"Connection {idx}"
+    print(f"  \033[1;33m[{idx}]\033[0m 🔗 Показать и сохранить только: \033[1;32m{tag}\033[0m")
+' "$body"
+        echo -e "  ${YELLOW}[0]${NC} ⬅️  Отмена"
+        echo ""
+        read -p "Выберите вариант [a / 1-${count} / 0]: " exp_choice
+        case "$exp_choice" in
+            a|A|ф|Ф)
+                local def_path="/root/webdav_${u_nick}_all.txt"
+                read -p "Путь к файлу для сохранения всех URI [${def_path}]: " target_path
+                target_path="${target_path:-$def_path}"
+                python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    for u in data.get("uris", []):
+        f.write(u + "\n")
+' "$body" "$target_path"
+                chmod 600 "$target_path"
+                echo -e "${GREEN}✓ Все ${count} URI сохранены в ${target_path} (права 0600)${NC}"
+                ;;
+            0)
+                return
+                ;;
+            *)
+                if [[ "$exp_choice" =~ ^[0-9]+$ ]] && [ "$exp_choice" -ge 1 ] && [ "$exp_choice" -le "$count" ]; then
+                    local idx_0=$((exp_choice - 1))
+                    local picked_uri=$(echo "$body" | jq -r ".uris[${idx_0}] // \"\"")
+                    echo ""
+                    echo -e "${BOLD}Ссылка подключения #${exp_choice}:${NC}"
+                    echo -e "${CYAN}════════════════════════════════════════════════════════════════════════${NC}"
+                    echo -e "${YELLOW}${picked_uri}${NC}"
+                    echo -e "${CYAN}════════════════════════════════════════════════════════════════════════${NC}"
+                    echo ""
+                    read -p "Сохранить ссылку в локальный файл? [y/N]: " save_f
+                    case "$save_f" in
+                        y|Y|д|Д)
+                            local def_path="/root/webdav_${u_nick}_conn${exp_choice}.uri"
+                            read -p "Путь к файлу [${def_path}]: " target_path
+                            target_path="${target_path:-$def_path}"
+                            printf "%s\n" "$picked_uri" > "$target_path"
+                            chmod 600 "$target_path"
+                            echo -e "${GREEN}✓ Ссылка сохранена в ${target_path} (права 0600)${NC}"
+                            ;;
+                    esac
+                else
+                    echo -e "${RED}Неверный выбор.${NC}"
+                fi
+                ;;
+        esac
+    fi
+
+    echo ""
+    read -p "Нажмите Enter для возврата..."
+}
+
+import_user_webdav_sub() {
+    local SUB_API="http://127.0.0.1:22217"
+    local uid="$1"
+    local u_nick="$2"
+    [ -z "$uid" ] && return
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}          ИМПОРТ РЕКВИЗИТОВ WEBDAV С ДРУГОГО СЕРВЕРА                  ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${YELLOW}[1]${NC} 🔗 ${BOLD}Одиночная ссылка подключения${NC} (webdav:// или webdavs://)"
+    echo -e "  ${YELLOW}[2]${NC} 📑 ${BOLD}Пакетный импорт из файла / списка${NC} (по 1 ссылке на строку)"
+    echo -e "  ${YELLOW}[0]${NC} ⬅️  Отмена"
+    echo ""
+    read -p "Выберите вариант [0-2]: " imp_mode
+    case "$imp_mode" in
+        1)
+            echo ""
+            read -p "Вставьте ссылку webdav://... или путь к файлу: " raw_input
+            raw_input=$(echo "$raw_input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$raw_input" ] && return
+
+            local uri_to_import=""
+            if [ -f "$raw_input" ]; then
+                uri_to_import=$(head -n 1 "$raw_input" | tr -d '\r\n[:space:]')
+            else
+                uri_to_import=$(echo "$raw_input" | tr -d '\r\n[:space:]')
+            fi
+
+            if [[ ! "$uri_to_import" =~ ^webdavs?:// ]]; then
+                echo -e "${RED}Ошибка: ссылка должна начинаться с webdav:// или webdavs://${NC}"
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                return
+            fi
+
+            echo -e "${CYAN}Запрос предварительного просмотра (dry-run)...${NC}"
+            local p_req=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'commit': False}))" "$uri_to_import")
+            local resp=$(curl -s -w "\n%{http_code}" -X POST "${SUB_API}/api/users/${uid}/webdav/import" \
+                -H "Content-Type: application/json" -d "$p_req" 2>/dev/null)
+            local http_code=$(echo "$resp" | tail -n 1)
+            local body=$(echo "$resp" | sed '$d')
+
+            if [ "$http_code" -ne 200 ]; then
+                local err_msg=$(echo "$body" | jq -r '.error // "Ошибка валидации"' 2>/dev/null || echo "Ошибка запроса")
+                echo -e "${RED}Ошибка предпросмотра: ${err_msg}${NC}"
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                return
+            fi
+
+            clear
+            echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${CYAN}║${BOLD}          ПРЕДПРОСМОТР ИМПОРТИРУЕМОГО WEBDAV ПОДКЛЮЧЕНИЯ              ${CYAN}║${NC}"
+            echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+conns = data.get("preview_connections", [])
+if not conns:
+    print("  \033[1;31mНет данных для предпросмотра\033[0m")
+    sys.exit(0)
+c = conns[0]
+print(f"  Пользователь:           \033[1;32m{sys.argv[2]}\033[0m")
+print(f"  Имя подключения:        \033[1m{c.get(\"name\", \"\")}\033[0m")
+print(f"  Основное хранилище:     \033[36m{c.get(\"url\", \"\")}\033[0m")
+print(f"  Логин / Пароль:         user: {c.get(\"username\", \"\")} | pass: {c.get(\"masked_password\", \"******\")}")
+print(f"  Бэкендов в пуле:        \033[1;33m{c.get(\"backends_count\", 0)}\033[0m")
+cat_status = "\033[1;33mУже в каталоге (дубликат не создается)\033[0m" if c.get("exists_in_catalog") else "\033[1;32mНовое (будет создано в каталоге)\033[0m"
+user_status = "\033[1;33mУже привязано к пользователю\033[0m" if c.get("already_assigned_to_user") else "\033[1;32mБудет привязано к пользователю\033[0m"
+print(f"  Статус в каталоге:      {cat_status}")
+print(f"  Статус у пользователя:  {user_status}")
+print(f"  Подключений после имп.: \033[1;33m{data.get(\"total_connections_after\", 0)} / 8\033[0m")
+
+backends = c.get("backends", [])
+if backends:
+    print("\n  \033[1mБэкенды:\033[0m")
+    for b_idx, b in enumerate(backends, 1):
+        b_lbl = f" [{b.get(\"label\")}]" if b.get("label") else ""
+        print(f"    └── \033[1;33m#{b_idx}\033[0m \033[36m{b.get(\"url\")}\033[0m{b_lbl} (pass: {b.get(\"masked_password\", \"******\")})")
+' "$body" "$u_nick"
+
+            local state_token=$(echo "$body" | jq -r '.state_token // ""')
+
+            echo ""
+            read -p "Применить импорт и привязать подключение к ${u_nick}? [y/N]: " do_commit
+            case "$do_commit" in
+                y|Y|д|Д)
+                    local c_req=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'commit': True, 'expected_state_token': sys.argv[2]}))" "$uri_to_import" "$state_token")
+                    local c_resp=$(curl -s -w "\n%{http_code}" -X POST "${SUB_API}/api/users/${uid}/webdav/import" \
+                        -H "Content-Type: application/json" -d "$c_req" 2>/dev/null)
+                    local c_code=$(echo "$c_resp" | tail -n 1)
+                    local c_body=$(echo "$c_resp" | sed '$d')
+
+                    if [ "$c_code" -eq 200 ]; then
+                        echo -e "${GREEN}✓ Подключение WebDAV успешно импортировано и привязано!${NC}"
+                    elif [ "$c_code" -eq 409 ]; then
+                        echo -e "${RED}Ошибка 409: Конфигурация изменилась во время предпросмотра. Повторите попытку.${NC}"
+                    else
+                        local c_err=$(echo "$c_body" | jq -r '.error // "Ошибка применения"' 2>/dev/null || echo "Ошибка запроса")
+                        echo -e "${RED}Ошибка импорта: ${c_err}${NC}"
+                    fi
+                    ;;
+                *)
+                    echo -e "${YELLOW}Импорт отменен.${NC}"
+                    ;;
+            esac
+            ;;
+
+        2)
+            echo ""
+            read -p "Укажите путь к файлу со ссылками WebDAV: " file_path
+            file_path=$(echo "$file_path" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$file_path" ] && return
+
+            if [ ! -f "$file_path" ]; then
+                echo -e "${RED}Файл не найден: ${file_path}${NC}"
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                return
+            fi
+
+            local p_req=$(python3 -c '
+import json, sys
+lines = []
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+    for line in f:
+        s = line.strip()
+        if s and not s.startswith("#"):
+            lines.append(s)
+print(json.dumps({"uris": lines, "commit": False}))
+' "$file_path" 2>/dev/null || echo "{}")
+
+            local line_cnt=$(echo "$p_req" | jq -r '(.uris // []) | length')
+            if [ "$line_cnt" -eq 0 ]; then
+                echo -e "${YELLOW}Файл пуст или не содержит активных ссылок.${NC}"
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                return
+            fi
+
+            echo -e "${CYAN}Предварительная проверка пакета (${line_cnt} ссылок)...${NC}"
+            local resp=$(curl -s -w "\n%{http_code}" -X POST "${SUB_API}/api/users/${uid}/webdav/import" \
+                -H "Content-Type: application/json" -d "$p_req" 2>/dev/null)
+            local http_code=$(echo "$resp" | tail -n 1)
+            local body=$(echo "$resp" | sed '$d')
+
+            if [ "$http_code" -ne 200 ]; then
+                local err_msg=$(echo "$body" | jq -r '.error // "Ошибка валидации пакета"' 2>/dev/null || echo "Ошибка запроса")
+                echo -e "${RED}Ошибка валидации пакета: ${err_msg}${NC}"
+                echo -e "${GRAY}(Никакие изменения не были внесены в БД)${NC}"
+                echo ""
+                read -p "Нажмите Enter для возврата..."
+                return
+            fi
+
+            clear
+            echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${CYAN}║${BOLD}          ПРЕДПРОСМОТР ПАКЕТНОГО ИМПОРТА WEBDAV (${line_cnt} ПОДКЛЮЧЕНИЙ)        ${CYAN}║${NC}"
+            echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+conns = data.get("preview_connections", [])
+print(f"  Пользователь:           \033[1;32m{sys.argv[2]}\033[0m")
+print(f"  Подключений в пакете:   \033[1;33m{len(conns)}\033[0m")
+print(f"  Подключений после имп.: \033[1;33m{data.get(\"total_connections_after\", 0)} / 8\033[0m\n")
+for idx, c in enumerate(conns, 1):
+    c_nm = c.get("name", "")
+    c_url = c.get("url", "")
+    c_usr = c.get("username", "")
+    c_pw = c.get("masked_password", "******")
+    b_cnt = c.get("backends_count", 0)
+    cat_st = "в каталоге" if c.get("exists_in_catalog") else "новое"
+    u_st = "уже у юзера" if c.get("already_assigned_to_user") else "будет добавлено"
+    print(f"  \033[1;33m[{idx}]\033[0m \033[1;32m{c_nm}\033[0m ({c_url})")
+    print(f"      user: {c_usr}, pass: {c_pw} | бэкендов: {b_cnt} [{cat_st} | {u_st}]")
+' "$body" "$u_nick"
+
+            local state_token=$(echo "$body" | jq -r '.state_token // ""')
+
+            echo ""
+            read -p "Применить пакетный импорт для ${u_nick}? [y/N]: " do_commit
+            case "$do_commit" in
+                y|Y|д|Д)
+                    local c_req=$(python3 -c '
+import json, sys
+p = json.loads(sys.argv[1])
+p["commit"] = True
+p["expected_state_token"] = sys.argv[2]
+print(json.dumps(p))
+' "$p_req" "$state_token")
+                    local c_resp=$(curl -s -w "\n%{http_code}" -X POST "${SUB_API}/api/users/${uid}/webdav/import" \
+                        -H "Content-Type: application/json" -d "$c_req" 2>/dev/null)
+                    local c_code=$(echo "$c_resp" | tail -n 1)
+                    local c_body=$(echo "$c_resp" | sed '$d')
+
+                    if [ "$c_code" -eq 200 ]; then
+                        echo -e "${GREEN}✓ Пакет из ${line_cnt} подключений успешно импортирован!${NC}"
+                    elif [ "$c_code" -eq 409 ]; then
+                        echo -e "${RED}Ошибка 409: Конфигурация изменилась параллельно. Повторите импорт.${NC}"
+                    else
+                        local c_err=$(echo "$c_body" | jq -r '.error // "Ошибка применения"' 2>/dev/null || echo "Ошибка запроса")
+                        echo -e "${RED}Ошибка импорта: ${c_err}${NC}"
+                    fi
+                    ;;
+                *)
+                    echo -e "${YELLOW}Импорт отменен.${NC}"
+                    ;;
+            esac
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}Неверный выбор.${NC}"
+            ;;
+    esac
+
+    echo ""
+    read -p "Нажмите Enter для возврата..."
+}
+
 edit_user_webdav_sub() {
     local SUB_API="http://127.0.0.1:22217"
     local uid="$1"
@@ -7021,6 +7553,8 @@ except Exception as e:
         echo -e "  ${YELLOW}[t]${NC}   ⚡ ${BOLD}Вкл / Выкл публикацию WebDAV${NC} в подписке пользователя"
         echo -e "  ${YELLOW}[s]${NC}   📑 ${BOLD}Выбрать / Упорядочить подключения${NC} из каталога (1–8 подключений)"
         echo -e "  ${YELLOW}[p]${NC}   👁️  ${BOLD}Предпросмотр выдачи WebDAV${NC} для клиента TUNA rc9"
+        echo -e "  ${YELLOW}[e]${NC}   📤 ${BOLD}Экспортировать ссылку подключения${NC} для другого сервера"
+        echo -e "  ${YELLOW}[i]${NC}   📥 ${BOLD}Импортировать ссылку подключения${NC} с другого сервера"
         echo -e "  ${YELLOW}[c]${NC}   📂 ${BOLD}Открыть общий каталог${NC} подключений WebDAV"
         echo -e "  ${YELLOW}[0]${NC}   ⬅️  ${BOLD}Назад${NC} к редактированию пользователя"
         echo ""
@@ -7029,7 +7563,7 @@ except Exception as e:
         [ "$sel_conns_len" -gt 0 ] && prompt_hint="${prompt_hint}, 1-${sel_conns_len}"
         prompt_hint="${prompt_hint}, +, "
         [ "$sel_conns_len" -gt 0 ] && prompt_hint="${prompt_hint}b, "
-        prompt_hint="${prompt_hint}t, s, p, c]: "
+        prompt_hint="${prompt_hint}t, s, p, e, i, c]: "
 
         read -p "Выберите действие ${prompt_hint}" wd_act
         wd_act=$(echo "$wd_act" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -7052,6 +7586,12 @@ except Exception as e:
                 ;;
             p|P|з|З)
                 preview_user_webdav "$uid"
+                ;;
+            e|E|у|У)
+                export_user_webdav_sub "$uid" "$u_nick"
+                ;;
+            i|I|ш|Ш)
+                import_user_webdav_sub "$uid" "$u_nick"
                 ;;
             c|C|с|С)
                 menu_webdav_sub_catalog
