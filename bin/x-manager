@@ -6511,7 +6511,7 @@ print(conns[idx].get("name", "") if 0 <= idx < len(conns) else "")
         return
     fi
 
-    local det_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=0" 2>/dev/null || echo "{}")
+    local det_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=1" 2>/dev/null || echo "{}")
     local cur_b_cnt=$(echo "$det_conn" | jq -r '(.backends // []) | length')
     if [ "$cur_b_cnt" -ge 8 ]; then
         echo -e "${RED}У сервера '${target_nm}' уже настроен максимум бэкендов (8).${NC}"
@@ -6525,7 +6525,7 @@ print(conns[idx].get("name", "") if 0 <= idx < len(conns) else "")
     [ -z "$add_b_url" ] && return
     read -p "Логин бэкенда: " add_b_u
     add_b_u=$(echo "$add_b_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-    read -s -p "Пароль бэкенда: " add_b_p; echo ""
+    read -p "Пароль бэкенда: " add_b_p
     add_b_p=$(echo "$add_b_p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     read -p "Метка / комментарий (например 'Резерв' или 'Hetzner'): " add_b_lbl
     add_b_lbl=$(echo "$add_b_lbl" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -6558,6 +6558,7 @@ edit_connection_parameters_dialog() {
     local c_nm=$(echo "$cur_conn" | jq -r '.name // ""')
     local c_url=$(echo "$cur_conn" | jq -r '.url // ""')
     local c_usr=$(echo "$cur_conn" | jq -r '.username // ""')
+    local c_pass=$(echo "$cur_conn" | jq -r '.password // ""')
     local c_enc=$(echo "$cur_conn" | jq -r '.enc // 0')
     local c_dns=$(echo "$cur_conn" | jq -r '.dns // ""')
     local c_tout=$(echo "$cur_conn" | jq -r '.timeout // "60s"')
@@ -6566,7 +6567,7 @@ edit_connection_parameters_dialog() {
     echo -e "${CYAN}=== ПАРАМЕТРЫ СЕРВЕРА ===${NC}"
     echo -e "  [1] Имя: ${GREEN}${c_nm}${NC}"
     echo -e "  [2] Основной URL: ${CYAN}${c_url}${NC}"
-    echo -e "  [3] Логин / Пароль (сейчас user: ${c_usr})"
+    echo -e "  [3] Логин / Пароль (сейчас user: ${GREEN}${c_usr}${NC}, pass: ${YELLOW}${c_pass}${NC})"
     echo -e "  [4] Шифрование (enc): $([ "$c_enc" -eq 1 ] && echo "${GREEN}enc=1${NC}" || echo "${GRAY}enc=0${NC}")"
     echo -e "  [5] Bootstrap DNS: ${YELLOW}${c_dns:-"(не задан)"}${NC}"
     echo -e "  [6] Таймаут: ${c_tout}"
@@ -6594,7 +6595,7 @@ edit_connection_parameters_dialog() {
             read -p "Новый логин (Enter для сохранения '${c_usr}'): " n_usr
             n_usr=$(echo "$n_usr" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             [ -z "$n_usr" ] && n_usr="$c_usr"
-            read -s -p "Новый пароль (Enter для сохранения текущего): " n_pass; echo ""
+            read -p "Новый пароль (Enter для сохранения '${c_pass}'): " n_pass
             n_pass=$(echo "$n_pass" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             local p_payload=$(python3 -c "import json, sys; d={'username': sys.argv[1]}; (d.update({'password': sys.argv[2]}) if sys.argv[2] else None); print(json.dumps(d))" "$n_usr" "$n_pass")
             curl -s -X PUT "${SUB_API}/api/webdav/connections/${target_id}" -H "Content-Type: application/json" -d "$p_payload" >/dev/null 2>&1
@@ -6645,7 +6646,7 @@ print(conns[idx].get("id", "") if 0 <= idx < len(conns) else "")
             return
         fi
 
-        local cur_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=0" 2>/dev/null || echo "")
+        local cur_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=1" 2>/dev/null || echo "")
         local c_err=$(echo "$cur_conn" | jq -r '.error // empty' 2>/dev/null || echo "")
         if [ -n "$c_err" ] || [ -z "$cur_conn" ]; then
             echo -e "${RED}Не удалось загрузить данные подключения: ${c_err}${NC}"
@@ -6656,6 +6657,7 @@ print(conns[idx].get("id", "") if 0 <= idx < len(conns) else "")
         local c_nm=$(echo "$cur_conn" | jq -r '.name // ""')
         local c_url=$(echo "$cur_conn" | jq -r '.url // ""')
         local c_usr=$(echo "$cur_conn" | jq -r '.username // ""')
+        local c_pass=$(echo "$cur_conn" | jq -r '.password // ""')
         local c_enc=$(echo "$cur_conn" | jq -r '.enc // 0')
         local c_dns=$(echo "$cur_conn" | jq -r '.dns // ""')
         local c_tout=$(echo "$cur_conn" | jq -r '.timeout // "60s"')
@@ -6667,7 +6669,7 @@ print(conns[idx].get("id", "") if 0 <= idx < len(conns) else "")
         echo -e "${CYAN}║${NC}  Пользователь:   ${GREEN}${u_nick}${NC}"
         echo -e "${CYAN}║${NC}  ID подключения: ${GRAY}${target_id}${NC}"
         echo -e "${CYAN}║${NC}  Основной URL:   ${CYAN}${BOLD}${c_url}${NC}"
-        echo -e "${CYAN}║${NC}  Учетные данные: user: ${GREEN}${c_usr}${NC}, pass: [СКРЫТ]"
+        echo -e "${CYAN}║${NC}  Учетные данные: user: ${GREEN}${c_usr}${NC}, pass: ${YELLOW}${c_pass}${NC}"
         echo -e "${CYAN}║${NC}  Шифрование:     $([ "$c_enc" -eq 1 ] && echo "${GREEN}enc=1 (включено)${NC}" || echo "${GRAY}enc=0 (выключено)${NC}")"
         echo -e "${CYAN}║${NC}  Bootstrap DNS:  ${YELLOW}${c_dns:-"(не задан)"}${NC} | Таймаут: ${c_tout}"
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
@@ -6686,10 +6688,17 @@ else:
         prefix = "  └── " if is_last else "  ├── "
         b_url = b.get("url", "")
         b_u = b.get("username", "")
+        b_p = b.get("password", "")
         b_lbl = b.get("label", "")
         lbl_str = f" [{b_lbl}]" if b_lbl else ""
-        u_str = f" (user: {b_u})" if b_u else ""
-        print(f"{prefix}\033[1;33mБэкенд #{idx}:\033[0m \033[36m{b_url}\033[0m{lbl_str}{u_str}")
+        creds = []
+        if b_u:
+            creds.append(f"user: {b_u}")
+        if b_p:
+            creds.append(f"pass: {b_p}")
+        joined = ", ".join(creds)
+        cred_str = f" ({joined})" if creds else ""
+        print(f"{prefix}\033[1;33mБэкенд #{idx}:\033[0m \033[36m{b_url}\033[0m{lbl_str}{cred_str}")
 ' "$cur_conn"
 
         echo ""
@@ -6714,7 +6723,7 @@ else:
                 [ -z "$add_b_url" ] && continue
                 read -p "Логин бэкенда: " add_b_u
                 add_b_u=$(echo "$add_b_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                read -s -p "Пароль бэкенда: " add_b_p; echo ""
+                read -p "Пароль бэкенда: " add_b_p
                 add_b_p=$(echo "$add_b_p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
                 read -p "Метка (например 'Резерв' или 'Mail.Ru Pool'): " add_b_lbl
                 add_b_lbl=$(echo "$add_b_lbl" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -6961,11 +6970,20 @@ try:
         cid = c.get("id", "")
         cnm = c.get("name", "")
         url = c.get("url", "")
+        c_usr = c.get("username", "")
+        c_pw = c.get("password", "")
+        cred_items = []
+        if c_usr:
+            cred_items.append(f"user: {c_usr}")
+        if c_pw:
+            cred_items.append(f"pass: {c_pw}")
+        main_joined = ", ".join(cred_items)
+        cred_main = f" [{main_joined}]" if cred_items else ""
         b_cnt = c.get("backends_count", 0)
         enc = "🔐 enc=1" if c.get("enc") else "🔓 enc=0"
         en = "🟢" if c.get("enabled") else "🔴"
         cat_en = "" if c.get("catalog_enabled", True) else " \033[1;31m[В каталоге ОТКЛЮЧЕН]\033[0m"
-        print(f" ── \033[1;33m[{idx}]\033[0m {en} \033[1;32m{cnm}\033[0m ({url}) [{enc}]{cat_en}")
+        print(f" ── \033[1;33m[{idx}]\033[0m {en} \033[1;32m{cnm}\033[0m ({url}){cred_main} [{enc}]{cat_en}")
         backends = c.get("backends", [])
         if not backends:
             print("        └── \033[90m(одиночный сервер, без дополнительных бэкендов)\033[0m")
@@ -6975,9 +6993,16 @@ try:
                 prefix = "        └── " if is_last else "        ├── "
                 b_url = b.get("url", "")
                 b_user = b.get("username", "")
+                b_pass = b.get("password", "")
                 b_lbl = b.get("label", "")
                 lbl_str = f" [{b_lbl}]" if b_lbl else ""
-                u_str = f" (user: {b_user})" if b_user else ""
+                b_creds = []
+                if b_user:
+                    b_creds.append(f"user: {b_user}")
+                if b_pass:
+                    b_creds.append(f"pass: {b_pass}")
+                b_joined = ", ".join(b_creds)
+                u_str = f" ({b_joined})" if b_creds else ""
                 print(f"{prefix}\033[1;33mБэкенд #{b_idx}:\033[0m \033[36m{b_url}\033[0m{lbl_str}{u_str}")
         print("")
 except Exception as e:
@@ -7055,7 +7080,7 @@ menu_webdav_sub_catalog() {
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
 
-        local raw_conns=$(curl -s "${SUB_API}/api/webdav/connections" 2>/dev/null || echo "[]")
+        local raw_conns=$(curl -s "${SUB_API}/api/webdav/connections?secrets=1" 2>/dev/null || echo "[]")
         local count_conns=$(python3 -c "import json, sys; conns=json.loads(sys.argv[1]) if sys.argv[1].startswith('[') else []; print(len(conns))" "$raw_conns" 2>/dev/null || echo 0)
 
         echo -e "${BOLD}Текущие подключения в каталоге (${count_conns}):${NC}"
@@ -7071,13 +7096,15 @@ try:
         name = c.get("name", "")
         url = c.get("url", "")
         username = c.get("username", "")
+        pw = c.get("password", "")
+        pw_str = f", pass: {pw}" if pw else ""
         b_cnt = c.get("backends_count", 0)
         enc = "🔐 enc=1" if c.get("enc") else "🔓 enc=0"
         dns_val = c.get("dns") or ""
         dns_str = f" | dns: {dns_val}" if dns_val else ""
         en = "🟢" if c.get("enabled") else "🔴"
         print(f"  \033[1;33m[{i}]\033[0m {en} \033[1;32m{name}\033[0m [\033[36m{cid}\033[0m]")
-        print(f"      Основное: \033[1m{url}\033[0m (user: {username}) | Бэкендов: \033[1;33m{b_cnt}\033[0m | {enc}{dns_str}")
+        print(f"      Основное: \033[1m{url}\033[0m (user: {username}{pw_str}) | Бэкендов: \033[1;33m{b_cnt}\033[0m | {enc}{dns_str}")
 except Exception as e:
     print(f"  Ошибка вывода подключений: {e}")
 ' "$raw_conns"
@@ -7117,7 +7144,7 @@ except Exception as e:
                     continue
                 fi
                 local target_id=$(python3 -c "import json, sys; conns=json.loads(sys.argv[1]); print(conns[int(sys.argv[2])-1]['id'])" "$raw_conns" "$ed_num")
-                local cur_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=0" 2>/dev/null || echo "")
+                local cur_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=1" 2>/dev/null || echo "")
                 if [ -z "$cur_conn" ] || [ "$(echo "$cur_conn" | jq -r '.error // empty')" != "" ]; then
                     echo -e "${RED}Не удалось загрузить подключение ${target_id}${NC}"
                     sleep 1.5
@@ -7127,6 +7154,7 @@ except Exception as e:
                 local c_nm=$(echo "$cur_conn" | jq -r '.name // ""')
                 local c_url=$(echo "$cur_conn" | jq -r '.url // ""')
                 local c_usr=$(echo "$cur_conn" | jq -r '.username // ""')
+                local c_pass=$(echo "$cur_conn" | jq -r '.password // ""')
                 local c_b_cnt=$(echo "$cur_conn" | jq -r '.backends_count // 0')
                 local c_enc=$(echo "$cur_conn" | jq -r '.enc // 0')
                 local c_dns=$(echo "$cur_conn" | jq -r '.dns // ""')
@@ -7139,7 +7167,7 @@ except Exception as e:
                 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
                 echo -e "  [1] Имя: ${GREEN}${c_nm}${NC}"
                 echo -e "  [2] Основной URL: ${CYAN}${c_url}${NC}"
-                echo -e "  [3] Логин / Пароль (сейчас: user: ${c_usr}, pass: [СКРЫТ])"
+                echo -e "  [3] Логин / Пароль (сейчас user: ${GREEN}${c_usr}${NC}, pass: ${YELLOW}${c_pass}${NC})"
                 echo -e "  [4] Дополнительные бэкенды: ${YELLOW}${c_b_cnt}${NC} шт. (добавление/удаление)"
                 echo -e "  [5] Шифрование (enc): $([ "$c_enc" -eq 1 ] && echo "${GREEN}enc=1${NC}" || echo "${GRAY}enc=0${NC}")"
                 echo -e "  [6] Bootstrap DNS: ${YELLOW}${c_dns:-"(не задан)"}${NC}"
@@ -7172,8 +7200,7 @@ except Exception as e:
                         n_usr=$(echo "$n_usr" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
                         [ -z "$n_usr" ] && n_usr="$c_usr"
 
-                        read -s -p "Новый пароль (Enter для сохранения текущего): " n_pass
-                        echo ""
+                        read -p "Новый пароль (Enter для сохранения '${c_pass}'): " n_pass
                         n_pass=$(echo "$n_pass" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
                         local p_payload=$(python3 -c "import json, sys; d={'username': sys.argv[1]}; (d.update({'password': sys.argv[2]}) if sys.argv[2] else None); print(json.dumps(d))" "$n_usr" "$n_pass")
@@ -7184,7 +7211,7 @@ except Exception as e:
                     4)
                         clear
                         echo -e "${CYAN}=== УПРАВЛЕНИЕ БЭКЕНДАМИ ПОДКЛЮЧЕНИЯ: ${c_nm} ===${NC}\n"
-                        local det_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=0" 2>/dev/null || echo "{}")
+                        local det_conn=$(curl -s "${SUB_API}/api/webdav/connections/${target_id}?secrets=1" 2>/dev/null || echo "{}")
                         python3 -c '
 import json, sys
 data = json.loads(sys.argv[1])
@@ -7194,10 +7221,16 @@ if not backends:
     print("  (Дополнительные бэкенды не настроены)")
 for idx, b in enumerate(backends, 1):
     u = b.get("username", "")
+    p = b.get("password", "")
     b_url = b.get("url", "")
     b_lbl = b.get("label", "")
     lbl_str = f" [{b_lbl}]" if b_lbl else ""
-    print(f"  \033[1;33m[{idx}]\033[0m {b_url}{lbl_str} (user: {u})")
+    creds = []
+    if u: creds.append(f"user: {u}")
+    if p: creds.append(f"pass: {p}")
+    joined = ", ".join(creds)
+    cred_str = f" ({joined})" if creds else ""
+    print(f"  \033[1;33m[{idx}]\033[0m {b_url}{lbl_str}{cred_str}")
 ' "$det_conn"
                         echo ""
                         echo -e "  ${YELLOW}[1]${NC} ➕ Добавить дополнительный бэкенд (сторонний сервер)"
@@ -7342,7 +7375,7 @@ print(json.dumps({"backends": backends}))
                     continue
                 fi
                 local v_id=$(python3 -c "import json, sys; conns=json.loads(sys.argv[1]); print(conns[int(sys.argv[2])-1]['id'])" "$raw_conns" "$v_num")
-                local v_data=$(curl -s "${SUB_API}/api/webdav/connections/${v_id}?secrets=0" 2>/dev/null || echo "{}")
+                local v_data=$(curl -s "${SUB_API}/api/webdav/connections/${v_id}?secrets=1" 2>/dev/null || echo "{}")
                 clear
                 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
                 echo -e "${CYAN}║${BOLD}          ПОДРОБНЫЙ ПРОСМОТР ПОДКЛЮЧЕНИЯ WEBDAV: ${v_id}        ${CYAN}║${NC}"
@@ -7387,9 +7420,15 @@ print(f"\nДополнительные бэкенды ({b_cnt}):")
 for idx, b in enumerate(backends, 1):
     b_url = b.get("url", "")
     b_user = b.get("username", "")
+    b_pass = b.get("password", "")
     b_lbl = b.get("label", "")
     lbl_str = f" [{b_lbl}]" if b_lbl else ""
-    print(f"  \033[1;33m#{idx}\033[0m {b_url}{lbl_str} (user: {b_user})")
+    b_creds = []
+    if b_user: b_creds.append(f"user: {b_user}")
+    if b_pass: b_creds.append(f"pass: {b_pass}")
+    b_joined = ", ".join(b_creds)
+    u_str = f" ({b_joined})" if b_creds else ""
+    print(f"  \033[1;33m#{idx}\033[0m {b_url}{lbl_str}{u_str}")
 print(f"\nСериализованный URI:")
 print(f"\033[1;36m{uri}\033[0m\n")
 ' "$v_data"

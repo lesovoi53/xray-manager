@@ -3205,15 +3205,6 @@ class SubscriptionApp:
                 backends = json.loads(r["backends_json"])
             except Exception:
                 backends = []
-            safe_backends = []
-            if isinstance(backends, list):
-                for b in backends:
-                    if isinstance(b, dict):
-                        safe_backends.append({
-                            "url": str(b.get("url") or ""),
-                            "username": str(b.get("username") or ""),
-                            "label": str(b.get("label") or ""),
-                        })
             conn_ids.append(r["id"])
             conns_res.append({
                 "id": r["id"],
@@ -3223,8 +3214,9 @@ class SubscriptionApp:
                 "position": r["position"],
                 "url": r["url"],
                 "username": r["username"],
+                "password": r["password"],
                 "backends_count": len(backends),
-                "backends": safe_backends,
+                "backends": backends if isinstance(backends, list) else [],
                 "timeout": r["timeout"],
                 "enc": r["enc"],
             })
