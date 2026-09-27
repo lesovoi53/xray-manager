@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.26.4.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.28.1.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -632,7 +632,7 @@ echo -e "${CYAN}==> Шаг 9: Развертывание диспетчера x-
 xm_install_asset bin/x-manager /usr/local/bin/x-manager 0755
 install -d -m 0755 /usr/local/share/x-manager /usr/local/share/x-manager/patches /usr/local/share/x-manager/scripts
 install -m 0644 "$SCRIPT_DIR/patches/openflux-multistream.patch" /usr/local/share/x-manager/patches/
-install -m 0644 "$SCRIPT_DIR/scripts/"{webdav-config.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/scripts/"{webdav-config.py,webdav-encryption.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/components.json" /usr/local/share/x-manager/components.json
 install -m 0644 "$SCRIPT_DIR/scripts/menu-actions.tsv" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/installer-state.py" /usr/local/share/x-manager/scripts/
@@ -660,6 +660,7 @@ XM_PARENT_TRANSACTION=1 XM_PARENT_BACKUP="$XM_BACKUP" bash "$SCRIPT_DIR/tuna-sub
 if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = yes ]; then
     systemctl enable webdav-tunnel
     xm_service webdav-tunnel
+    python3 /usr/local/share/x-manager/scripts/webdav-encryption.py --if-active --server-ip "$SERVER_IP"
 fi
 # Preserve existing instance enablement; start only channels with configured URLs.
 if [ "$INSTALL_OPENFLUX" = yes ]; then

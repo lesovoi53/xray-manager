@@ -1487,6 +1487,11 @@ def import_server_webdav_config(env_path: str = "/etc/webdav-tunnel/config.env",
             env[k] = v
 
     mode = env.get("WEBDAV_MODE", "selfhosted").strip().lower()
+    # Match runner defaults and the legacy listen-port override.
+    local_port = env.get("SELFHOSTED_PORT", "18080") or "18080"
+    listen_port = re.search(r":([0-9]+)$", env.get("WEBDAV_LISTEN", ""))
+    if listen_port:
+        local_port = listen_port.group(1)
     enc_val = env.get("WEBDAV_ENC", "false").strip().lower() in ("true", "1", "yes")
     enc = 1 if enc_val else 0
 
@@ -1516,7 +1521,7 @@ def import_server_webdav_config(env_path: str = "/etc/webdav-tunnel/config.env",
 
     if mode == "multi":
         loc_en = env.get("MULTI_LOCAL_ENABLED", "true").strip().lower() in ("true", "1", "yes")
-        l_port = env.get("SELFHOSTED_PORT", "8443").strip() or "8443"
+        l_port = local_port
         l_user = env.get("SELFHOSTED_LOGIN", "wdav").strip() or "wdav"
         l_pass = env.get("SELFHOSTED_PASSWORD", env.get("WEBDAV_PASSWORD", "")).strip()
         if loc_en and l_pass:
@@ -1569,7 +1574,7 @@ def import_server_webdav_config(env_path: str = "/etc/webdav-tunnel/config.env",
         name = "Multi-WebDAV"
 
     elif mode == "selfhosted":
-        l_port = env.get("SELFHOSTED_PORT", "8443").strip() or "8443"
+        l_port = local_port
         l_user = env.get("SELFHOSTED_LOGIN", "wdav").strip() or "wdav"
         l_pass = env.get("SELFHOSTED_PASSWORD", env.get("WEBDAV_PASSWORD", "")).strip()
         if not l_pass:

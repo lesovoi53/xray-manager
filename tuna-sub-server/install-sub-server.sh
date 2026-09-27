@@ -81,6 +81,8 @@ chown tuna-sub:tuna-sub /var/log/tuna-subscriptions
 # 4. Копирование исполняемого скрипта
 echo -e "${CYAN}[*] Установка исполняемого файла /usr/local/bin/tuna-subscriptions...${NC}"
 install -m 0644 "$SCRIPT_DIR/tuna_connection_groups.py" /usr/local/bin/tuna_connection_groups.py
+install -d -m 0755 /usr/local/share/x-manager/scripts
+install -m 0644 "$SCRIPT_DIR/../scripts/webdav-encryption.py" /usr/local/share/x-manager/scripts/webdav-encryption.py
 install -m 0755 "$SCRIPT_DIR/tuna-groups.py" /usr/local/bin/tuna-groups
 cp -f "${SCRIPT_DIR}/tuna-subscriptions.py" /usr/local/bin/tuna-subscriptions
 chmod 0755 /usr/local/bin/tuna-subscriptions
@@ -130,6 +132,9 @@ if [[ "${XM_PARENT_TRANSACTION:-0}" == 1 ]]; then
     XM_BACKUP=$XM_PARENT_BACKUP
 fi
 xm_service tuna-subscriptions.service
+if [[ "${XM_PARENT_TRANSACTION:-0}" != 1 ]] && [[ -f /etc/webdav-tunnel/config.env ]]; then
+    python3 /usr/local/share/x-manager/scripts/webdav-encryption.py --if-active
+fi
 
 sleep 1
 
