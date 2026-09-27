@@ -111,11 +111,11 @@ curl -f http://127.0.0.1:22217/health
 Реализация и проверки: [tests](tests), [валидатор и хранение групп](tuna_connection_groups.py), [редактор](tuna-groups.py), [отчёт приёмки](../docs/VPS_DEPLOYMENT_20260925.md). Сервер хранит параметры URL-test/Speedtest, а измерения выполняет клиент.
 
 
-## Внешние подписки LuckUI: транспорт групп
+## Внешние подписки : транспорт групп
 
 `GET /sub-groups/TOKEN` выдаёт Base64 от одной URI `tuna-groups://v1/BASE64URL_JSON` и LF.
 Контейнер сохраняет полный документ `/sub-json/TOKEN` без изменения данных и проходит
-URI-обработчик LuckUI. Для старых потребителей `/sub/` и `/sub-json/` не меняются.
+URI-обработчик . Для старых потребителей `/sub/` и `/sub-json/` не меняются.
 В API ссылок добавлено `group_transport_subscription_url`; TUI показывает его в пункте 7.
 Новый контейнер требует отдельной поддержки клиентом TUNA (текущий rc12 её ещё не имеет).
 Формат, лимиты и подключение: [GROUP_URI_TRANSPORT_V1.md](../docs/GROUP_URI_TRANSPORT_V1.md).
