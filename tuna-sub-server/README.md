@@ -115,7 +115,7 @@ curl -f http://127.0.0.1:22217/health
 
 `GET /sub-groups/TOKEN` выдаёт Base64 от одной URI `tuna-groups://v1/BASE64URL_JSON` и LF.
 Контейнер сохраняет полный документ `/sub-json/TOKEN` без изменения данных и проходит
-URI-обработчик LuckUI. Для старых потребителей `/sub/` и `/sub-json/` не меняются.
+URI-обработчик . Для старых потребителей `/sub/` и `/sub-json/` не меняются.
 В API ссылок добавлено `group_transport_subscription_url`; TUI показывает его в пункте 7.
 Новый контейнер требует отдельной поддержки клиентом TUNA (текущий rc12 её ещё не имеет).
 Формат, лимиты и подключение: [GROUP_URI_TRANSPORT_V1.md](../docs/GROUP_URI_TRANSPORT_V1.md).
