@@ -1,0 +1,18 @@
+[Unit]
+Description=Refresh Yandex cookies on VPS without bypassing manual CAPTCHA
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=openflux
+Group=openflux
+UMask=0077
+ExecStart=/usr/bin/python3 /usr/local/share/x-manager/scripts/openflux-volga.py refresh
+TimeoutStartSec=10min
+MemoryMax=192M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/openflux

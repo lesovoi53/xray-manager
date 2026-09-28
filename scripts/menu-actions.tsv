@@ -93,6 +93,7 @@ menu_openflux|OpenFlux|Каналы|M|Классический / Multi-Stream
 menu_openflux|OpenFlux|Настройки|3|Транспорт
 menu_openflux|OpenFlux|Настройки|4|Кодек
 menu_openflux|OpenFlux|Настройки|5|Ключ шифрования
+menu_openflux|OpenFlux|Настройки|V|Cookies Яндекс Волги (SmartCaptcha)
 menu_openflux|OpenFlux|Настройки|6|Отладка
 menu_openflux|OpenFlux|Настройки|7|Маршрутизация Xray / Direct
 menu_openflux|OpenFlux|Диагностика|T|Экспресс-тест ссылок

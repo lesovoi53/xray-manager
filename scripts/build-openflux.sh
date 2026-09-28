@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# Build the exact source revision compatible with our client and Multi-stream patch.
+# Rebuild the fully patched, hash-checked source distributed in this release.
 set -euo pipefail
 source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-patch_file=${1:-"$source_dir/patches/openflux-multistream.patch"}
-output=${2:?Usage: build-openflux.sh PATCH OUTPUT}
-revision=d13aa5b701c8ee5311aa638de16c70ea094d9dfd
-test -s "$patch_file" || { echo 'OpenFlux: required patch is missing' >&2; exit 1; }
-patch_file=$(realpath "$patch_file")
+output=${1:?Usage: build-openflux.sh OUTPUT [CHECK_OUTPUT]}
+check_output=${2:-"${output}-volga-check"}
+command -v go >/dev/null
+[[ $(go env GOVERSION) = go1.26.4 ]] || { echo 'Go 1.26.4 required; use GOTOOLCHAIN=local' >&2; exit 1; }
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-export GOPATH="${GOPATH:-$work/go}"
-export GOCACHE="${GOCACHE:-$work/go-build}"
-curl -fL --connect-timeout 15 --max-time 180 --retry 2 \
-    "https://codeload.github.com/p1neappleXpress/OpenFlux/tar.gz/$revision" -o "$work/source.tar.gz"
-tar -xzf "$work/source.tar.gz" --strip-components=1 -C "$work"
-git -C "$work" apply --check "$patch_file"
-git -C "$work" apply "$patch_file"
+python3 "$source_dir/scripts/release-assets.py" openflux-source.tar.gz "$work/source.tar.gz"
+python3 - "$work" <<'PY'
+import pathlib, sys, tarfile
+root=pathlib.Path(sys.argv[1])
+with tarfile.open(root/'source.tar.gz') as archive:
+    for member in archive.getmembers():
+        path=pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0]!='openflux' or not (member.isfile() or member.isdir()):
+            sys.exit('Unsafe OpenFlux source archive')
+    archive.extractall(root)
+PY
 (
-    cd "$work"
-    export CGO_ENABLED=0 GOTOOLCHAIN=auto
-    go test ./transport/... -run 'TestBoardsJSONEnvelope|TestMultiStream|TestFlowHash' -count=1
-    go build -trimpath -ldflags='-s -w' -o "$work/openflux" .
+    cd "$work/openflux"
+    export CGO_ENABLED=0 GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 GOFLAGS=-mod=readonly
+    go test ./...
+    go build -trimpath -ldflags='-s -w' -o "$work/openflux-bin" .
+    go build -trimpath -ldflags='-s -w' -o "$work/check-bin" ./cmd/volga-check
 )
-install -m 0755 "$work/openflux" "$output"
+install -m 0755 "$work/openflux-bin" "$output"
+install -m 0755 "$work/check-bin" "$check_output"

@@ -350,7 +350,7 @@ detect_transport_from_url() {
     elif [[ "$u" =~ cups\.online ]]; then
         echo "cupsonline"
     elif [[ "$u" =~ disk\.yandex\.ru || "$u" =~ docs\.yandex\.ru ]]; then
-        echo "unsupported_yandex"
+        echo "vyandex"
     else
         echo "$fallback"
     fi
@@ -598,11 +598,16 @@ get_wdtt_status() {
 }
 
 get_wdtt_password() {
-    if [ -f "$WDTT_PASSWORD_FILE" ]; then
-        cat "$WDTT_PASSWORD_FILE" | tr -d '\r\n'
-    else
-        echo "sad_534188_sad"
+    local password
+    if [ -r "$WDTT_PASSWORD_FILE" ]; then
+        password=$(tr -d '\r\n' < "$WDTT_PASSWORD_FILE") || return 1
+        if [ -n "$password" ]; then
+            printf '%s\n' "$password"
+            return 0
+        fi
     fi
+    echo 'WDTT: сохранённый пароль отсутствует или недоступен; проверьте /etc/wdtt/main.password.' >&2
+    return 1
 }
 
 get_wdtt_peer_port() {
@@ -1915,7 +1920,8 @@ wdtt_view_devices() {
 show_qwdtt_link() {
     clear
     local peer_p=$(get_wdtt_peer_port)
-    local pass=$(get_wdtt_password)
+    local pass
+    pass=$(get_wdtt_password) || return 1
     local name=$(get_wdtt_profile_name)
 
     local qwdtt_url=$(python3 -c "
@@ -4990,7 +4996,8 @@ extract_current_server_links() {
     local w_uri=""
     if is_wdtt_installed; then
         local w_port=$(get_wdtt_peer_port)
-        local w_pass=$(get_wdtt_password)
+        local w_pass
+        w_pass=$(get_wdtt_password) || return 1
         local w_name=$(get_wdtt_profile_name)
         if [ -n "$w_port" ] && [ -n "$w_pass" ]; then
             w_uri=$(python3 -c "
@@ -5571,12 +5578,17 @@ export_user_openflux_sub() {
     fi
 
     local exp_uri=$(echo "$body" | jq -r '.uri // ""')
-    local exp_name=$(echo "$body" | jq -r '.name // "OpenFlux"')
-    local exp_mode=$(echo "$body" | jq -r '.mode // "classic"')
-    local exp_bal=$(echo "$body" | jq -r '.balancer_strategy // "roundRobin"')
-    local exp_gcnt=$(echo "$body" | jq -r '.groups_count // 0')
-    local exp_urls=$(echo "$body" | jq -r '.total_urls // 0')
-    local exp_rev=$(echo "$body" | jq -r '.revision // 1')
+    if ! printf '%s' "$body" | jq -e '.payload | type == "object" and (.name | type == "string") and (.groups | type == "array")' >/dev/null; then
+        echo 'Ошибка экспорта: сервер не вернул структуру бандла payload.' >&2
+        read -rp 'Enter — назад: ' _
+        return 1
+    fi
+    local exp_name=$(echo "$body" | jq -r '.payload.name')
+    local exp_mode=$(echo "$body" | jq -r '.payload.mode')
+    local exp_bal=$(echo "$body" | jq -r '.payload.balancer_strategy')
+    local exp_gcnt=$(echo "$body" | jq -r '.payload.groups | length')
+    local exp_urls=$(echo "$body" | jq -r '[.payload.groups[].urls | length] | add // 0')
+    local exp_rev=$(echo "$body" | jq -r '.payload.revision')
     local exp_en=$(echo "$body" | jq -r '.enabled // false')
 
     local en_str="🟢 Включена"
@@ -5993,7 +6005,7 @@ menu_openflux_sub_catalog() {
         echo -e "${CYAN}║${BOLD}          КАТАЛОГ ГРУПП OPENFLUX V2 ДЛЯ ПОДПИСОК TUNA                  ${CYAN}║${NC}"
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
         echo -e "${CYAN}║${NC}  Сервер подписок: ${CYAN}${SUB_API}${NC}"
-        echo -e "${CYAN}║${NC}  Контракт: v2 | Транспорты: mailru, boards, cupsonline (vyandex не поддерживается)"
+        echo -e "${CYAN}║${NC}  Контракт: v2 | Транспорты: mailru, boards, cupsonline, vyandex (Волга)"
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
 
@@ -6045,7 +6057,7 @@ except Exception as e:
                     local imp_count=$(echo "$imp_resp" | jq -r '.imported_count // .count // 0' 2>/dev/null)
                     echo -e "${GREEN}✓ Локальный импорт завершен успешно!${NC}"
                     echo -e "  Импортировано/синхронизировано групп: ${BOLD}${imp_count}${NC}"
-                    echo -e "  ${GRAY}(Транспорты vyandex пропущены per v2 contract: разрешены только mailru, boards, cupsonline)${NC}"
+                    echo -e "  ${GRAY}(Импортируются поддерживаемые группы, включая Яндекс Волгу)${NC}"
                 else
                     local imp_err=$(echo "$imp_resp" | jq -r '.error // "Неизвестная ошибка"' 2>/dev/null || echo "$imp_resp")
                     echo -e "${RED}Ошибка импорта: ${imp_err}${NC}"
@@ -6082,11 +6094,13 @@ except Exception as e:
                 echo -e "  [1] mailru (Облако Mail.ru)"
                 echo -e "  [2] boards (Яндекс.Доски)"
                 echo -e "  [3] cupsonline (VK Cups Online)"
-                read -p "Транспорт [1-3, дефолт 1]: " tr_choice
+                echo "  [4] vyandex (Яндекс Волга)"
+                read -p "Транспорт [1-4, дефолт 1]: " tr_choice
                 local g_tr="mailru"
                 case "$tr_choice" in
                     2) g_tr="boards" ;;
                     3) g_tr="cupsonline" ;;
+                    4) g_tr="vyandex" ;;
                     *) g_tr="mailru" ;;
                 esac
 
@@ -8062,8 +8076,14 @@ print(f"\033[1;36m{uri}\033[0m\n")
 
 sync_openflux_to_sub_server() {
     local sub_api="http://127.0.0.1:22217"
-    if curl -s "${sub_api}/health" >/dev/null 2>&1; then
-        curl -s -X POST "${sub_api}/api/openflux/import-local" >/dev/null 2>&1 || true
+    local response
+    response=$(curl --fail --silent --show-error --max-time 15 -X POST "${sub_api}/api/openflux/import-local") || {
+        echo 'Канал сохранён, но каталог TUNA не синхронизирован. Повторите импорт в каталоге OpenFlux.' >&2
+        return 1
+    }
+    if ! printf '%s' "$response" | jq -e '.success == true or .status == "ok"' >/dev/null; then
+        echo 'TUNA отклонила импорт. Проверьте каталог OpenFlux.' >&2
+        return 1
     fi
 }
 
@@ -9686,8 +9706,17 @@ test_openflux_link() {
             cupsonline)
                 echo -e "   ${prefix}${GREEN}✓ [cups.online] Комнаты интервью live-coding${NC}"
                 ;;
-            unsupported_yandex|vyandex|yandex)
-                echo -e "   ${prefix}${RED}✗ [ОТКЛЮЧЕН] Яндекс.Документы (Волга) отключены из-за блокировки SmartCaptcha на хостингах. Используйте Яндекс.Доски (boards.yandex.ru), Mail.ru или Cups.online!${NC}"
+            vyandex)
+                local check_file
+                check_file=$(mktemp) || return 1
+                chmod 600 "$check_file"
+                printf '%s' "$u" > "$check_file"
+                if ! python3 /usr/local/share/x-manager/scripts/openflux-volga.py check "$check_file"; then
+                    rm -f "$check_file"
+                    echo 'Волга: проверьте новый редактор, доступ на редактирование и cookies после SmartCaptcha.' >&2
+                    return 1
+                fi
+                rm -f "$check_file"
                 ;;
             *)
                 echo -e "   ${prefix}${YELLOW}ℹ Транспорт: ${detected_tr}${NC}"
@@ -9841,6 +9870,17 @@ benchmark_openflux_transport() {
     esac
 }
 
+configure_volga_channel() {
+    local file result
+    file=$(mktemp) || return 1
+    chmod 600 "$file"
+    printf '%s' "$2" > "$file"
+    python3 /usr/local/share/x-manager/scripts/openflux-volga.py configure "$file" --channel "$1"
+    result=$?
+    rm -f "$file"
+    return "$result"
+}
+
 menu_openflux() {
     if ! is_openflux_installed; then
         clear
@@ -9913,6 +9953,21 @@ menu_openflux() {
         xm_choose_action menu_openflux of_choice || return
 
         case "$of_choice" in
+            V)
+                echo 'Cookies обновляются непосредственно на VPS. Ручную SmartCaptcha автоматика не проходит.'
+                printf '[1] Получить и проверить cookies сейчас\n[2] Включить обновление каждые 30 минут\n[3] Выключить таймер\n[4] Статус и журнал обновления\n[5] Импортировать cookies из файла на VPS\n[6] Инструкция: SSH-туннель, браузер и получение cookies\n[0] Назад\n'
+                read -rp 'Действие: ' cookie_action
+                case "$cookie_action" in
+                    1) systemctl start volga-cookies.service && echo 'Cookies обновлены и проверены.';;
+                    2) systemctl enable --now volga-cookies.timer;;
+                    3) systemctl disable --now volga-cookies.timer;;
+                    4) systemctl show volga-cookies.service -p Result -p ExecMainStatus; systemctl list-timers volga-cookies.timer --no-pager; journalctl -u volga-cookies.service -n 15 --no-pager;;
+                    5) read -rp 'Путь к Netscape cookies-файлу (Enter — отмена): ' cookie_source
+                       [ -z "$cookie_source" ] || python3 /usr/local/share/x-manager/scripts/openflux-volga.py cookies "$cookie_source";;
+                    6) python3 /usr/local/share/x-manager/scripts/openflux-volga.py instructions;;
+                esac
+                read -rp 'Enter — назад: ' _
+                ;;
             1|c1|c2|c3|c4|c5|c6|c7|c8|C1|C2|C3|C4|C5|C6|C7|C8)
                 local target_ch=""
                 if [[ "$of_choice" =~ ^[cC]([1-8])$ ]]; then
@@ -9943,7 +9998,7 @@ menu_openflux() {
                     echo "  Введите 1 ссылку на облачный документ для этого независимого канала."
                     echo "  Ссылки сохраняются изолированно в профиле Классического балансира."
                 fi
-                echo "• Поддерживаются: Яндекс Доски (boards.yandex.ru), Облако Mail.ru, Cups.online."
+                echo "• Поддерживаются: Яндекс Волга, Яндекс Доски, Облако Mail.ru, Cups.online."
                 echo "• Оставьте пустым и нажмите Enter, чтобы очистить ссылку (отключить канал)."
                 echo ""
                 read -rp "Новая ссылка: " new_u
@@ -9956,15 +10011,23 @@ menu_openflux() {
                     echo " 3) boards     (Яндекс Доски - boards.yandex.ru)"
                     echo " 4) cupsonline (Cups.online - комнаты live-coding)"
                     echo " 5) oneme      (MAX Messenger / VK Calls)"
-                    read -rp "Транспорт [1-5, Enter для '$auto_tr']: " sel_tr
+                    echo " 6) vyandex    (Яндекс Волга, новый редактор)"
+                    read -rp "Транспорт [1-6, Enter для '$auto_tr']: " sel_tr
                     local use_tr="$auto_tr"
                     case "$sel_tr" in
                         2) use_tr="mailru" ;;
                         3) use_tr="boards" ;;
                         4) use_tr="cupsonline" ;;
                         5) use_tr="oneme" ;;
+                        6) use_tr="vyandex" ;;
                         *) use_tr="$auto_tr" ;;
                     esac
+                    if [ "$use_tr" = vyandex ]; then
+                        configure_volga_channel "$target_ch" "$new_u" || { read -rp "Enter — назад: " _; continue; }
+                        sync_openflux_to_sub_server
+                        read -rp "Enter — назад: " _
+                        continue
+                    fi
                     echo ""
                     echo -e "${CYAN}→ Экспресс-проверка доступности ссылки...${NC}"
                     test_openflux_link "$new_u" "$use_tr"
@@ -10012,7 +10075,7 @@ menu_openflux() {
                     echo "  Для каждого канала вводите 1 ссылку на облачный документ."
                 fi
                 echo "Введите по очереди ссылки на документы Яндекс / Mail.ru / Cups."
-                echo "Транспорт (mailru / boards / cupsonline) определяется автоматически по формату ссылки."
+                echo "Транспорт (mailru / boards / cupsonline / vyandex) определяется автоматически по формату ссылки."
                 echo "Нажмите Enter без ввода, чтобы оставить текущую ссылку без изменений."
                 echo ""
                 for m_ch in 1 2 3 4 5 6 7 8; do
@@ -10022,6 +10085,10 @@ menu_openflux() {
                     read -rp "  Введите URL: " in_u
                     if [ -n "$in_u" ]; then
                         local auto_m_tr=$(detect_transport_from_url "$in_u" "$of_transport")
+                        if [ "$auto_m_tr" = vyandex ]; then
+                            configure_volga_channel "$m_ch" "$in_u" || { read -rp "Ошибка: Enter — следующий канал: " _; }
+                            continue
+                        fi
                         set_openflux_channel_prop "$m_ch" "URL" "$in_u"
                         set_openflux_channel_prop "$m_ch" "ROLE" "exit"
                         set_openflux_channel_prop "$m_ch" "MODE" "l4"
@@ -10047,17 +10114,23 @@ menu_openflux() {
                 echo " 1) Mail.ru Документы (mailru - docs.datacloudmail.ru, Облако Mail.ru, рекомендуется)"
                 echo " 2) Яндекс Доски (boards - boards.yandex.ru, интерактивная доска, без капчи)"
                 echo " 3) Cups.online (cupsonline - комнаты live-coding)"
-                read -rp "Выберите транспорт [1-3]: " tr_choice
+                echo " 4) Яндекс Волга (vyandex - новый редактор документов)"
+                read -rp "Выберите транспорт [1-4]: " tr_choice
                 local new_tr=""
                 case "$tr_choice" in
                     1) new_tr="mailru" ;;
                     2) new_tr="boards" ;;
                     3) new_tr="cupsonline" ;;
+                    4) new_tr="vyandex" ;;
                     *) echo -e "${YELLOW}Без изменений.${NC}" ;;
                 esac
                 if [ -n "$new_tr" ]; then
-                    set_openflux_prop "TRANSPORT" "$new_tr"
-                    echo -e "${GREEN}✓ Транспорт установлен: ${new_tr}${NC}"
+                    for r_ch in 1 2 3 4 5 6 7 8; do
+                        if [ -z "$(get_openflux_channel_prop "$r_ch" URL "")" ]; then
+                            set_openflux_channel_prop "$r_ch" TRANSPORT "$new_tr"
+                        fi
+                    done
+                    echo 'Транспорт назначен свободным каналам. Для настроенного канала выберите «Каналы».'
                 fi
                 for r_ch in 1 2 3 4 5 6 7 8; do
                     if [ -n "$(get_openflux_channel_prop "$r_ch" "URL" "")" ] && systemctl is-active --quiet "openflux@$r_ch"; then

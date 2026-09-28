@@ -1,14 +1,9 @@
 {
-  "repository": "lesovoi53/xray-manager",
-  "release": "v2026.09.29.1",
-  "versions": {
-    "snell": "5.0.1",
-    "mieru": "3.38.0",
-    "openflux": "d13aa5b7 + multistream/boards + Volga server patches",
-    "webdav": "b1af4c05",
-    "cottendns": "v2026.09.01.221444-530ffbf",
-    "masterdns": "v2026.06.13.234407-7de2476"
-  },
+  "stage": "release",
+  "base_revision": "d13aa5b701c8ee5311aa638de16c70ea094d9dfd",
+  "base_source_sha256": "2d3077bb48f02d8623264fa60143b12035383dc57707b0b27d4946c1019e9951",
+  "selected_volga_upstream_revision": "ad516948d881009542ef7a89c01b3b5535bbc9dc",
+  "source_files_verified_against_published_archive_ignoring_crlf": 81,
   "sha256": {
     "cottendns-amd64.tar.gz": "e40a51672bdfeeaf11a332a23873fb087e1c7b426e0950dfe6f5a78c6a504e25",
     "snell-amd64.zip": "9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539",
@@ -21,11 +16,5 @@
     "webdav-tunnel-source.tar.gz": "f4b9c2abcf96a7fd6d0783d4bbfd8e8c8e98c74c909a6e169a2ba03441f78a9a",
     "openflux-volga-check-amd64": "c67bff2bd55d6de9738a1111c2888b999eed3bedb639c4d5ba596d8674951b6f"
   },
-  "platform": {
-    "os": [
-      "debian12",
-      "debian13"
-    ],
-    "architecture": "amd64"
-  }
+  "release": "v2026.09.29.1"
 }

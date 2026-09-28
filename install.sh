@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.28.1.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.29.1.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -172,6 +172,7 @@ asset() { python3 "$SCRIPT_DIR/scripts/release-assets.py" "$1" "$WORK_DIR/$2"; }
 [ "$INSTALL_SNELL" != yes ] || asset 'snell-{arch}.zip' snell-package.zip
 [ "$INSTALL_MIERU" != yes ] || asset 'mita-{arch}.deb' mita.deb
 [ "$INSTALL_OPENFLUX" != yes ] || asset 'openflux-{arch}' openflux
+[ "$INSTALL_OPENFLUX" != yes ] || asset 'openflux-volga-check-{arch}' openflux-volga-check
 [ "${INSTALL_WEBDAV_TUNNEL:-yes}" != yes ] || asset 'webdav-tunnel-{arch}' webdav-tunnel
 xm_begin
 echo -e "${CYAN}==> Шаг 2: Анализ и настройка шлюзов ядра Xray (панель / standalone / заданные шлюзы)...${NC}"
@@ -507,6 +508,10 @@ if [ "$INSTALL_OPENFLUX" = "yes" ]; then
     
     install -m 0755 "$WORK_DIR/openflux" /usr/local/bin/openflux.new
     mv -f /usr/local/bin/openflux.new /usr/local/bin/openflux
+    install -m 0755 "$WORK_DIR/openflux-volga-check" /usr/local/bin/openflux-volga-check.new
+    mv -f /usr/local/bin/openflux-volga-check.new /usr/local/bin/openflux-volga-check
+    xm_install_asset systemd/volga-cookies.service /etc/systemd/system/volga-cookies.service 0644
+    xm_install_asset systemd/volga-cookies.timer /etc/systemd/system/volga-cookies.timer 0644
     xm_install_asset scripts/openflux-routing.sh /usr/local/bin/openflux-routing.sh 0755
     xm_install_asset scripts/openflux-runner.sh /usr/local/bin/openflux-runner.sh 0755
     xm_install_asset systemd/openflux@.service /etc/systemd/system/openflux@.service 0644
@@ -631,8 +636,8 @@ fi
 echo -e "${CYAN}==> Шаг 9: Развертывание диспетчера x-manager...${NC}"
 xm_install_asset bin/x-manager /usr/local/bin/x-manager 0755
 install -d -m 0755 /usr/local/share/x-manager /usr/local/share/x-manager/patches /usr/local/share/x-manager/scripts
-install -m 0644 "$SCRIPT_DIR/patches/openflux-multistream.patch" /usr/local/share/x-manager/patches/
-install -m 0644 "$SCRIPT_DIR/scripts/"{webdav-config.py,webdav-encryption.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/patches/"*.patch /usr/local/share/x-manager/patches/
+install -m 0644 "$SCRIPT_DIR/scripts/"{openflux-volga.py,tuna-watchdog.py,volga-cookie-capture.ps1,webdav-config.py,webdav-encryption.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/components.json" /usr/local/share/x-manager/components.json
 install -m 0644 "$SCRIPT_DIR/scripts/menu-actions.tsv" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/installer-state.py" /usr/local/share/x-manager/scripts/
@@ -685,6 +690,7 @@ for unit, previous in json.load(open(sys.argv[1]))['services'].items():
     if previous['enabled'] == 'disabled':
         subprocess.run(['systemctl', 'disable', unit], check=True)
 PY
+rm -f /etc/x-manager/volga-preview.lock
 XM_TRANSACTION=0
 rm -rf -- "$WORK_DIR"
 echo "Rollback: bash /usr/local/share/x-manager/distribution/install.sh --rollback $XM_BACKUP"

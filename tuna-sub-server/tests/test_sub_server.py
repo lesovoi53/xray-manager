@@ -120,10 +120,10 @@ class TunaSubscriptionTests(unittest.TestCase):
     def test_01_create_user(self):
         payload = {
             "nickname": "ivan",
-            "csqtt": "csqtt://sad_534188_sad@185.22.153.4:37000?plugin=v2ray+tls",
-            "qwdtt": "qwdtt://config?name=WDTT-Main&peer=185.22.153.4%3A56000&hashes=#",
-            "snell": "snell://secret_psk_123@185.22.153.4:1488/?version=5&reuse=true&tfo=true#Snell-v5",
-            "mieru": "mierus://ADMIN:mita_pass@185.22.153.4/?profile=Home&port=2020-2030&low-entropy-mode=LOW_ENTROPY_MODE_48",
+            "csqtt": "csqtt://fixture-csqtt-password@192.0.2.40:37000?plugin=v2ray+tls",
+            "qwdtt": "qwdtt://config?name=WDTT-Main&peer=192.0.2.40%3A56000&hashes=#",
+            "snell": "snell://secret_psk_123@192.0.2.40:1488/?version=5&reuse=true&tfo=true#Snell-v5",
+            "mieru": "mierus://ADMIN:mita_pass@192.0.2.40/?profile=Home&port=2020-2030&low-entropy-mode=LOW_ENTROPY_MODE_48",
             "masterdnsvpn": "stormdns://d.example.com?key=a7125b5f3cc23e525123c677bc6d202e#StormDNS"
         }
         status, headers, body = self.api_request("POST", "/api/users", payload)
@@ -764,9 +764,9 @@ class TunaSubscriptionTests(unittest.TestCase):
             ]
         }
 
-        # 1. Запрещенный транспорт (vyandex, yandex, vless и др.)
+        # 1. Запрещенный транспорт (yandex, vless и др.)
         bad_tr_payload = json.loads(json.dumps(base_payload))
-        bad_tr_payload["groups"][0]["transport"] = "vyandex"
+        bad_tr_payload["groups"][0]["transport"] = "yandex"
         ok_tr, err_tr, _ = serialize_openflux_v2_bundle(bad_tr_payload)
         self.assertFalse(ok_tr)
         self.assertIn("forbidden transport", err_tr)
@@ -877,11 +877,11 @@ class TunaSubscriptionTests(unittest.TestCase):
         })
         self.assertEqual(st_comma, 400)
 
-        # 3. Отклонение запрещенного транспорта (vyandex)
+        # 3. Отклонение запрещенного транспорта (yandex)
         st_bad, _, b_bad = self.api_request("POST", "/api/openflux/groups", {
-            "name": "Bad-Vyandex",
+            "name": "Bad-Legacy-Yandex",
             "mode": "classic",
-            "transport": "vyandex",
+            "transport": "yandex",
             "urls": ["https://disk.yandex.ru/i/123"]
         })
         self.assertEqual(st_bad, 400)
@@ -1293,9 +1293,9 @@ class TunaSubscriptionTests(unittest.TestCase):
         with open(os.path.join(mock_instances_dir, "2.env"), "w", encoding="utf-8") as f:
             f.write('TRANSPORT="boards"\nCODEC="batched"\nURL="https://boards.example.com/doc/2"\n')
 
-        # Слот 3: vyandex (НЕВАЛИДНЫЙ транспорт в v2 - должен быть пропущен)
+        # Слот 3: yandex (НЕВАЛИДНЫЙ транспорт в v2 - должен быть пропущен)
         with open(os.path.join(mock_instances_dir, "3.env"), "w", encoding="utf-8") as f:
-            f.write('TRANSPORT="vyandex"\nURL="https://disk.yandex.ru/i/skipped"\n')
+            f.write('TRANSPORT="yandex"\nURL="https://disk.yandex.ru/i/skipped"\n')
 
         pool_mode_file = os.path.join(self.test_dir, "pool.mode")
         with open(pool_mode_file, "w", encoding="utf-8") as f:

@@ -16,16 +16,17 @@ import tarfile
 
 CONFIGS = ["/etc/" + p for p in (
     "x-manager", "snell", "mita", "mieru", "openflux", "webdav-tunnel", "tuna-subscriptions")]
-BINARIES = ["snell-server", "mita", "openflux", "webdav-tunnel", "x-manager", "tuna-subscriptions", "tuna-groups", "tuna_connection_groups.py",
+BINARIES = ["snell-server", "mita", "openflux", "openflux-volga-check", "webdav-tunnel", "x-manager", "tuna-subscriptions", "tuna-groups", "tuna_connection_groups.py",
             "snell-routing.sh", "wdtt-tproxy.sh", "openflux-routing.sh", "openflux-runner.sh",
             "webdav-tunnel-routing.sh", "webdav-tunnel-runner.sh"]
 ALIASES = ["snell", "mieru", "wdtt", "qwdtt", "csqtt", "dns", "cottendns", "masterdns", "ssl", "cert",
            "fw", "firewall", "sub", "tuna", "openflux", "flux", "webdav", "wdav"]
-UNITS = ["snell", "mita", "wdtt-tproxy", "openflux@", "webdav-tunnel", "tuna-subscriptions"]
-SERVICES = [u + ".service" for u in UNITS if not u.endswith("@")] + ["openflux@%d.service" % n for n in range(1, 9)] + ["x-ui.service"]
+UNITS = ["snell", "mita", "wdtt-tproxy", "openflux@", "webdav-tunnel", "tuna-subscriptions", "volga-cookies"]
+SERVICES = [u + ".service" for u in UNITS if not u.endswith("@")] + ["openflux@%d.service" % n for n in range(1, 9)] + ["x-ui.service", "volga-cookies.timer"]
 PATHS = CONFIGS + ["/usr/local/bin/" + b for b in BINARIES + ["x-" + a for a in ALIASES]]
 PATHS += ["/usr/bin/mita", "/usr/local/share/x-manager", "/var/lib/tuna-subscriptions",
           "/etc/x-ui/x-ui.db", "/etc/systemd/system/mita.service.d"] + ["/etc/systemd/system/" + u + ".service" for u in UNITS]
+PATHS += ["/etc/systemd/system/volga-cookies.timer"]
 
 
 def run(*args, **kwargs):

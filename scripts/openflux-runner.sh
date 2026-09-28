@@ -40,7 +40,41 @@ if [ -z "$URL" ]; then
     exit 1
 fi
 
-ARGS=("--role=$ROLE" "--mode=$MODE" "--transport=$TRANSPORT" "--codec=$CODEC" "--url=$URL")
+ARGS=("--role=$ROLE" "--mode=$MODE" "--transport=$TRANSPORT" "--codec=$CODEC")
+if [ "$TRANSPORT" = vyandex ]; then
+    # Keep document URLs out of the process command line.
+    umask 077
+    URL_FILE=$(mktemp /etc/openflux/.volga-urls-XXXXXX)
+    trap 'rm -f "$URL_FILE"' EXIT
+    printf '%s' "$URL" > "$URL_FILE"
+    python3 /usr/local/share/x-manager/scripts/openflux-volga.py validate "$URL_FILE"
+    # The descriptor remains open across exec; the temporary path is removed.
+    exec 3<"$URL_FILE"
+    rm "$URL_FILE"
+    trap - EXIT
+    ARGS+=("--url-file=/proc/self/fd/3")
+    COOKIES_FILE="${YANDEX_COOKIES_FILE:-/etc/openflux/yandex-cookies.txt}"
+    if [ -e "$COOKIES_FILE" ]; then
+        [ -r "$COOKIES_FILE" ] || { echo 'Volga cookies file is unreadable' >&2; exit 1; }
+        ARGS+=("--yandex-cookies-file=$COOKIES_FILE")
+    elif [ -n "${YANDEX_COOKIES_FILE:-}" ]; then
+        echo 'Configured Volga cookies file is missing' >&2; exit 1
+    fi
+    ROUTING=xray
+    [ ! -f /etc/openflux/routing.mode ] || ROUTING=$(tr -d ' \r\n' < /etc/openflux/routing.mode)
+    case "$ROUTING" in
+        xray)
+            [ -r /etc/x-manager/gateways.env ] || { echo 'SOCKS5 gateway configuration missing' >&2; exit 1; }
+            . /etc/x-manager/gateways.env
+            [[ "${XRAY_SOCKS_PORT:-}" =~ ^[0-9]+$ ]] && ((XRAY_SOCKS_PORT > 0 && XRAY_SOCKS_PORT < 65536)) || { echo 'Invalid SOCKS5 gateway port' >&2; exit 1; }
+            ARGS+=("--upstream-socks5=127.0.0.1:$XRAY_SOCKS_PORT")
+            ;;
+        direct) ;;
+        *) echo 'Unknown OpenFlux routing mode' >&2; exit 1;;
+    esac
+else
+    ARGS+=("--url=$URL")
+fi
 
 if [ "$DEBUG" = "1" ] || [ "$DEBUG" = "true" ]; then
     ARGS+=("--debug")
@@ -54,7 +88,7 @@ if [ -n "$ENCRYPTION_KEY" ]; then
 elif [ -n "$ENCRYPTION_KEY_FILE" ] && [ -f "$ENCRYPTION_KEY_FILE" ]; then
     ARGS+=("--encryption-key-file=$ENCRYPTION_KEY_FILE")
 else
-    rm -f "$KEY_FILE" 2>/dev/null || true
+    rm -f "$KEY_FILE"
 fi
 
 echo "[OpenFlux #$INSTANCE] Запуск: role=$ROLE mode=$MODE transport=$TRANSPORT codec=$CODEC (URL and key hidden)"

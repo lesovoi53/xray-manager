@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Yandex Volga cookies every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=30min
+RandomizedDelaySec=2min
+Unit=volga-cookies.service
+
+[Install]
+WantedBy=timers.target

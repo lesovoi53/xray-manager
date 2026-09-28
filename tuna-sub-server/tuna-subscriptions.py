@@ -54,7 +54,7 @@ DEFAULT_CONFIG = {
 
 # Константы нормативного контракта OpenFlux v2 (TUNA 1.1.43-rc8)
 OPENFLUX_SCHEMA_V2 = "tuna.openflux.bundle"
-ALLOWED_OPENFLUX_TRANSPORTS = {"mailru", "boards", "cupsonline"}
+ALLOWED_OPENFLUX_TRANSPORTS = {"mailru", "boards", "cupsonline", "vyandex"}
 ALLOWED_OPENFLUX_MODES = {"classic", "multistream"}
 ALLOWED_OPENFLUX_CODECS = {"legacy", "batched"}
 ALLOWED_BALANCER_STRATEGIES = {"roundRobin", "leastPing"}
@@ -364,7 +364,13 @@ def validate_openflux_url(val: str, transport: str = None) -> tuple[bool, str]:
     netloc_lower = parsed.netloc.lower()
     if transport:
         tr = str(transport).strip().lower()
-        if tr == "mailru":
+        if tr == "vyandex":
+            try:
+                if parsed.hostname not in ("disk.yandex.ru", "docs.yandex.ru") or parsed.username or parsed.password or parsed.port not in (None, 443) or parsed.path in ("", "/"):
+                    return False, "Volga requires an HTTPS document on disk.yandex.ru or docs.yandex.ru"
+            except ValueError:
+                return False, "Invalid Volga document port"
+        elif tr == "mailru":
             if not ("mail.ru" in netloc_lower or "example.com" in netloc_lower):
                 return False, f"mailru URL host must be on mail.ru (got: {parsed.netloc})"
         elif tr == "boards":

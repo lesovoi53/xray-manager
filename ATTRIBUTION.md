@@ -1,6 +1,6 @@
 # Компоненты, авторство и лицензии
 
-Сведения сверены 26 сентября 2026 года для X-Manager **v2026.09.28.1**. Лицензия собственного кода X-Manager — [MIT](LICENSE). Она не заменяет лицензии независимых компонентов. Возможности транспорта, сжатия и шифрования следует относить к их авторам.
+Базовые сведения сверены 26 сентября 2026 года; описание серверных изменений OpenFlux дополнено для X-Manager **v2026.09.29.1**. Лицензия собственного кода X-Manager — [MIT](LICENSE). Она не заменяет лицензии независимых компонентов. Возможности транспорта, сжатия и шифрования следует относить к их авторам.
 
 ## Компоненты закреплённого выпуска
 
@@ -8,13 +8,15 @@
 |---|---|---|
 | Snell | Surge Networks, [официальные примечания](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell), бинарник 5.0.1 | Поставляется оригинальный бинарник; исходников в архиве нет. MIT X-Manager не распространяется на него; условия использования определяются поставщиком |
 | Mieru / mita | [enfein/mieru v3.38.0](https://github.com/enfein/mieru/tree/v3.38.0) | GPL-3.0: [mieru.txt](licenses/mieru.txt), [mita.txt](licenses/mita.txt) |
-| OpenFlux | [p1neappleXpress/OpenFlux d13aa5b7](https://github.com/p1neappleXpress/OpenFlux/tree/d13aa5b701c8ee5311aa638de16c70ea094d9dfd), с поставляемым патчем | GPL-3.0-or-later по README закреплённой версии; текст GPL-3.0: [openflux.txt](licenses/openflux.txt) |
+| OpenFlux | [p1neappleXpress/OpenFlux d13aa5b7](https://github.com/p1neappleXpress/OpenFlux/tree/d13aa5b701c8ee5311aa638de16c70ea094d9dfd), с поставляемыми Multi-stream/Boards и Volga server патчами | GPL-3.0-or-later по README закреплённой версии; текст GPL-3.0: [openflux.txt](licenses/openflux.txt) |
 | WebDAV Tunnel | [spkprsnts/webdav-tunnel b1af4c05](https://github.com/spkprsnts/webdav-tunnel/tree/b1af4c05eb80fd29a6f676be894fa61cd12a3dec), copyright spkprsnts | MIT: [webdav-tunnel.txt](licenses/webdav-tunnel.txt) |
 | CottenDNS | [WhiteDNS/CottenDNS v2026.09.01.221444-530ffbf](https://github.com/WhiteDNS/CottenDNS/tree/v2026.09.01.221444-530ffbf) | MIT; цепочка MasterDnsVPN → StormDNS → CottenDNS и уведомления авторов: [cottendns.txt](licenses/cottendns.txt) |
 | MasterDnsVPN | [masterking32/MasterDnsVPN v2026.06.13.234407-7de2476](https://github.com/masterking32/MasterDnsVPN/tree/v2026.06.13.234407-7de2476), Amin Mahmoudi | MIT: [masterdns.txt](licenses/masterdns.txt) |
 | TUNA Subscription Server | Встроенный модуль [tuna-sub-server](tuna-sub-server) этого репозитория | Лицензия проекта [MIT](LICENSE) |
 
-В собственном Release также размещены соответствующие исходные архивы Mieru, OpenFlux и WebDAV. OpenFlux source asset уже содержит применённый патч; повторное применение не требуется. Состав, происхождение и инструкции для сборки: [licenses/COMPONENTS.md](licenses/COMPONENTS.md). Точные SHA-256: [components.json](components.json).
+В собственном Release также размещены соответствующие исходные архивы Mieru, OpenFlux и WebDAV. OpenFlux source asset уже содержит оба применённых патча; повторное применение не требуется. Состав, происхождение и инструкции для сборки: [licenses/COMPONENTS.md](licenses/COMPONENTS.md). Точные SHA-256: [components.json](components.json).
+
+Выбранные исправления Волги перенесены с учётом работы авторов [OpenFlux PR #115](https://github.com/p1neappleXpress/OpenFlux/pull/115), закреплённая ревизия `ad516948d881009542ef7a89c01b3b5535bbc9dc`. Полное соответствующее дерево исходников поставляется в Release; происхождение и сборка описаны в [руководстве разработчика](docs/DEVELOPMENT.md) и [provenance](patches/openflux-provenance.json). Состав локальных изменений не следует приписывать одному автору или считать полной новой upstream-версией.
 
 ## Независимые установки и интеграции
 

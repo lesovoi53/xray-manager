@@ -145,12 +145,13 @@ xm_maintenance_menu() {
     local choice
     while true; do
         xm_header 'Обслуживание'
-        printf '  [1] Обновить полный выпуск\n  [2] Восстановить резервную копию\n  [3] Пересканировать и подхватить службы\n  [4] Перезапустить службы пакета\n  [0] Назад\n'
+        printf '  [1] Обновить полный выпуск\n  [2] Восстановить резервную копию\n  [3] Пересканировать и подхватить службы\n  [4] Перезапустить службы пакета\n  [5] TUNA Watchdog — ограниченный автоперезапуск\n  [0] Назад\n'
         read -r -p 'Действие: ' choice || return
         case "$choice" in
             1) xm_release_update;; 2) xm_backup_menu;;
             3) xm_confirm 'Подхватить обнаруженные службы? Это может обновить служебные настройки.' && rescan_and_adopt_protocols;;
             4) xm_confirm 'Перезапуск прервёт текущие подключения.' && restart_all_services;;
+            5) python3 /usr/local/share/x-manager/scripts/tuna-watchdog.py menu; xm_pause;;
             0) return;; *) echo 'Неверный выбор';;
         esac
     done
