@@ -57,6 +57,26 @@
 
 Нужны root, Debian 12/13 amd64, работающий systemd, доступ к APT Debian и GitHub Releases. Для режима Xray сначала должны быть подготовлены совместимые локальные шлюзы; для самостоятельной установки без Xray предусмотрен `--direct`.
 
+### Быстрый старт — одна команда
+
+Выполните **от root** на Debian 12/13 amd64. Команда скачает полный закреплённый выпуск, проверит SHA-256 и запустит установщик. Нужны `curl`, `tar` и `sha256sum`; остальные зависимости проверяет установщик. При ошибке скачивания или проверки установка не запускается.
+
+```bash
+bash -c 'set -euo pipefail; work=$(mktemp -d); trap "rm -rf -- \"$work\"" EXIT; cd "$work"; base=https://github.com/lesovoi53/xray-manager/releases/download/v2026.09.29.2; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/x-manager.tar.gz" -o x-manager.tar.gz; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/SHA256SUMS" -o SHA256SUMS; sha256sum --ignore-missing -c SHA256SUMS; mkdir source; tar -xzf x-manager.tar.gz -C source; bash source/install.sh --quick'
+```
+
+По умолчанию используется Xray: для совместимой базы x-ui установщик подхватывает/создаёт шлюзы, для standalone нужны заранее настроенные совместимые шлюзы. Для чистой установки **без Xray** замените последний `--quick` на `--direct`.
+
+### Обновление старого скрипта со старым watchdog — одна команда
+
+Предварительно ничего удалять не нужно. Эта команда явно разрешает переход со старого `tuna-watchdog.timer` на ограниченные перезапуски после резервирования:
+
+```bash
+bash -c 'set -euo pipefail; work=$(mktemp -d); trap "rm -rf -- \"$work\"" EXIT; cd "$work"; base=https://github.com/lesovoi53/xray-manager/releases/download/v2026.09.29.2; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/x-manager.tar.gz" -o x-manager.tar.gz; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/SHA256SUMS" -o SHA256SUMS; sha256sum --ignore-missing -c SHA256SUMS; mkdir source; tar -xzf x-manager.tar.gz -C source; bash source/install.sh --update --migrate-legacy-watchdog'
+```
+
+Полный комплект добавляет отсутствующие TUNA/WebDAV. Обновление может кратковременно прервать соединения. Сохраните выведенные пути `Backup:` и `Rollback:`. Подробности перехода, лимиты watchdog и ограничения: [инструкция обновления](docs/UPGRADE_TEMPLATE_GATEWAYS.md). SHA-256 проверяет соответствие manifest выпуска, но не является независимой подписью издателя.
+
 Проверяемая загрузка полного выпуска и команды всех режимов приведены в [руководстве](docs/USER_GUIDE.md#установка). После установки:
 
 ```bash
