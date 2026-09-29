@@ -23,10 +23,14 @@ ALIASES = ["snell", "mieru", "wdtt", "qwdtt", "csqtt", "dns", "cottendns", "mast
            "fw", "firewall", "sub", "tuna", "openflux", "flux", "webdav", "wdav"]
 UNITS = ["snell", "mita", "wdtt-tproxy", "openflux@", "webdav-tunnel", "tuna-subscriptions", "volga-cookies"]
 SERVICES = [u + ".service" for u in UNITS if not u.endswith("@")] + ["openflux@%d.service" % n for n in range(1, 9)] + ["x-ui.service", "volga-cookies.timer"]
+SERVICES = ['tuna-watchdog.timer', 'tuna-watchdog.service'] + SERVICES
 PATHS = CONFIGS + ["/usr/local/bin/" + b for b in BINARIES + ["x-" + a for a in ALIASES]]
 PATHS += ["/usr/bin/mita", "/usr/local/share/x-manager", "/var/lib/tuna-subscriptions",
           "/etc/x-ui/x-ui.db", "/etc/systemd/system/mita.service.d"] + ["/etc/systemd/system/" + u + ".service" for u in UNITS]
 PATHS += ["/etc/systemd/system/volga-cookies.timer"]
+WATCHDOG_UNITS = ['tuna-subscriptions','webdav-tunnel','snell','mita','wdtt','csqtt','masterdns','cottendns','x-ui'] + ['openflux@'+str(i) for i in range(1,9)]
+PATHS += ['/etc/systemd/system/'+unit+'.service.d' for unit in WATCHDOG_UNITS if unit != 'mita']
+PATHS += ['/etc/systemd/system/tuna-watchdog.service', '/etc/systemd/system/tuna-watchdog.timer', '/usr/local/bin/tuna-watchdog.sh']
 
 
 def run(*args, **kwargs):
@@ -102,7 +106,7 @@ def restore(dest):
             for suffix in ("-wal", "-shm"):
                 Path(target + suffix).unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
-    for unit, previous in state["services"].items():
+    for unit, previous in sorted(state["services"].items(), key=lambda pair: pair[0].endswith(".timer")):
         if previous["enabled"] in ("enabled", "disabled"):
             if subprocess.run(["systemctl", "enable" if previous["enabled"] == "enabled" else "disable", unit]).returncode:
                 failures.append(unit + ": enable state")

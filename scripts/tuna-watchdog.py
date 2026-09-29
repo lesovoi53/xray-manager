@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 
-UNITS=['tuna-subscriptions','webdav-tunnel','snell','mita','wdtt','csqtt','masterdns','cottendns']+['openflux@'+str(i) for i in range(1,9)]
+UNITS=['tuna-subscriptions','webdav-tunnel','snell','mita','wdtt','csqtt','masterdns','cottendns','x-ui']+['openflux@'+str(i) for i in range(1,9)]
 ROOT=Path('/etc/systemd/system')
 NAME='90-tuna-watchdog.conf'
 
@@ -43,6 +43,26 @@ def apply(unit,attempts,delay):
         ctl('daemon-reload');raise
     print(unit+': политика сохранена, работающая служба не перезапущена. Копия: '+str(backup))
 
+def retire_legacy(attempts, delay):
+    # Installer-only transition after the managed snapshot, with explicit opt-in.
+    if os.environ.get('XM_WATCHDOG_TRANSACTION') != '1':
+        raise ValueError('Legacy migration requires the installer backup transaction')
+    render(attempts, delay)
+    active = []
+    for unit in UNITS:
+        state = show(unit)
+        if state.get('LoadState') == 'loaded' and state.get('ActiveState') == 'active' and state.get('Type') != 'oneshot':
+            active.append(unit)
+    for unit in ('tuna-watchdog.timer', 'tuna-watchdog.service'):
+        if show(unit).get('LoadState') == 'loaded':
+            ctl('stop', unit)
+            if subprocess.run(['systemctl','is-enabled','--quiet',unit]).returncode == 0:
+                ctl('disable', unit)
+    for unit in active:
+        apply(unit, attempts, delay)
+    print('Legacy watchdog stopped; bounded policies applied without restarting running services.')
+
+
 def menu():
     while True:
         available=[]
@@ -72,9 +92,10 @@ def menu():
         elif action=='4':subprocess.run(['journalctl','-u',unit,'-n','30','--no-pager'],check=True)
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['menu','set']);parser.add_argument('--unit');parser.add_argument('--attempts',type=int,default=3);parser.add_argument('--delay',type=int,default=30)
+    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['menu','set','retire-legacy']);parser.add_argument('--unit');parser.add_argument('--attempts',type=int,default=3);parser.add_argument('--delay',type=int,default=30)
     a=parser.parse_args()
     if a.action=='menu':menu()
+    elif a.action=='retire-legacy':retire_legacy(a.attempts,a.delay)
     else:apply(a.unit,a.attempts,a.delay)
 if __name__=='__main__':
     try:main()

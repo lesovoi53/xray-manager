@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.29.1.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.09.29.2.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -26,6 +26,13 @@ if [ "${1:-}" = --rollback ]; then
     exit
 fi
 case "${1:-}" in ''|--quick|--update|--direct|--manual|-m|--interactive|-i) ;; *) xm_die 'Unknown option';; esac
+case "${2:-}" in ''|--migrate-legacy-watchdog) ;; *) xm_die 'Unknown second option';; esac
+[ "$#" -le 2 ] || xm_die 'Too many arguments'
+legacy_watchdog=no
+if systemctl is-active --quiet tuna-watchdog.timer || systemctl is-enabled --quiet tuna-watchdog.timer || systemctl is-active --quiet tuna-watchdog.service; then
+    legacy_watchdog=yes
+    [ "${2:-}" = --migrate-legacy-watchdog ] || xm_die 'Legacy watchdog is active. Review migration and use --update --migrate-legacy-watchdog; no installation changes made.'
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -175,6 +182,9 @@ asset() { python3 "$SCRIPT_DIR/scripts/release-assets.py" "$1" "$WORK_DIR/$2"; }
 [ "$INSTALL_OPENFLUX" != yes ] || asset 'openflux-volga-check-{arch}' openflux-volga-check
 [ "${INSTALL_WEBDAV_TUNNEL:-yes}" != yes ] || asset 'webdav-tunnel-{arch}' webdav-tunnel
 xm_begin
+if [ "$legacy_watchdog" = yes ]; then
+    XM_WATCHDOG_TRANSACTION=1 python3 "$SCRIPT_DIR/scripts/tuna-watchdog.py" retire-legacy --attempts 3 --delay 30
+fi
 echo -e "${CYAN}==> Шаг 2: Анализ и настройка шлюзов ядра Xray (панель / standalone / заданные шлюзы)...${NC}"
 mkdir -p /etc/x-manager
 ENV_FILE="/etc/x-manager/gateways.env"
@@ -637,7 +647,7 @@ echo -e "${CYAN}==> Шаг 9: Развертывание диспетчера x-
 xm_install_asset bin/x-manager /usr/local/bin/x-manager 0755
 install -d -m 0755 /usr/local/share/x-manager /usr/local/share/x-manager/patches /usr/local/share/x-manager/scripts
 install -m 0644 "$SCRIPT_DIR/patches/"*.patch /usr/local/share/x-manager/patches/
-install -m 0644 "$SCRIPT_DIR/scripts/"{openflux-volga.py,tuna-watchdog.py,volga-cookie-capture.ps1,webdav-config.py,webdav-encryption.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/scripts/"{xray_gateways.py,openflux-volga.py,tuna-watchdog.py,volga-cookie-capture.ps1,webdav-config.py,webdav-encryption.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/components.json" /usr/local/share/x-manager/components.json
 install -m 0644 "$SCRIPT_DIR/scripts/menu-actions.tsv" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/installer-state.py" /usr/local/share/x-manager/scripts/

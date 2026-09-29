@@ -9,6 +9,12 @@ import os
 import sqlite3
 import sys
 
+import importlib.util
+from pathlib import Path
+_spec = importlib.util.spec_from_file_location('xray_gateways', Path(__file__).with_name('xray_gateways.py'))
+_gateways = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_gateways)
+
 
 def configure(path):
     connection = sqlite3.connect(path)
@@ -16,18 +22,7 @@ def configure(path):
     messages = []
     try:
         connection.execute("BEGIN IMMEDIATE")
-        rows = list(connection.execute("SELECT * FROM inbounds"))
-        found = {}
-        for row in rows:
-            stream = json.loads(row["stream_settings"] or "{}")
-            settings = json.loads(row["settings"] or "{}")
-            if row["protocol"] in ("socks", "mixed") and row["enable"]:
-                # Egress has no credentials: do not select an authenticated/public proxy.
-                if settings.get("auth", "noauth") == "noauth" and row["listen"] in ("127.0.0.1", "::1"):
-                    found.setdefault("SOCKS", row["port"])
-            elif row["protocol"] == "dokodemo-door" and row["enable"] and settings.get("followRedirect"):
-                key = "TPROXY" if stream.get("sockopt", {}).get("tproxy") == "tproxy" else "REDIRECT"
-                found.setdefault(key, row["port"])
+        found, rows, template = _gateways.panel_gateways(connection, os.environ)
         definitions = {
             "SOCKS": (10808, "mixed", "in-mixed-gateway", {"auth": "noauth", "udp": True, "ip": "127.0.0.1"}, {}, {"enabled": False}),
             "TPROXY": (12345, "dokodemo-door", "in-tproxy-gateway", {"network": "tcp,udp", "followRedirect": True}, {"sockopt": {"tproxy": "tproxy"}}, {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}),
@@ -35,8 +30,6 @@ def configure(path):
         }
         for key, definition in list(definitions.items()):
             definitions[key] = (int(os.environ.get("XRAY_" + key + "_PORT", definition[0])),) + definition[1:]
-        template_row = connection.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig'").fetchone()
-        template = json.loads(template_row[0]) if template_row else None
         template_inbounds = template.get("inbounds", []) if template else []
         changed = False
         for key, (port, protocol, tag, settings, stream, sniffing) in definitions.items():

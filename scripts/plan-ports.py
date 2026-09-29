@@ -9,6 +9,11 @@ import socket
 import sqlite3
 import sys
 import importlib.util
+from contextlib import closing
+
+_spec = importlib.util.spec_from_file_location("xray_gateways", Path(__file__).with_name("xray_gateways.py"))
+_gateways = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_gateways)
 
 FORBIDDEN = {443, 8443}
 
@@ -63,23 +68,18 @@ def plan(root=Path("/")):
     reserved = set(FORBIDDEN)
     db = path("/etc/x-ui/x-ui.db")
     if db.exists():
-        with sqlite3.connect("file:" + str(db) + "?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect("file:" + str(db) + "?mode=ro", uri=True)) as connection:
             connection.row_factory = sqlite3.Row
-            rows = list(connection.execute("SELECT * FROM inbounds"))
+            preferred = dict(saved)
+            preferred.update({k:v for k,v in os.environ.items() if k in ('XRAY_SOCKS_PORT','XRAY_REDIRECT_PORT','XRAY_TPROXY_PORT')})
+            found, rows, template = _gateways.panel_gateways(connection, preferred)
             for row in rows:
-                reserved.add(int(row["port"]))
-                settings = json.loads(row["settings"] or "{}")
-                stream = json.loads(row["stream_settings"] or "{}")
-                key = None
-                if row["enable"] and row["protocol"] in ("mixed", "socks") and row["listen"] in ("127.0.0.1", "::1") and settings.get("auth", "noauth") == "noauth":
-                    key = "XRAY_SOCKS_PORT"
-                elif row["enable"] and row["protocol"] == "dokodemo-door" and settings.get("followRedirect"):
-                    key = "XRAY_TPROXY_PORT" if stream.get("sockopt", {}).get("tproxy") == "tproxy" else "XRAY_REDIRECT_PORT"
-                if key:
-                    saved.setdefault(key, str(row["port"]))
-            row = connection.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig'").fetchone()
-            if row:
-                reserved.update(int(ib["port"]) for ib in json.loads(row[0]).get("inbounds", []) if "port" in ib)
+                reserved.add(int(row['port']))
+            for inbound in (template or {}).get('inbounds', []):
+                if 'port' in inbound:
+                    reserved.add(int(inbound['port']))
+            for key, value in found.items():
+                saved['XRAY_'+key+'_PORT'] = str(value)
     if not db.exists():
         spec = importlib.util.spec_from_file_location('xray_discovery', Path(__file__).with_name('xray-discovery.py'))
         discovery = importlib.util.module_from_spec(spec)
