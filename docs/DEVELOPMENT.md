@@ -1,6 +1,6 @@
 # Руководство для дальнейшей разработки
 
-Актуальная серверная база: **v2026.09.29.2**. Поддерживаемая платформа — Debian 12/13 amd64 с systemd. Android-клиент разрабатывается отдельно. Это руководство дополняет [пользовательскую документацию](USER_GUIDE.md), [описание Волги](VOLGA_SERVER.md) и [API](../tuna-sub-server/README.md).
+Актуальная серверная база: **v2026.10.01.1**. Поддерживаемая платформа — Debian 12/13 amd64 с systemd. Android-клиент разрабатывается отдельно. Это руководство дополняет [пользовательскую документацию](USER_GUIDE.md), [описание Волги](VOLGA_SERVER.md) и [API](../tuna-sub-server/README.md).
 
 ## Карта кода
 
@@ -118,3 +118,7 @@ for script in install.sh bin/x-manager scripts/*.sh; do bash -n "$script" || exi
 ## Миграция старых установок (v2026.09.29.2)
 
 `xray_gateways.py` объединяет чтение таблицы `inbounds` и `xrayTemplateConfig` для планировщика и мигратора. Не возвращайте два независимых алгоритма выбора портов. Проверки: `tests/test_template_gateway_upgrade.py`. Переход со старого polling watchdog выполняется только при явном `--migrate-legacy-watchdog` и после snapshot. `tests/lab-legacy-watchdog.py` проверяет реальный systemd и оба пути отката. Детали и команда: [инструкция обновления](UPGRADE_TEMPLATE_GATEWAYS.md).
+
+## Snell: URI и связанные подписки
+
+Генератор, привязки, атомарное обновление и тесты описаны в [SNELL_SUBSCRIPTIONS.md](SNELL_SUBSCRIPTIONS.md). Используйте общий helper; не добавляйте отдельный шаблон snell:// в TUI.

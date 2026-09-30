@@ -2,7 +2,7 @@
 
 Серверный установщик и терминальный диспетчер сетевых служб для **Debian 12–13, x86_64 (amd64), systemd**. Объединяет управление Snell, Mieru, OpenFlux, WebDAV Tunnel, DNS-туннелями, установленными WDTT/CSQTT и локальным сервером подписок TUNA.
 
-Документация соответствует выпуску **v2026.09.29.2**. Возможности сверены с кодом этого репозитория и первоисточниками компонентов. X-Manager настраивает и связывает отдельные программы; протоколы, шифрование и транспортные движки принадлежат их авторам.
+Документация соответствует выпуску **v2026.10.01.1**. Возможности сверены с кодом этого репозитория и первоисточниками компонентов. X-Manager настраивает и связывает отдельные программы; протоколы, шифрование и транспортные движки принадлежат их авторам.
 
 ## Документация
 
@@ -13,6 +13,10 @@
 - [Закреплённые выпуски и меню](docs/RELEASES_AND_MENU.md).
 - [Фактические результаты приёмки](docs/VPS_DEPLOYMENT_20260925.md).
 - [Авторы и лицензии](ATTRIBUTION.md).
+
+## Исправление Snell в v2026.10.01.1
+
+Единая генерация ссылок с обфускацией и именем, точечная синхронизация связанных подписок, сохранение внешних ссылок и откат при ошибке. [Настройка, миграция и разработка](docs/SNELL_SUBSCRIPTIONS.md).
 
 ## Исправление обновления v2026.09.29.2
 
@@ -62,7 +66,7 @@
 Выполните **от root** на Debian 12/13 amd64. Команда скачает полный закреплённый выпуск, проверит SHA-256 и запустит установщик. Нужны `curl`, `tar` и `sha256sum`; остальные зависимости проверяет установщик. При ошибке скачивания или проверки установка не запускается.
 
 ```bash
-bash -c 'set -euo pipefail; work=$(mktemp -d); trap "rm -rf -- \"$work\"" EXIT; cd "$work"; base=https://github.com/lesovoi53/xray-manager/releases/download/v2026.09.29.2; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/x-manager.tar.gz" -o x-manager.tar.gz; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/SHA256SUMS" -o SHA256SUMS; sha256sum --ignore-missing -c SHA256SUMS; mkdir source; tar -xzf x-manager.tar.gz -C source; bash source/install.sh --quick'
+bash -c 'set -euo pipefail; work=$(mktemp -d); trap "rm -rf -- \"$work\"" EXIT; cd "$work"; base=https://github.com/lesovoi53/xray-manager/releases/download/v2026.10.01.1; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/x-manager.tar.gz" -o x-manager.tar.gz; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/SHA256SUMS" -o SHA256SUMS; sha256sum --ignore-missing -c SHA256SUMS; mkdir source; tar -xzf x-manager.tar.gz -C source; bash source/install.sh --quick'
 ```
 
 По умолчанию используется Xray: для совместимой базы x-ui установщик подхватывает/создаёт шлюзы, для standalone нужны заранее настроенные совместимые шлюзы. Для чистой установки **без Xray** замените последний `--quick` на `--direct`.
@@ -72,7 +76,7 @@ bash -c 'set -euo pipefail; work=$(mktemp -d); trap "rm -rf -- \"$work\"" EXIT; 
 Предварительно ничего удалять не нужно. Эта команда явно разрешает переход со старого `tuna-watchdog.timer` на ограниченные перезапуски после резервирования:
 
 ```bash
-bash -c 'set -euo pipefail; work=$(mktemp -d); trap "rm -rf -- \"$work\"" EXIT; cd "$work"; base=https://github.com/lesovoi53/xray-manager/releases/download/v2026.09.29.2; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/x-manager.tar.gz" -o x-manager.tar.gz; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/SHA256SUMS" -o SHA256SUMS; sha256sum --ignore-missing -c SHA256SUMS; mkdir source; tar -xzf x-manager.tar.gz -C source; bash source/install.sh --update --migrate-legacy-watchdog'
+bash -c 'set -euo pipefail; work=$(mktemp -d); trap "rm -rf -- \"$work\"" EXIT; cd "$work"; base=https://github.com/lesovoi53/xray-manager/releases/download/v2026.10.01.1; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/x-manager.tar.gz" -o x-manager.tar.gz; curl -fL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300 --retry 2 "$base/SHA256SUMS" -o SHA256SUMS; sha256sum --ignore-missing -c SHA256SUMS; mkdir source; tar -xzf x-manager.tar.gz -C source; bash source/install.sh --update --migrate-legacy-watchdog'
 ```
 
 Полный комплект добавляет отсутствующие TUNA/WebDAV. Обновление может кратковременно прервать соединения. Сохраните выведенные пути `Backup:` и `Rollback:`. Подробности перехода, лимиты watchdog и ограничения: [инструкция обновления](docs/UPGRADE_TEMPLATE_GATEWAYS.md). SHA-256 проверяет соответствие manifest выпуска, но не является независимой подписью издателя.

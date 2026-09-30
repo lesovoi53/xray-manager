@@ -509,11 +509,23 @@ get_snell_obfs() {
 
 get_snell_tag() {
     if [ -f "/etc/snell/tag.txt" ]; then
-        local t=$(cat "/etc/snell/tag.txt" | tr -d '[:space:]')
+        local t=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' /etc/snell/tag.txt)
         [ -n "$t" ] && echo "$t" || echo "Snell-v5"
     else
         echo "Snell-v5"
     fi
+}
+
+snell_tool() {
+    local helper="/usr/local/share/x-manager/scripts/snell-subscriptions.py"
+    if [ ! -f "$helper" ]; then
+        helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)/snell-subscriptions.py"
+    fi
+    python3 "$helper" "$@" --server-ip "$SERVER_IP"
+}
+
+get_snell_uri() {
+    snell_tool uri
 }
 
 snell_change_tag() {
@@ -522,11 +534,9 @@ snell_change_tag() {
     echo -e "${BOLD}--- Настройка имени подключения Snell ---${NC}"
     echo -e "Текущее имя подключения: ${CYAN}${cur_tag}${NC}"
     echo ""
-    read -p "Введите новое имя подключения (например, Snell-Home, Proxy-1): " new_tag
-    if [ -n "$new_tag" ]; then
-        new_tag=$(echo "$new_tag" | tr -d '#&/?')
-        mkdir -p /etc/snell
-        echo "$new_tag" > /etc/snell/tag.txt
+    read -r -p "Введите новое имя подключения (0 — отмена): " new_tag || return
+    if [ -n "$new_tag" ] && [ "$new_tag" != 0 ]; then
+        printf '%s' "$new_tag" | python3 -c 'import json,sys; print(json.dumps({"name":sys.stdin.read()}))' | snell_tool set || return 1
         echo -e "${GREEN}✓ Имя подключения сохранено: ${new_tag}${NC}"
         sleep 2
     fi
@@ -569,16 +579,13 @@ get_snell_routing() {
 }
 
 restart_snell_and_verify() {
-    chown -R snell:snell "$SNELL_CONFIG_DIR"
-    chmod 644 "$SNELL_CONFIG_FILE"
-    systemctl daemon-reload
-    systemctl restart snell
+    systemctl restart snell || return 1
     sleep 2
     if systemctl is-active --quiet snell; then
         echo -e "${GREEN}✓ Snell v5 успешно перезапущен и работает (RUNNING)!${NC}"
     else
         echo -e "${RED}✗ Внимание: Snell не смог запуститься!${NC}"
-        journalctl -u snell -n 8 --no-pager
+        return 1
     fi
 }
 
@@ -1654,19 +1661,14 @@ snell_manage_obfs() {
     read -p "Выберите режим [0-2]: " ob_choice
     case "$ob_choice" in
         1)
-            read -p "Введите домен для HTTP маскировки (например, ya.ru или vk.com): " custom_host
-            [ -z "$custom_host" ] && return
-            sed -i '/^obfs/d' "$SNELL_CONFIG_FILE"
-            echo "obfs = http" >> "$SNELL_CONFIG_FILE"
-            echo "obfs-host = ${custom_host}" >> "$SNELL_CONFIG_FILE"
-            restart_snell_and_verify
+            read -r -p "Введите домен для HTTP маскировки (0 — отмена): " custom_host || return
+            [ -z "$custom_host" ] || [ "$custom_host" = 0 ] && return
+            printf '%s' "$custom_host" | python3 -c 'import json,sys; print(json.dumps({"obfs":"http","obfs_host":sys.stdin.read()}))' | snell_tool set || return 1
             echo -e "${GREEN}✓ Установлена HTTP-обфускация: ${custom_host}${NC}"
             sleep 2
             ;;
         2)
-            sed -i '/^obfs/d' "$SNELL_CONFIG_FILE"
-            echo "obfs = off" >> "$SNELL_CONFIG_FILE"
-            restart_snell_and_verify
+            printf '%s' '{"obfs":"off"}' | snell_tool set || return 1
             echo -e "${GREEN}✓ Обфускация отключена (Чистый Snell v5)${NC}"
             sleep 2
             ;;
@@ -1702,9 +1704,7 @@ snell_change_psk() {
         *) echo "Неверный выбор"; sleep 1; return ;;
     esac
 
-    sed -i '/^psk/d' "$SNELL_CONFIG_FILE"
-    echo "psk = ${new_psk}" >> "$SNELL_CONFIG_FILE"
-    restart_snell_and_verify
+    printf '%s' "$new_psk" | python3 -c 'import json,sys; print(json.dumps({"psk":sys.stdin.read()}))' | snell_tool set || return 1
     echo -e "${GREEN}✓ PSK ключ Snell успешно обновлён!${NC}"
     sleep 2
 }
@@ -1725,18 +1725,8 @@ snell_change_port() {
         return
     fi
 
-    sed -i '/^listen/d' "$SNELL_CONFIG_FILE"
-    sed -i "/^\[snell-server\]/a listen = 0.0.0.0:${new_port}" "$SNELL_CONFIG_FILE"
-
-    iptables -I INPUT 1 -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT 1 -p udp --dport "$new_port" -j ACCEPT 2>/dev/null || true
-    if [ "$cur_port" != "$new_port" ]; then
-        iptables -D INPUT -p tcp --dport "$cur_port" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport "$cur_port" -j ACCEPT 2>/dev/null || true
-    fi
-
-    restart_snell_and_verify
-    echo -e "${GREEN}✓ Порт Snell успешно изменён на: ${new_port} (TCP + UDP открыты)!${NC}"
+    printf '%s' "$new_port" | python3 -c 'import json,sys; print(json.dumps({"port":int(sys.stdin.read())}))' | snell_tool set || return 1
+    echo -e "${GREEN}✓ Порт Snell изменён на: ${new_port}; политика фаервола сохранена.${NC}"
     sleep 2
 }
 
@@ -1755,11 +1745,8 @@ snell_export_links() {
     [ "$obfs_mode" = "tls" ] && client_obfs="tls"
 
     local tag=$(get_snell_tag)
-    local snell_url="snell://${s_psk}@${SERVER_IP}:${s_port}/?version=5"
-    if [ "$obfs_mode" != "off" ] && [ -n "$obfs_mode" ]; then
-        snell_url="${snell_url}&obfs-mode=${client_obfs}&obfs-host=${obfs_host}"
-    fi
-    snell_url="${snell_url}&reuse=true&tfo=true#${tag}"
+    local snell_url
+    snell_url=$(get_snell_uri) || return 1
 
     local surge_line="${tag} = snell, ${SERVER_IP}, ${s_port}, psk=${s_psk}, version=5"
     if [ "$obfs_mode" != "off" ] && [ -n "$obfs_mode" ]; then
@@ -4985,11 +4972,7 @@ extract_current_server_links() {
     # 1. Snell URI
     local s_uri=""
     if is_snell_installed; then
-        local s_port=$(get_snell_port)
-        local s_psk=$(get_snell_psk)
-        if [ -n "$s_port" ] && [ -n "$s_psk" ]; then
-            s_uri="snell://${s_psk}@${SERVER_IP}:${s_port}/?version=5&reuse=true&tfo=true#Snell-v5"
-        fi
+        s_uri=$(get_snell_uri) || return 1
     fi
 
     # 2. WDTT URI
@@ -5432,6 +5415,9 @@ edit_sub_user() {
                 echo -e "  [1] ✏️  Заменить новыми ссылками"
                 echo -e "  [2] ➕ Добавить новые ссылки к существующим"
                 echo -e "  [3] 🗑️  Очистить (удалить все ссылки ${proto_label})"
+                if [ "$proto_field" = "snell_uri" ] && [ -n "$cur_links" ]; then
+                    echo '  [4] Синхронизировать локальный Snell и включить автообновление его ссылки'
+                fi
                 if [ "$proto_field" = "csqtt_uri" ] && [ -n "$cur_links" ]; then
                     echo -e "  ${YELLOW}[4]${NC} 🏷️  ${BOLD}Изменить имя подключения/сервера для сохраненных ссылок CSQTT${NC}"
                 fi
@@ -5481,6 +5467,11 @@ ${add_u}"
                         fi
                         ;;
                     4)
+                        if [ "$proto_field" = "snell_uri" ]; then
+                            snell_tool adopt --user "$uid"
+                            read -r -p 'Enter для возврата...'
+                            continue
+                        fi
                         if [ "$proto_field" = "csqtt_uri" ] && [ -n "$cur_links" ]; then
                             local updated_lines=()
                             local idx=1
@@ -5532,8 +5523,12 @@ ${ul}"
                 echo ""
                 read -p "Перезаписать профиль ссылками текущих служб сервера? [y/N]: " conf_rebuild
                 if [[ "$conf_rebuild" =~ ^[YyДд]$ ]]; then
-                    local s_payload=$(extract_current_server_links "$u_nick")
-                    local resp=$(curl -s -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$s_payload" 2>/dev/null || echo "")
+                    local s_payload resp
+                    s_payload=$(extract_current_server_links "$u_nick") || { read -r -p 'Ошибка генерации. Enter для возврата...'; continue; }
+                    resp=$(curl -fsS -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$s_payload") || { read -r -p 'Ошибка сохранения. Enter для возврата...'; continue; }
+                    if is_snell_installed; then
+                        snell_tool bind --user "$uid" || { read -r -p 'Профиль записан, но автосинхронизация Snell не настроена. Enter...'; continue; }
+                    fi
                     echo -e "${GREEN}✓ Профиль синхронизирован с активными службами сервера!${NC}"
                     sleep 2
                 fi
@@ -8180,7 +8175,8 @@ except Exception as e:
                 read -p "Введите ник пользователя (например: alex_travel): " new_nick
                 [ -z "$new_nick" ] && new_nick="user_$(openssl rand -hex 3 2>/dev/null || echo "1")"
 
-                local payload=$(extract_current_server_links "$new_nick")
+                local payload
+                payload=$(extract_current_server_links "$new_nick") || { read -r -p 'Ошибка генерации. Enter для возврата...'; continue; }
                 echo -e "${CYAN}[*] Отправка данных в локальный сервер подписок...${NC}"
                 local resp=$(curl -s -X POST "${SUB_API}/api/users" \
                     -H "Content-Type: application/json" \
@@ -8188,6 +8184,11 @@ except Exception as e:
 
                 local sub_url=$(echo "$resp" | jq -r '.subscription_url // empty' 2>/dev/null || echo "")
                 if [ -n "$sub_url" ]; then
+                    if is_snell_installed; then
+                        local created_uid
+                        created_uid=$(printf '%s' "$resp" | jq -er '.id') || { echo 'Не получен ID созданного пользователя'; continue; }
+                        snell_tool bind --user "$created_uid" || { read -r -p 'Пользователь создан, но автосинхронизация Snell не настроена. Enter...'; continue; }
+                    fi
                     echo ""
                     echo -e "${GREEN}${BOLD}✓ Профиль успешно создан!${NC}"
                     echo -e "  • Никнейм:   ${GREEN}${new_nick}${NC}"

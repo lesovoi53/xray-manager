@@ -28,7 +28,7 @@ def users():
 
 if sys.argv[1] == 'seed':
     request = urllib.request.Request('http://127.0.0.1:22217/api/users',
-                                     data=json.dumps({'nickname': 'upgrade-fixture', 'custom_uri': 'vless://11111111-2222-4333-8444-555555555555@192.0.2.1:24443?security=tls&x-preserved=yes#fixture'}).encode(),
+                                     data=json.dumps({'nickname': 'upgrade-fixture-' + os.urandom(3).hex(), 'custom_uri': 'vless://11111111-2222-4333-8444-555555555555@192.0.2.1:24443?security=tls&x-preserved=yes#fixture'}).encode(),
                                      headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(request) as response:
         created = json.load(response)
@@ -36,6 +36,12 @@ if sys.argv[1] == 'seed':
     config = Path('/etc/snell/snell-server.conf')
     config.write_text(config.read_text().replace(':1488', ':21488'))
     subprocess.run(['systemctl', 'restart', 'snell'], check=True)
+    # Seed a consistent baseline when the Snell acceptance ran earlier: it
+    # deliberately leaves a bound local profile. Direct config edits above
+    # must be synchronized before taking the preservation snapshot.
+    helper = Path('/usr/local/share/x-manager/scripts/snell-subscriptions.py')
+    if helper.exists():
+        subprocess.run(['python3', str(helper), 'sync', '--server-ip', '127.0.0.1'], check=True)
     Path('/etc/openflux/instances/3.env').write_text('ROLE="exit"\nMODE="l4"\nTRANSPORT="boards"\nCODEC="batched"\nDEBUG="0"\nURL=""\nENCRYPTION_KEY="fixture-key-never-printed"\n')
     os.chown('/etc/webdav-tunnel', 0, 0)
     os.chmod('/etc/webdav-tunnel', 0o755)  # Simulate old installer permissions.
