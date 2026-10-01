@@ -9956,16 +9956,35 @@ menu_openflux() {
         case "$of_choice" in
             V)
                 echo 'Cookies обновляются непосредственно на VPS. Ручную SmartCaptcha автоматика не проходит.'
-                printf '[1] Получить и проверить cookies сейчас\n[2] Включить обновление каждые 30 минут\n[3] Выключить таймер\n[4] Статус и журнал обновления\n[5] Импортировать cookies из файла на VPS\n[6] Инструкция: SSH-туннель, браузер и получение cookies\n[0] Назад\n'
+                python3 /usr/local/share/x-manager/scripts/openflux-volga.py drafts || { read -rp 'Ошибка чтения черновиков. Enter — назад: ' _; continue; }
+                printf '[1] Получить и проверить cookies сейчас\n[2] Включить обновление каждые 30 минут\n[3] Выключить таймер\n[4] Статус и журнал обновления\n[5] Импортировать cookies из файла на VPS\n[6] Одна команда для Windows: браузер и cookies\n[7] Продолжить настройку из черновика\n[8] Удалить черновик\n[0] Назад\n'
                 read -rp 'Действие: ' cookie_action
                 case "$cookie_action" in
-                    1) systemctl start volga-cookies.service && echo 'Cookies обновлены и проверены.';;
+                    1) if systemctl start volga-cookies.service; then
+                           echo 'Cookies обновлены и проверены. Если канал ещё не настроен — выберите [7].'
+                       else
+                           echo 'Проверка cookies не пройдена. Причина — в [4] «Статус и журнал». При SmartCaptcha используйте [6]; черновики сохранены.' >&2
+                       fi;;
                     2) systemctl enable --now volga-cookies.timer;;
                     3) systemctl disable --now volga-cookies.timer;;
                     4) systemctl show volga-cookies.service -p Result -p ExecMainStatus; systemctl list-timers volga-cookies.timer --no-pager; journalctl -u volga-cookies.service -n 15 --no-pager;;
                     5) read -rp 'Путь к Netscape cookies-файлу (Enter — отмена): ' cookie_source
                        [ -z "$cookie_source" ] || python3 /usr/local/share/x-manager/scripts/openflux-volga.py cookies "$cookie_source";;
                     6) python3 /usr/local/share/x-manager/scripts/openflux-volga.py instructions;;
+                    7|8)
+                       local draft_ch
+                       read -rp 'Номер канала [1-8, Enter — назад]: ' draft_ch
+                       if [[ "$draft_ch" =~ ^[1-8]$ ]]; then
+                           if [ "$cookie_action" = 7 ]; then
+                               if python3 /usr/local/share/x-manager/scripts/openflux-volga.py resume --channel "$draft_ch"; then
+                                   sync_openflux_to_sub_server
+                               fi
+                           else
+                               python3 /usr/local/share/x-manager/scripts/openflux-volga.py discard --channel "$draft_ch"
+                           fi
+                       elif [ -n "$draft_ch" ]; then
+                           echo 'Нужен номер от 1 до 8.' >&2
+                       fi;;
                 esac
                 read -rp 'Enter — назад: ' _
                 ;;
