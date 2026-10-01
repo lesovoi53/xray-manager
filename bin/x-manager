@@ -1477,10 +1477,19 @@ mieru_manage_routing() {
     echo -e "${GREEN}✓ Маршрутизация Mieru сохранена: ${mode}${NC}"
 }
 
+mieru_tool() {
+    local helper=/usr/local/share/x-manager/scripts/mieru-subscriptions.py
+    [ -f "$helper" ] || helper="$(dirname "$(readlink -f "$0")")/../scripts/mieru-subscriptions.py"
+    python3 "$helper" "$@"
+}
+
 mieru_export_links() {
     show_mieru_header
     echo -e "${BOLD}--- Выберите пользователя Mieru для экспорта конфига ---${NC}"
-    local users=($(cat "$MIERU_USER_STORE" | jq -r 'keys[]'))
+    local -a users=()
+    local user_names
+    user_names=$(jq -r 'keys[]' "$MIERU_USER_STORE") || return 1
+    [ -z "$user_names" ] || mapfile -t users <<< "$user_names"
     if [ ${#users[@]} -eq 0 ]; then
         echo -e "${RED}Нет пользователей!${NC}"
         read -p "Нажмите Enter..."
@@ -1493,20 +1502,18 @@ mieru_export_links() {
     echo ""
     read -p "Выберите номер пользователя [1-${#users[@]}]: " u_idx
     [ -z "$u_idx" ] && return
+    [[ "$u_idx" =~ ^[0-9]+$ ]] && ((u_idx >= 1 && u_idx <= ${#users[@]})) || { echo 'Неверный номер пользователя'; return 1; }
     local selected_user="${users[$((u_idx-1))]}"
-    local selected_pass=$(cat "$MIERU_USER_STORE" | jq -r --arg u "$selected_user" '.[$u]')
-    local ports_str=$(get_mieru_ports)
-    local p_range=$(echo "$ports_str" | cut -d'/' -f1)
-    local proto=$(echo "$ports_str" | cut -d'/' -f2)
-    local pattern=$(mita export traffic-pattern 2>/dev/null)
-    local low_mode=$(jq -r '.trafficPattern.lowEntropy.mode // "LOW_ENTROPY_MODE_OFF"' "$MIERU_CONFIG_FILE" 2>/dev/null)
-    local mask_rot=$(jq -r '.trafficPattern.lowEntropy.maskRotation // "LOW_ENTROPY_MASK_NO_ROTATION"' "$MIERU_CONFIG_FILE" 2>/dev/null)
     local m_tag=$(get_mieru_tag)
-
-    local mierus_url="mierus://${selected_user}:${selected_pass}@${SERVER_IP}/?profile=${m_tag}&port=${p_range}&protocol=${proto}&multiplexing=MULTIPLEXING_HIGH&traffic-pattern=${pattern}"
-    if [ "$low_mode" != "LOW_ENTROPY_MODE_OFF" ] && [ -n "$low_mode" ]; then
-        mierus_url="${mierus_url}&low-entropy-mode=${low_mode}&low-entropy-mask-rotation=${mask_rot}"
-    fi
+    local exported mierus_url selected_pass p_range proto pattern low_mode mask_rot
+    exported=$(mieru_tool export --server-ip "$SERVER_IP" --user "$selected_user" --name "$m_tag" --json) || return 1
+    mierus_url=$(jq -er '.uri' <<< "$exported") || return 1
+    selected_pass=$(jq -er '.password' <<< "$exported") || return 1
+    p_range=$(jq -er '.port' <<< "$exported") || return 1
+    proto=$(jq -er '.protocol' <<< "$exported") || return 1
+    pattern=$(jq -r '.pattern' <<< "$exported") || return 1
+    low_mode=$(jq -er '.["low-entropy-mode"]' <<< "$exported") || return 1
+    mask_rot=$(jq -er '.["low-entropy-mask-rotation"]' <<< "$exported") || return 1
 
     show_mieru_header
     echo -e "${GREEN}${BOLD}=== ДАННЫЕ ПОДКЛЮЧЕНИЯ MIERU (NekoBox+ / Karing) ===${NC}"
@@ -1627,16 +1634,12 @@ snell_manage_routing() {
     read -p "Выберите режим [0-2]: " s_rt_choice
     case "$s_rt_choice" in
         1)
-            mkdir -p /etc/snell
-            echo "xray" > /etc/snell/routing.mode
-            /usr/local/bin/snell-routing.sh
+            /usr/local/bin/snell-routing.sh --mode xray || return 1
             echo -e "${GREEN}✓ Маршрутизация Snell: Xray${NC}"
             sleep 2
             ;;
         2)
-            mkdir -p /etc/snell
-            echo "direct" > /etc/snell/routing.mode
-            /usr/local/bin/snell-routing.sh
+            /usr/local/bin/snell-routing.sh --mode direct || return 1
             echo -e "${GREEN}✓ Маршрутизация Snell: Прямой выход${NC}"
             sleep 2
             ;;
@@ -4994,14 +4997,10 @@ print(f'qwdtt://config?name={urllib.parse.quote_plus(name)}&peer={ip}%3A{port}&h
     # 3. Mieru URI
     local m_uri=""
     if is_mieru_installed && [ -f "$MIERU_USER_STORE" ]; then
-        local m_first_user=$(jq -r 'keys[0] // empty' "$MIERU_USER_STORE" 2>/dev/null || echo "")
+        local m_first_user
+        m_first_user=$(jq -r 'keys[0] // empty' "$MIERU_USER_STORE") || return 1
         if [ -n "$m_first_user" ]; then
-            local m_pass=$(jq -r --arg u "$m_first_user" '.[$u]' "$MIERU_USER_STORE" 2>/dev/null || echo "")
-            local ports_str=$(get_mieru_ports)
-            local p_range=$(echo "$ports_str" | cut -d'/' -f1)
-            local proto=$(echo "$ports_str" | cut -d'/' -f2)
-            local pattern=$(mita export traffic-pattern 2>/dev/null || echo "")
-            m_uri="mierus://${m_first_user}:${m_pass}@${SERVER_IP}/?profile=Mieru-Home&port=${p_range}&protocol=${proto}&multiplexing=MULTIPLEXING_HIGH&traffic-pattern=${pattern}&low-entropy-mode=LOW_ENTROPY_MODE_48&low-entropy-mask-rotation=LOW_ENTROPY_MASK_ROTATE_RIGHT_7"
+            m_uri=$(mieru_tool export --server-ip "$SERVER_IP" --user "$m_first_user" --name Mieru-Home) || return 1
         fi
     fi
 

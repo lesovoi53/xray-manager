@@ -291,7 +291,10 @@ EOF
     SNELL_PORT=$(sed -nE 's/^listen[[:space:]]*=[[:space:]]*.*:([0-9]+)$/\1/p' /etc/snell/snell-server.conf)
     [[ "$SNELL_PORT" =~ ^[0-9]+$ ]] || xm_die "Invalid Snell listen port"
 
-    # Скрипт маршрутизации snell-routing.sh с использованием подхваченного REDIRECT порта (TCP + UDP)
+    # TCP REDIRECT and UDP policy-routing/TPROXY helpers must precede ExecStartPre.
+    install -d -m 0755 /usr/local/share/x-manager/scripts
+    xm_install_asset scripts/snell-routing.py /usr/local/share/x-manager/scripts/snell-routing.py 0644
+    xm_install_asset scripts/xray-discovery.py /usr/local/share/x-manager/scripts/xray-discovery.py 0644
 
     xm_install_asset scripts/snell-routing.sh /usr/local/bin/snell-routing.sh 0755
     chmod +x /usr/local/bin/snell-routing.sh
@@ -647,7 +650,7 @@ echo -e "${CYAN}==> Шаг 9: Развертывание диспетчера x-
 xm_install_asset bin/x-manager /usr/local/bin/x-manager 0755
 install -d -m 0755 /usr/local/share/x-manager /usr/local/share/x-manager/patches /usr/local/share/x-manager/scripts
 install -m 0644 "$SCRIPT_DIR/patches/"*.patch /usr/local/share/x-manager/patches/
-install -m 0644 "$SCRIPT_DIR/scripts/"{snell-subscriptions.py,xray_gateways.py,openflux-volga.py,tuna-watchdog.py,volga-cookie-capture.ps1,webdav-config.py,webdav-encryption.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/scripts/"{snell-routing.py,snell-subscriptions.py,mieru-subscriptions.py,xray_gateways.py,openflux-volga.py,tuna-watchdog.py,volga-cookie-capture.ps1,webdav-config.py,webdav-encryption.py,plan-ports.py,release-assets.py,update-release.sh,xray-discovery.py,menu-v2.sh} /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/components.json" /usr/local/share/x-manager/components.json
 install -m 0644 "$SCRIPT_DIR/scripts/menu-actions.tsv" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/installer-state.py" /usr/local/share/x-manager/scripts/

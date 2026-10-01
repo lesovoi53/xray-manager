@@ -42,8 +42,44 @@ def query(*args):
     return p.stdout.strip()
 
 
+def snell_policy():
+    def data(*args):
+        return json.loads(subprocess.check_output(args, text=True))
+    rules=[r for r in data('ip','-j','-4','rule','show') if r.get('priority')==1988 or
+           str(r.get('table'))=='1988' or int(str(r.get('fwmark','0')),0)==0x534e]
+    routes=[r for r in data('ip','-j','-4','route','show','table','all') if str(r.get('table'))=='1988']
+    marker=Path('/etc/snell/tproxy-state.json')
+    owned=marker.is_file() and json.loads(marker.read_text())=={'table':1988,'priority':1988,'mark':0x534e}
+    return dict(rules=rules,routes=routes,owned=owned)
+
+
+def restore_snell_policy(previous, current):
+    # No global `ip rule flush`: only the reserved Snell slot may change.
+    if previous['rules']==current['rules'] and previous['routes']==current['routes']:
+        return
+    for value in (previous,current):
+        if (value['rules'] or value['routes']) and not value['owned']:
+            raise RuntimeError('Snell policy slot changed ownership; refusing rollback over foreign routes')
+        if len(value['rules'])>1 or any(r.get('priority')!=1988 or str(r.get('table'))!='1988' or
+             int(str(r.get('fwmark','0')),0)!=0x534e or r.get('src','all')!='all' or
+             r.get('fwmask','0xffffffff') not in ('0xffffffff',4294967295) for r in value['rules']):
+            raise RuntimeError('Unexpected Snell policy rule; manual rollback required')
+        if len(value['routes'])>1 or any(r.get('type')!='local' or r.get('dev')!='lo' or
+             r.get('dst') not in ('default','0.0.0.0/0') for r in value['routes']):
+            raise RuntimeError('Unexpected Snell policy route; manual rollback required')
+    if current['rules']:
+        run('ip','-4','rule','del','priority','1988','fwmark',str(0x534e),'table','1988')
+    if current['routes']:
+        run('ip','-4','route','del','local','0.0.0.0/0','dev','lo','table','1988')
+    if previous['routes']:
+        run('ip','-4','route','add','local','0.0.0.0/0','dev','lo','table','1988')
+    if previous['rules']:
+        run('ip','-4','rule','add','priority','1988','fwmark',str(0x534e),'table','1988')
+
+
 def snapshot(dest, config_module):
     state = {"present": [], "services": {}, "paths": list(PATHS), "databases": []}
+    state['snell_policy']=snell_policy()
     sys.path.insert(0, str(Path(config_module).parent))
     spec = importlib.util.spec_from_file_location('tuna_backup_config', config_module)
     module = importlib.util.module_from_spec(spec)
@@ -85,6 +121,8 @@ def restore(dest):
         if query("systemctl", "show", "-p", "LoadState", "--value", unit) != "not-found":
             if subprocess.run(["systemctl", "stop", unit]).returncode:
                 raise RuntimeError("Cannot stop " + unit + "; refusing to restore files beneath a running service")
+    if 'snell_policy' in state:
+        restore_snell_policy(state['snell_policy'], snell_policy())
     for name in state['paths']:
         p = Path(name)
         if p.is_symlink() or p.is_file():
@@ -106,7 +144,9 @@ def restore(dest):
             for suffix in ("-wal", "-shm"):
                 Path(target + suffix).unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
-    for unit, previous in sorted(state["services"].items(), key=lambda pair: pair[0].endswith(".timer")):
+    # Transparent Snell routing checks the actual Xray listeners at start.
+    # Restore the managed core before dependent services, timers last.
+    for unit, previous in sorted(state["services"].items(), key=lambda pair: (pair[0].endswith(".timer"), pair[0] != 'x-ui.service')):
         if previous["enabled"] in ("enabled", "disabled"):
             if subprocess.run(["systemctl", "enable" if previous["enabled"] == "enabled" else "disable", unit]).returncode:
                 failures.append(unit + ": enable state")
@@ -119,6 +159,8 @@ def restore(dest):
             failures.append(unit + ": start")
     with open(dest / "iptables") as f:
         run("iptables-restore", stdin=f)
+    if 'snell_policy' in state:
+        restore_snell_policy(state['snell_policy'], snell_policy())
     if failures:
         raise RuntimeError("Rollback service failures: " + ", ".join(failures))
 
