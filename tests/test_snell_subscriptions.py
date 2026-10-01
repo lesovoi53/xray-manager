@@ -86,7 +86,7 @@ class SnellSubscriptions(unittest.TestCase):
         self.assertEqual(self.local()[1].splitlines()[1], self.foreign)
 
     def test_manual_edit_detaches_and_custom_flags_name_survive(self):
-        custom = self.old.replace('reuse=true','reuse=false&custom=value').replace('#Snell-v5','#Personal')
+        custom = self.old.replace('reuse=true','reuse=false&custom=value').replace('tfo=true','tfo=false').replace('#Snell-v5','#Personal')
         self.db.execute('UPDATE users SET snell_uri=? WHERE id="local"', (custom,))
         self.db.commit()
         self.sync(bind_user='local', adopt=True)
@@ -94,6 +94,7 @@ class SnellSubscriptions(unittest.TestCase):
         p = urlsplit(first)
         self.assertEqual(p.fragment,'Personal')
         self.assertEqual(parse_qs(p.query)['reuse'],['false'])
+        self.assertEqual(parse_qs(p.query)['tfo'],['false'])
         self.assertEqual(parse_qs(p.query)['custom'],['value'])
         self.db.execute('UPDATE users SET snell_uri=? WHERE id="local"', (self.foreign,))
         self.db.commit()
