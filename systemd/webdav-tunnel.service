@@ -12,6 +12,7 @@ EnvironmentFile=-/etc/webdav-tunnel/config.env
 
 # Применить iptables-правила ДО старта туннеля (с правами root через +)
 ExecStartPre=+/usr/local/bin/webdav-tunnel-routing.sh up
+ExecStartPre=+/usr/bin/python3 /usr/local/share/x-manager/scripts/webdav-access.py sync
 
 # Запуск в selfhosted-режиме через runner-скрипт
 ExecStart=/usr/local/bin/webdav-tunnel-runner.sh

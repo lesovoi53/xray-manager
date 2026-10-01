@@ -97,6 +97,8 @@ def snapshot(dest, config_module):
                                    "enabled": query("systemctl", "is-enabled", unit)}
     with open(dest / "iptables", "w") as f:
         run("iptables-save", stdout=f)
+    with open(dest / "ip6tables", "w") as f:
+        run("ip6tables-save", stdout=f)
     with tarfile.open(dest / "files.tar", "w") as archive:
         for name in state['paths']:
             p = Path(name)
@@ -159,6 +161,9 @@ def restore(dest):
             failures.append(unit + ": start")
     with open(dest / "iptables") as f:
         run("iptables-restore", stdin=f)
+    if (dest / "ip6tables").is_file():
+        with open(dest / "ip6tables") as f:
+            run("ip6tables-restore", stdin=f)
     if 'snell_policy' in state:
         restore_snell_policy(state['snell_policy'], snell_policy())
     if failures:

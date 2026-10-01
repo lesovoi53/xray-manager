@@ -6,6 +6,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MenuNavigation(unittest.TestCase):
+    def test_firewall_menu_has_webdav_access(self):
+        script = '. "$1"; xm_header() { :; }; xm_choose_action menu_firewall selected; test "$selected" = 9'
+        result = subprocess.run(['bash','-c',script,'bash',str(ROOT/'scripts/menu-v2.sh')],input='1\n7\n0\n',text=True,capture_output=True,timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertIn('WebDAV', result.stdout)
+
     def test_every_catalog_menu_can_go_back_without_an_action(self):
         names = {line.split('|')[0] for line in (ROOT/'scripts/menu-actions.tsv').read_text().splitlines()}
         for name in names:

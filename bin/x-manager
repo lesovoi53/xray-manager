@@ -905,6 +905,7 @@ lock_all_protocols_fw() {
     is_wdtt_installed && ! is_wdtt_fw_blocked && toggle_wdtt_fw
     is_csqtt_installed && ! is_csqtt_tunnel_blocked && toggle_csqtt_tunnel_fw
     is_dns_installed && ! is_dns_wan_blocked && toggle_dns_wan
+    python3 /usr/local/share/x-manager/scripts/webdav-access.py blocked --if-local || return 1
     echo -e "${RED}${BOLD}✓ Все протоколы успешно заблокированы в фаерволе (порты закрыты)!${NC}"
     sleep 2
 }
@@ -917,6 +918,7 @@ unlock_all_protocols_fw() {
     is_wdtt_installed && is_wdtt_fw_blocked && toggle_wdtt_fw
     is_csqtt_installed && is_csqtt_tunnel_blocked && toggle_csqtt_tunnel_fw
     is_dns_installed && is_dns_wan_blocked && toggle_dns_wan
+    python3 /usr/local/share/x-manager/scripts/webdav-access.py open --if-local || return 1
     echo -e "${GREEN}${BOLD}✓ Все протоколы успешно разблокированы в фаерволе (порты открыты)!${NC}"
     sleep 2
 }
@@ -1018,6 +1020,7 @@ menu_firewall() {
             6) is_dns_installed && toggle_dns_wan ;;
             7) lock_all_protocols_fw ;;
             8) unlock_all_protocols_fw ;;
+            9) python3 /usr/local/share/x-manager/scripts/webdav-access.py menu; xm_pause ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac
