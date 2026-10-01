@@ -83,6 +83,14 @@ def save_draft(channel, urls):
     return path
 
 def draft_info():
+    channels=documents=0
+    for file in sorted((ROOT/'instances').glob('[1-8].env')):
+        props={k:v.strip().strip('"').strip("'") for k,v in (l.split('=',1) for l in file.read_text().splitlines() if '=' in l and not l.lstrip().startswith('#'))}
+        if props.get('TRANSPORT')=='vyandex' and props.get('URL'):
+            channels+=1
+            documents+=len(validate(props['URL']).split(','))
+    print(f'Сохранённые каналы Волги: {channels}; документов: {documents}.')
+    print('Файл cookies: '+('есть; проверить авторизацию — пункт [1].' if COOKIE.is_file() else 'нет; получить через браузер — пункт [6].'))
     found=False
     for channel in map(str,range(1,9)):
         path,mode=draft_path(channel)
@@ -90,7 +98,8 @@ def draft_info():
             urls=validate(path.read_text(),mode)
             print(f'Канал {channel}: черновик {mode}, документов: {len(urls.split(","))}.')
             found=True
-    if not found:print('В текущем режиме черновиков Волги нет.')
+    if not found:
+        print('Незавершённых настроек нет. Пункт [7] не нужен для уже сохранённых каналов.' if channels else 'Нет каналов и черновиков Волги. Сначала добавьте ссылки в разделе «Каналы».')
 
 def resume(channel):
     path,_=draft_path(channel)
@@ -275,7 +284,8 @@ def main():
 4. Помощник запустит проверку cookies на VPS и покажет результат.
    Для первой настройки сначала введите ссылки в разделе «Каналы»:
    даже при отказе авторизации они останутся в черновике.
-   После успешной проверки выберите [7] «Продолжить настройку из черновика».
+   Только если есть незавершённый черновик, выберите [7] для его применения.
+   Для уже сохранённых каналов повторная настройка через [7] не нужна.
    Туннель помощника закроется автоматически; закройте отдельный Chrome.
    Для конфиденциальности удалите отдельный временный профиль, путь к которому покажет помощник.
 

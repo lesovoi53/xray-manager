@@ -125,7 +125,7 @@ try {
  if ($LASTEXITCODE -ne 0) { throw 'Server rejected cookies; existing cookies preserved' }
  & ssh -p $SshPort "root@$ServerHost" 'systemctl start volga-cookies.service; result=$?; if [ "$result" -ne 0 ]; then journalctl -u volga-cookies.service -n 8 --no-pager; fi; exit "$result"'
  if ($LASTEXITCODE -ne 0) { throw 'Cookies imported, but document verification failed. See the server error above; the channel was not changed.' }
- Write-Host 'Yandex cookies transferred and verified. In X-Manager: Volga cookies -> 7 -> channel number.'
+ Write-Host 'Yandex cookies transferred and verified. Existing configured channels do not need draft setup. Only for an unfinished draft: X-Manager -> Volga cookies -> 7 -> channel number.'
  $verified=$true
  } catch {
   Write-Warning $_.Exception.Message
