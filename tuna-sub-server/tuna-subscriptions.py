@@ -241,6 +241,20 @@ def init_database(db_path):
     c.execute("CREATE INDEX IF NOT EXISTS idx_user_of_sel_user ON user_openflux_selection(user_id, position);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_user_of_sel_group ON user_openflux_selection(group_id);")
 
+    # Independent imported bundles never overwrite the local OpenFlux configuration.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_openflux_imports (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            source_issuer_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            uri TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, source_issuer_id, source_connection_id)
+        );
+    """)
+
     # Аддитивная схема для WebDAV подключений (TUNA rc9)
     c.execute("""
         CREATE TABLE IF NOT EXISTS webdav_connections (
@@ -1804,7 +1818,8 @@ class SubscriptionApp:
             """, (r["id"],))
             wd_cnt = c_wd.fetchone()[0] if wd_en else 0
 
-            total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list)
+            external = [self._imported_openflux_item(x) for x in self._imported_openflux_rows(r["id"]) if x["enabled"]]
+            total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list) + len(external)
             if of_en and of_cnt > 0:
                 total_uris += 1
             if wd_en and wd_cnt > 0:
@@ -1830,7 +1845,7 @@ class SubscriptionApp:
                     "mieru": len(mieru_list) > 0,
                     "masterdnsvpn": len(dns_list) > 0,
                     "custom": len(custom_list) > 0,
-                    "openflux": of_en and of_cnt > 0,
+                    "openflux": (of_en and of_cnt > 0) or bool(external),
                     "webdav": wd_en and wd_cnt > 0,
                 },
                 "counts": {
@@ -1840,7 +1855,7 @@ class SubscriptionApp:
                     "mieru": len(mieru_list),
                     "masterdnsvpn": len(dns_list),
                     "custom": len(custom_list),
-                    "openflux": of_cnt,
+                    "openflux": of_cnt + sum(x["total_groups"] for x in external),
                     "webdav": wd_cnt,
                 }
             })
@@ -1881,7 +1896,8 @@ class SubscriptionApp:
         """, (r["id"],))
         wd_cnt = c_wd.fetchone()[0] if wd_en else 0
 
-        total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list)
+        external = [self._imported_openflux_item(x) for x in self._imported_openflux_rows(r["id"]) if x["enabled"]]
+        total_uris = len(csqtt_list) + len(qwdtt_list) + len(snell_list) + len(mieru_list) + len(dns_list) + len(custom_list) + len(external)
         if of_en and of_cnt > 0:
             total_uris += 1
         if wd_en and wd_cnt > 0:
@@ -1908,8 +1924,9 @@ class SubscriptionApp:
             "mieru_uris": mieru_list,
             "masterdnsvpn_uris": dns_list,
             "custom_uris": custom_list,
-            "openflux_enabled": of_en,
-            "openflux_groups_count": of_cnt,
+            "openflux_enabled": of_en or bool(external),
+            "openflux_imported_count": len(external),
+            "openflux_groups_count": of_cnt + sum(x["total_groups"] for x in external),
             "webdav_enabled": wd_en,
             "webdav_connections_count": wd_cnt,
             "total_uris": total_uris,
@@ -2019,6 +2036,7 @@ class SubscriptionApp:
             resolved_id = cur["id"]
             c.execute("DELETE FROM user_openflux_selection WHERE user_id = ?;", (resolved_id,))
             c.execute("DELETE FROM user_openflux_config WHERE user_id = ?;", (resolved_id,))
+            c.execute("DELETE FROM user_openflux_imports WHERE user_id = ?;", (resolved_id,))
             c.execute("DELETE FROM users WHERE id = ?;", (resolved_id,))
             self.conn.commit()
         return 200, {"success": True, "message": f"User '{user_id}' deleted successfully"}
@@ -2536,6 +2554,7 @@ class SubscriptionApp:
             "total_urls": total_urls,
             "v2_uri": v2_uri,
             "bundle_payload": bundle_payload,
+            "imported_connections": [self._imported_openflux_item(r) for r in self._imported_openflux_rows(u_id)],
             "updated_at": of_cfg["updated_at"],
         }
 
@@ -2754,227 +2773,136 @@ class SubscriptionApp:
             "revision": int(of_cfg["revision"]),
         }
 
-    def import_user_openflux(self, user_id_or_nick: str, data: dict) -> tuple[int, dict]:
-        """
-        Импорт снимка подключения OpenFlux v2 с другого сервера:
-        - Двухфазный: preview_only (предпросмотр с маскировкой секретов) и commit (атомарное применение).
-        - Оптимистичная блокировка через expected_state_token: ошибка 409 при изменении состояния.
-        - Идентичный повторный импорт — no-op без создания дубликатов и без роста revision.
-        - Сохраняет локальный connection_id существующего пользователя и увеличивает локальную revision.
-        - Для нового пользователя создает локальный connection_id, начальную revision=1 и enabled=0.
-        - Сохраняет флаг публикации (enabled) существующего пользователя.
-        - Не привязывает импортированные группы к слотам /etc/openflux/instances (source_slot=NULL).
-        - Сохраняет source_issuer_id, source_connection_id, source_revision, source_group_id.
-        """
-        c = self.conn.cursor()
-        c.execute("SELECT * FROM users WHERE id = ? OR nickname = ?;", (user_id_or_nick, user_id_or_nick))
-        user = c.fetchone()
+    def _imported_openflux_rows(self, user_id):
+        return self.conn.execute("SELECT * FROM user_openflux_imports WHERE user_id=? ORDER BY rowid", (user_id,)).fetchall()
+
+    @staticmethod
+    def _imported_openflux_token(user, rows):
+        state = [user['id'], user['revision'], [(r['id'], r['uri'], r['enabled']) for r in rows]]
+        return hashlib.sha256(json.dumps(state, ensure_ascii=False).encode()).hexdigest()
+
+    @staticmethod
+    def _imported_openflux_item(row):
+        ok, error, payload = deserialize_openflux_v2_bundle(row['uri'])
+        if not ok:
+            raise ValueError('Stored imported OpenFlux bundle is invalid')
+        return {'import_id': row['id'], 'enabled': bool(row['enabled']), 'uri': row['uri'],
+                'name': payload['name'], 'connection_id': payload['id'],
+                'source_issuer_id': payload['issuer_id'], 'revision': payload['revision'],
+                'mode': payload['mode'], 'balancer_strategy': payload['balancer_strategy'],
+                'total_groups': len(payload['groups']), 'total_urls': sum(len(g['urls']) for g in payload['groups']),
+                'groups': payload['groups'], 'payload': payload}
+
+    def list_imported_openflux(self, user_id_or_nick):
+        user = self.conn.execute('SELECT * FROM users WHERE id=? OR nickname=?', (user_id_or_nick, user_id_or_nick)).fetchone()
         if not user:
-            return 404, {"error": "User not found"}
-        u_id = user["id"]
-
-        raw_uri = data.get("uri")
-        raw_payload = data.get("payload")
-        if raw_uri:
-            if not isinstance(raw_uri, str) or not raw_uri.strip():
-                return 400, {"error": "Field 'uri' must be a non-empty string"}
-            ok_d, err_d, payload = deserialize_openflux_v2_bundle(raw_uri.strip())
-            if not ok_d:
-                return 400, {"error": f"Failed to parse OpenFlux bundle URI: {err_d}"}
-        elif raw_payload and isinstance(raw_payload, dict):
-            ok_v, err_v = validate_openflux_v2_payload(raw_payload)
-            if not ok_v:
-                return 400, {"error": f"Invalid OpenFlux payload: {err_v}"}
-            payload = raw_payload
-        else:
-            return 400, {"error": "Either 'uri' or 'payload' is required"}
-
-        ok_v, err_v = validate_openflux_v2_payload(payload)
-        if not ok_v:
-            return 400, {"error": f"Invalid OpenFlux payload: {err_v}"}
-
-        # Текущая конфигурация пользователя
-        c.execute("SELECT * FROM user_openflux_config WHERE user_id = ?;", (u_id,))
-        cur_cfg = c.fetchone()
-        c.execute("""
-            SELECT g.* FROM user_openflux_selection s
-            JOIN openflux_groups g ON s.group_id = g.id
-            WHERE s.user_id = ?
-            ORDER BY s.position ASC;
-        """, (u_id,))
-        cur_groups = c.fetchall()
-
-        cur_state_token = compute_user_openflux_state_token(u_id, cur_cfg, cur_groups)
-
-        # Проверка полной идентичности (no-op)
-        is_identical = False
-        if cur_cfg and len(cur_groups) == len(payload.get("groups", [])):
-            if (cur_cfg["name"] == payload.get("name") and
-                cur_cfg["mode"] == payload.get("mode") and
-                cur_cfg["balancer_strategy"] == payload.get("balancer_strategy")):
-                all_match = True
-                for cg, ig in zip(cur_groups, payload.get("groups", [])):
-                    try:
-                        cg_urls = json.loads(cg["urls_json"])
-                    except Exception:
-                        cg_urls = []
-                    if (cg["name"] != ig.get("name") or
-                        cg["transport"] != ig.get("transport") or
-                        cg_urls != ig.get("urls", []) or
-                        cg["codec"] != ig.get("codec") or
-                        (cg["encryption_key"] or "") != (ig.get("encryption_key") or "")):
-                        all_match = False
-                        break
-                is_identical = all_match
-
-        is_commit = bool(data.get("commit", False))
-        if data.get("preview_only") is True:
-            is_commit = False
-
-        if not is_commit:
-            # ФАЗА ПРЕДПРОСМОТРА
-            masked_groups = []
-            for idx, g in enumerate(payload.get("groups", []), 1):
-                raw_urls = g.get("urls", [])
-                enc_key = g.get("encryption_key") or ""
-                masked_groups.append({
-                    "position": idx,
-                    "name": g.get("name", ""),
-                    "transport": g.get("transport", ""),
-                    "urls_count": len(raw_urls),
-                    "codec": g.get("codec", "legacy"),
-                    "has_encryption": bool(enc_key),
-                    "encryption_key_masked": mask_secret(enc_key),
-                })
-            cur_summary = None
-            if cur_cfg:
-                cur_summary = {
-                    "name": cur_cfg["name"],
-                    "mode": cur_cfg["mode"],
-                    "balancer_strategy": cur_cfg["balancer_strategy"],
-                    "groups_count": len(cur_groups),
-                    "revision": cur_cfg["revision"],
-                    "enabled": bool(cur_cfg["enabled"]),
-                }
-            return 200, {
-                "success": True,
-                "preview": True,
-                "is_identical": is_identical,
-                "state_token": cur_state_token,
-                "current_config": cur_summary,
-                "incoming_config": {
-                    "name": payload.get("name"),
-                    "mode": payload.get("mode"),
-                    "balancer_strategy": payload.get("balancer_strategy"),
-                    "groups_count": len(payload.get("groups", [])),
-                    "groups": masked_groups,
-                    "source_issuer_id": payload.get("issuer_id"),
-                    "source_connection_id": payload.get("id"),
-                    "source_revision": payload.get("revision"),
-                }
-            }
-
-        # ФАЗА КОММИТА
-        expected_token = data.get("expected_state_token")
-        if expected_token and expected_token != cur_state_token:
-            return 409, {"error": "Configuration changed since preview. Please request a new preview before committing."}
-
-        if is_identical:
-            # Идентичный повторный импорт — no-op
-            return 200, {
-                "success": True,
-                "no_op": True,
-                "message": "Identical configuration already active. No changes made.",
-                "user_id": u_id,
-                "revision": cur_cfg["revision"],
-                "connection_id": cur_cfg["connection_id"],
-            }
-
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            return 404, {'error': 'User not found'}
+        rows = self._imported_openflux_rows(user['id'])
         try:
-            with self.conn:
-                if cur_cfg:
-                    target_conn_id = cur_cfg["connection_id"]
-                    target_rev = int(cur_cfg["revision"]) + 1
-                    target_enabled = cur_cfg["enabled"]
+            items = [self._imported_openflux_item(r) for r in rows]
+        except ValueError as exc:
+            return 500, {'error': str(exc)}
+        return 200, {'connections': items, 'state_token': self._imported_openflux_token(user, rows)}
+
+    def import_user_openflux(self, user_id_or_nick: str, data: dict) -> tuple[int, dict]:
+        """Add an independent remote bundle; never replace local settings or catalog.
+
+        Identity and wire payload are preserved. Exact repeats are no-ops; conflicting
+        reuse of an identity requires explicitly removing the old imported entry first.
+        """
+        if data.get('uri'):
+            if not isinstance(data['uri'], str):
+                return 400, {'error': 'uri must be a string'}
+            ok, error, payload = deserialize_openflux_v2_bundle(data['uri'].strip())
+        elif isinstance(data.get('payload'), dict):
+            payload = data['payload']
+            ok, error = validate_openflux_v2_payload(payload)
+        else:
+            return 400, {'error': "Either 'uri' or 'payload' is required"}
+        if not ok:
+            return 400, {'error': error}
+        ok, error, uri = serialize_openflux_v2_bundle(payload)
+        if not ok:
+            return 400, {'error': error}
+        # A separate connection serializes commits against all other SQLite writers.
+        db = sqlite3.connect(self.db_path, timeout=10)
+        db.row_factory = sqlite3.Row
+        try:
+            with db:
+                db.execute('BEGIN IMMEDIATE')
+                user = db.execute('SELECT * FROM users WHERE id=? OR nickname=?', (user_id_or_nick, user_id_or_nick)).fetchone()
+                if not user:
+                    return 404, {'error': 'User not found'}
+                uid = user['id']
+                rows = db.execute('SELECT * FROM user_openflux_imports WHERE user_id=? ORDER BY rowid', (uid,)).fetchall()
+                state_token = self._imported_openflux_token(user, rows)
+                existing = next((r for r in rows if r['source_issuer_id']==payload['issuer_id'] and r['source_connection_id']==payload['id']), None)
+                local = db.execute('SELECT * FROM user_openflux_config WHERE user_id=?', (uid,)).fetchone()
+                local_identical = False
+                if local and local['connection_id']==payload['id'] and self.issuer_id==payload['issuer_id']:
+                    code, exported = self.export_user_openflux(uid)
+                    local_identical = code==200 and exported['uri']==uri
+                    if not local_identical:
+                        return 409, {'error': 'This identity belongs to the original connection. Import cannot overwrite it.'}
+                if existing and existing['uri']!=uri:
+                    return 409, {'error': 'This remote connection is already imported with different settings. Remove that imported entry explicitly before importing a replacement; the original connection is unchanged.'}
+                identical = bool(existing or local_identical)
+                if not data.get('commit') or data.get('preview_only') is True:
+                    return 200, {'success': True, 'preview': True, 'is_identical': identical,
+                        'state_token': state_token, 'operation': 'add_connection',
+                        'incoming_config': {'name': payload['name'], 'mode': payload['mode'],
+                            'balancer_strategy': payload['balancer_strategy'], 'groups_count': len(payload['groups']),
+                            'groups': [{'name': g['name'], 'transport': g['transport'], 'codec': g['codec'],
+                                        'urls_count': len(g['urls']), 'has_encryption': bool(g.get('encryption_key'))} for g in payload['groups']]}}
+                if data.get('expected_state_token') and data['expected_state_token']!=state_token:
+                    return 409, {'error': 'Configuration changed since preview. Please request a new preview before committing.'}
+                if identical:
+                    item = self._imported_openflux_item(existing) if existing else {'connection_id': payload['id'], 'revision': payload['revision']}
+                    return 200, dict(item, success=True, no_op=True)
+                if sum(len(r['uri'].encode())+1 for r in rows)+len(uri.encode()) > MAX_SUBSCRIPTION_RESPONSE_BYTES:
+                    return 400, {'error': 'Imported connections exceed subscription size limit'}
+                item_id = str(uuid.uuid4())
+                now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                db.execute('INSERT INTO user_openflux_imports (id,user_id,source_issuer_id,source_connection_id,uri,enabled,created_at) VALUES (?,?,?,?,?,1,?)',
+                           (item_id,uid,payload['issuer_id'],payload['id'],uri,now))
+                db.execute('UPDATE users SET revision=revision+1,updated_at=? WHERE id=?', (now,uid))
+                row = db.execute('SELECT * FROM user_openflux_imports WHERE id=?', (item_id,)).fetchone()
+                return 200, dict(self._imported_openflux_item(row), success=True, no_op=False)
+        except sqlite3.Error:
+            return 500, {'error': 'Imported connection transaction failed; no changes committed'}
+        finally:
+            db.close()
+
+    def change_imported_openflux(self, user_id_or_nick, item_id, data):
+        action = data.get('action')
+        if action not in ('enable', 'disable', 'delete'):
+            return 400, {'error': 'Expected enable, disable or delete'}
+        db = sqlite3.connect(self.db_path, timeout=10)
+        db.row_factory = sqlite3.Row
+        try:
+            with db:
+                db.execute('BEGIN IMMEDIATE')
+                user = db.execute('SELECT * FROM users WHERE id=? OR nickname=?', (user_id_or_nick,user_id_or_nick)).fetchone()
+                if not user:
+                    return 404, {'error': 'User not found'}
+                rows = db.execute('SELECT * FROM user_openflux_imports WHERE user_id=? ORDER BY rowid', (user['id'],)).fetchall()
+                if data.get('expected_state_token') != self._imported_openflux_token(user, rows):
+                    return 409, {'error': 'Configuration changed since preview. Reload the list.'}
+                row = next((r for r in rows if r['id']==item_id), None)
+                if not row:
+                    return 404, {'error': 'Imported connection not found'}
+                if action!='delete' and bool(row['enabled'])==(action=='enable'):
+                    return 200, {'success': True, 'no_op': True}
+                if action=='delete':
+                    db.execute('DELETE FROM user_openflux_imports WHERE id=? AND user_id=?', (item_id,user['id']))
                 else:
-                    target_conn_id = str(uuid.uuid4()).lower()
-                    target_rev = 1
-                    target_enabled = 0
-
-                target_group_ids = []
-                for g in payload.get("groups", []):
-                    src_iss = payload.get("issuer_id", "")
-                    src_gid = g.get("id", "")
-                    g_urls = g.get("urls", [])
-                    g_urls_json = json.dumps(g_urls, separators=(",", ":"))
-                    g_codec = g.get("codec", "legacy")
-                    g_enc = g.get("encryption_key") or ""
-                    g_transport = g.get("transport", "")
-                    g_name = g.get("name", "")
-                    g_mode = payload.get("mode", "classic")
-
-                    c.execute("""
-                        SELECT id FROM openflux_groups
-                        WHERE (source_issuer_id = ? AND source_group_id = ?)
-                           OR (transport = ? AND mode = ? AND urls_json = ? AND codec = ? AND encryption_key = ?);
-                    """, (src_iss, src_gid, g_transport, g_mode, g_urls_json, g_codec, g_enc))
-                    existing_grp = c.fetchone()
-                    if existing_grp:
-                        target_group_ids.append(existing_grp["id"])
-                    else:
-                        new_gid = str(uuid.uuid4()).lower()
-                        c.execute("""
-                            INSERT INTO openflux_groups (
-                                id, name, mode, transport, urls_json, codec, encryption_key,
-                                source_slot, source_issuer_id, source_group_id, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?);
-                        """, (
-                            new_gid, g_name, g_mode, g_transport, g_urls_json, g_codec, g_enc,
-                            src_iss, src_gid, now_iso, now_iso
-                        ))
-                        target_group_ids.append(new_gid)
-
-                if cur_cfg:
-                    c.execute("""
-                        UPDATE user_openflux_config
-                        SET connection_id = ?, name = ?, mode = ?, balancer_strategy = ?,
-                            revision = ?, enabled = ?, source_issuer_id = ?, source_connection_id = ?,
-                            source_revision = ?, updated_at = ?
-                        WHERE user_id = ?;
-                    """, (
-                        target_conn_id, payload["name"], payload["mode"], payload["balancer_strategy"],
-                        target_rev, target_enabled, payload.get("issuer_id"), payload.get("id"),
-                        payload.get("revision"), now_iso, u_id
-                    ))
-                else:
-                    c.execute("""
-                        INSERT INTO user_openflux_config (
-                            user_id, enabled, connection_id, name, mode, balancer_strategy,
-                            revision, source_issuer_id, source_connection_id, source_revision, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """, (
-                        u_id, target_enabled, target_conn_id, payload["name"], payload["mode"],
-                        payload["balancer_strategy"], target_rev, payload.get("issuer_id"), payload.get("id"),
-                        payload.get("revision"), now_iso
-                    ))
-
-                c.execute("DELETE FROM user_openflux_selection WHERE user_id = ?;", (u_id,))
-                for pos, gid in enumerate(target_group_ids):
-                    c.execute("""
-                        INSERT INTO user_openflux_selection (user_id, group_id, position)
-                        VALUES (?, ?, ?);
-                    """, (u_id, gid, pos))
-
-                c.execute("""
-                    UPDATE users
-                    SET revision = revision + 1, updated_at = ?
-                    WHERE id = ?;
-                """, (now_iso, u_id))
-        except Exception as e:
-            return 500, {"error": f"Database transaction failed: {e}"}
-
-        return self.get_user_openflux(u_id)
+                    db.execute('UPDATE user_openflux_imports SET enabled=? WHERE id=? AND user_id=?', (int(action=='enable'),item_id,user['id']))
+                db.execute('UPDATE users SET revision=revision+1,updated_at=? WHERE id=?', (datetime.datetime.now(datetime.timezone.utc).isoformat(),user['id']))
+                return 200, {'success': True}
+        except sqlite3.Error:
+            return 500, {'error': 'Imported connection transaction failed; no changes committed'}
+        finally:
+            db.close()
 
     def import_local_openflux_groups(self, instances_dir: str = "/etc/openflux/instances", pool_mode_file: str = "/etc/openflux/pool.mode") -> tuple[int, dict]:
         """
@@ -4211,6 +4139,15 @@ class SubscriptionApp:
 
             non_empty.append(v2_uri)
 
+        # Imported bundles are separate profiles and retain their source identities.
+        for imported in self._imported_openflux_rows(user['id']):
+            if imported['enabled']:
+                ok, error, _ = deserialize_openflux_v2_bundle(imported['uri'])
+                if not ok:
+                    return 500, {'error': 'Invalid stored imported OpenFlux bundle'}, b''
+                if imported['uri'] not in non_empty:
+                    non_empty.append(imported['uri'])
+
         # WebDAV интеграция
         c.execute("SELECT enabled FROM user_webdav_config WHERE user_id = ?;", (user["id"],))
         wd_cfg = c.fetchone()
@@ -4415,6 +4352,12 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             self.send_json(status, res)
             return
 
+        imported = re.match(r"^/api/users/([^/]+)/openflux/imported$", path)
+        if imported:
+            status, res = self.app.list_imported_openflux(unquote(imported.group(1)))
+            self.send_json(status, res)
+            return
+
         # OpenFlux user export: GET /api/users/<id_or_nickname>/openflux/export
         m_of_export = re.match(r"^/api/users/([^/]+)/openflux/export$", path)
         if m_of_export:
@@ -4589,6 +4532,17 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
                 self.send_json(code, {"error": str(e)})
                 return
             status, res = self.app.create_user(data)
+            self.send_json(status, res)
+            return
+
+        imported = re.match(r"^/api/users/([^/]+)/openflux/imported/([^/]+)$", path)
+        if imported:
+            try:
+                data = self.read_json_body()
+            except ValueError as exc:
+                self.send_json(400, {'error': str(exc)})
+                return
+            status, res = self.app.change_imported_openflux(unquote(imported.group(1)), unquote(imported.group(2)), data)
             self.send_json(status, res)
             return
 

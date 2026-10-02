@@ -123,6 +123,21 @@ class MieruSubscriptions(unittest.TestCase):
         with self.assertRaises(m.Error):m.repair(self.db,self.request,self.model,'192.0.2.2',True,self.root)
         self.assertEqual(self.db.read_bytes(),before)
 
+    def test_explicit_rename_changes_only_profile_and_keeps_external_links(self):
+        name='FP SPB + Mieru'
+        # Deliberately retain the old URI's redundant fields: this is a name-only change.
+        expected=self.bad.replace('profile=Keep+name','profile=FP%20SPB%20%2B%20Mieru')
+        self.assertNotEqual(expected,self.bad)
+        self.assertEqual(m.renamed(self.bad,self.model,'192.0.2.1',name),expected)
+        other=self.row('other')
+        result=m.repair(self.db,self.request,self.model,'192.0.2.1',True,self.root,new_name=name)
+        self.assertTrue(result['applied'])
+        self.assertEqual(self.row()[1],expected+'\nmanual-external\n')
+        self.assertEqual(self.row('other'),other)
+        self.assertEqual(self.row()[4:],('keep-token','keep-snell'))
+        m.restore(self.db,Path(result['backup']))
+        self.assertEqual(self.row()[1],self.bad+'\nmanual-external\n')
+
     def test_group_collision_rolls_back(self):
         doc=copy.deepcopy(self.doc);doc['profiles'].append(dict(id='second',name='keep',uri=self.good))
         with sqlite3.connect(self.db) as db:db.execute('UPDATE user_connection_groups SET document_json=?',(json.dumps(doc),))
@@ -152,7 +167,7 @@ class MieruSubscriptions(unittest.TestCase):
 show_mieru_header() { :; }; get_mieru_tag() { echo 'Keep name'; }; get_mieru_routing() { echo direct; }
 is_snell_installed() { return 1; }; is_wdtt_installed() { return 1; }; is_csqtt_installed() { return 1; }; is_dns_installed() { return 1; }; is_mieru_installed() { return 0; }
 qrencode() { :; }
-mieru_tool() { [ "$TEST_FAIL" = 0 ] || return 41; if [[ "$*" == *--json* ]]; then cat "$TEST_OUTPUT"; else jq -r .uri "$TEST_OUTPUT"; fi; }
+mieru_tool() { [ "$TEST_FAIL" = 0 ] || return 41; [[ "$*" == *"--name Keep name"* ]] || return 42; if [[ "$*" == *--json* ]]; then cat "$TEST_OUTPUT"; else jq -r .uri "$TEST_OUTPUT"; fi; }
 SERVER_IP=192.0.2.1
 MIERU_USER_STORE="$TEST_STORE"
 '''

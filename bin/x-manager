@@ -544,7 +544,7 @@ snell_change_tag() {
 
 get_mieru_tag() {
     if [ -f "/etc/mieru/tag.txt" ]; then
-        local t=$(cat "/etc/mieru/tag.txt" | tr -d '[:space:]')
+        local t=$(cat "/etc/mieru/tag.txt" | tr -d '\r\n')
         [ -n "$t" ] && echo "$t" || echo "Mieru"
     else
         echo "Mieru"
@@ -5003,7 +5003,7 @@ print(f'qwdtt://config?name={urllib.parse.quote_plus(name)}&peer={ip}%3A{port}&h
         local m_first_user
         m_first_user=$(jq -r 'keys[0] // empty' "$MIERU_USER_STORE") || return 1
         if [ -n "$m_first_user" ]; then
-            m_uri=$(mieru_tool export --server-ip "$SERVER_IP" --user "$m_first_user" --name Mieru-Home) || return 1
+            m_uri=$(mieru_tool export --server-ip "$SERVER_IP" --user "$m_first_user" --name "$(get_mieru_tag)") || return 1
         fi
     fi
 
@@ -5632,8 +5632,8 @@ import_user_openflux_sub() {
     echo -e "${CYAN}║${BOLD}          ИМПОРТ РЕКВИЗИТОВ OPENFLUX С ДРУГОГО СЕРВЕРА                ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "Импорт переносит настройки туннеля OpenFlux (режим, балансировщик,"
-    echo -e "группы, URL и ключи) в локальный каталог и привязывает их к пользователю."
+    echo -e "Импорт добавляет отдельное подключение OpenFlux с другого сервера."
+    echo -e "Его имя, UUID, группы, URL и ключи сохраняются в отдельном бандле."
     echo -e "${YELLOW}Токен подписки пользователя и локальный issuer_id сохраняются.${NC}"
     echo ""
 
@@ -5677,34 +5677,23 @@ import_user_openflux_sub() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    python3 -c '
+    printf '%s' "$body" | python3 -c '
 import json, sys
-data = json.loads(sys.argv[1])
-print(f"  Пользователь:         \033[1;32m{sys.argv[2]}\033[0m")
-print(f"  Имя подключения:      \033[1m{data.get(\"name\", \"\")}\033[0m")
-print(f"  Режим:                \033[1;33m{data.get(\"mode\", \"\")}\033[0m")
-print(f"  Балансировщик:        \033[1;35m{data.get(\"balancer_strategy\", \"\")}\033[0m")
-grps = data.get("groups", [])
-print(f"  Групп в бандле:       \033[1;33m{len(grps)}\033[0m")
-print("")
-print("\033[1mГруппы и параметры туннелей:\033[0m")
-for i, g in enumerate(grps, 1):
-    gnm = g.get("name", "")
-    tr = g.get("transport", "")
-    md = g.get("mode", "")
-    cd = g.get("codec", "legacy")
-    urls = g.get("urls", [])
-    m_key = g.get("masked_encryption_key") or "(без ключа)"
-    print(f"  \033[1;33m[{i}]\033[0m \033[1;32m{gnm}\033[0m — {tr} | {md} | {cd} | URLs: {len(urls)} | ключ: \033[36m{m_key}\033[0m")
-' "$body" "$u_nick"
+d=json.load(sys.stdin); p=d["incoming_config"]
+print("  Имя подключения:", p["name"])
+print("  Режим:", p["mode"], "| Балансировщик:", p["balancer_strategy"])
+print("  Уже добавлено:" if d["is_identical"] else "  Будет добавлено:", p["groups_count"], "групп")
+for i,g in enumerate(p["groups"],1):
+    print("  [{}] {} | {} | {} | URL: {} | шифрование: {}".format(i,g["name"],g["transport"],g["codec"],g["urls_count"],"да" if g["has_encryption"] else "нет"))
+'
 
     local state_token=$(echo "$body" | jq -r '.state_token // ""')
 
     echo ""
-    echo -e "${YELLOW}⚠️  ВНИМАНИЕ: Настройки OpenFlux пользователя ${u_nick} будут полностью заменены.${NC}"
-    echo -e "${GRAY}Текущий статус публикации в подписке сохранится. Ревизия подписки будет увеличена.${NC}"
+    echo -e "${YELLOW}Будет добавлено отдельное подключение. Исходное подключение сохраняется.${NC}"
+    echo -e "${GRAY}Новое подключение включается в подписку независимо от исходного. Повторный импорт не создаёт дубликат.${NC}"
     echo ""
-    read -p "Применить импортированную конфигурацию? [y/N]: " do_commit
+    read -p "Добавить это подключение в подписку? [y/N]: " do_commit
     case "$do_commit" in
         y|Y|д|Д)
             local c_req=$(python3 -c "import json, sys; print(json.dumps({'uri': sys.argv[1], 'commit': True, 'expected_state_token': sys.argv[2]}))" "$uri_to_import" "$state_token")
@@ -5714,9 +5703,9 @@ for i, g in enumerate(grps, 1):
             local c_body=$(echo "$c_resp" | sed '$d')
 
             if [ "$c_code" -eq 200 ]; then
-                echo -e "${GREEN}✓ Конфигурация OpenFlux успешно импортирована и привязана к пользователю!${NC}"
+                echo -e "${GREEN}✓ Подключение добавлено (либо уже было добавлено). Исходное подключение сохранено.${NC}"
             elif [ "$c_code" -eq 409 ]; then
-                echo -e "${RED}Ошибка 409: Конфигурация пользователя изменилась параллельно. Повторите импорт.${NC}"
+                printf "%s\n" "$c_body" | jq -r '"Импорт не выполнен: " + (.error // "Конфликт состояния")'
             else
                 local c_err=$(echo "$c_body" | jq -r '.error // "Ошибка применения"' 2>/dev/null || echo "Ошибка запроса")
                 echo -e "${RED}Ошибка импорта: ${c_err}${NC}"
@@ -5729,6 +5718,47 @@ for i, g in enumerate(grps, 1):
 
     echo ""
     read -p "Нажмите Enter для возврата..."
+}
+
+manage_imported_openflux_sub() {
+    local uid="$1" base="http://127.0.0.1:22217" response item choice action request result
+    while true; do
+        if ! response=$(curl -fsS --connect-timeout 3 --max-time 15 "$base/api/users/$uid/openflux/imported"); then
+            echo 'Не удалось загрузить дополнительные подключения.' >&2
+            read -rp 'Enter — назад: ' _; return 1
+        fi
+        printf '%s' "$response" | jq -r '.connections | to_entries[] | "[\(.key+1)] \(.value.name) | групп: \(.value.total_groups) | " + (if .value.enabled then "включено" else "отключено" end)'
+        if [ "$(printf '%s' "$response" | jq '.connections | length')" -eq 0 ]; then
+            echo 'Дополнительных подключений пока нет. Добавьте ссылку в пункте [9].'
+            read -rp 'Enter — назад: ' _; return
+        fi
+        read -rp 'Номер подключения (0 — назад): ' choice
+        [ "$choice" = 0 ] && return
+        if [[ ! "$choice" =~ ^[1-9][0-9]{0,5}$ ]]; then echo 'Выберите номер из списка.'; continue; fi
+        item=$(printf '%s' "$response" | jq -c --argjson n "$choice" '.connections[$n-1] // empty')
+        [ -n "$item" ] || { echo 'Нет такого номера.'; continue; }
+        echo '[1] Включить  [2] Отключить  [3] Показать ссылку  [4] Удалить из подписки  [0] Назад'
+        read -rp 'Действие: ' choice
+        case "$choice" in
+            0) continue ;;
+            1) action=enable ;;
+            2) action=disable ;;
+            3) printf '%s' "$item" | jq -r '.uri'; read -rp 'Enter — назад: ' _; continue ;;
+            4) read -rp 'Удалить только это дополнительное подключение? [y/N]: ' choice
+               [[ "$choice" =~ ^[YyДд]$ ]] || continue
+               action=delete ;;
+            *) echo 'Выберите действие из списка.'; continue ;;
+        esac
+        request=$(printf '%s' "$response" | jq -c --arg a "$action" '{action:$a,expected_state_token:.state_token}')
+        if ! result=$(curl -sS --connect-timeout 3 --max-time 15 -X POST "$base/api/users/$uid/openflux/imported/$(printf '%s' "$item" | jq -r '.import_id')" -H 'Content-Type: application/json' --data-binary "$request"); then
+            echo 'Ошибка связи с сервисом подписок.' >&2
+        elif printf '%s' "$result" | jq -e '.success == true' >/dev/null; then
+            echo 'Сохранено. Исходное подключение не изменено.'
+        else
+            printf '%s' "$result" | jq -r '.error // "Изменение не сохранено"'
+        fi
+        read -rp 'Enter — продолжить: ' _
+    done
 }
 
 edit_user_openflux_sub() {
@@ -5755,7 +5785,7 @@ edit_user_openflux_sub() {
         echo -e "${CYAN}║${BOLD}          НАСТРОЙКА OPENFLUX V2 ДЛЯ ПОЛЬЗОВАТЕЛЯ TUNA                 ${CYAN}║${NC}"
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
         echo -e "${CYAN}║${NC}  Пользователь:  ${GREEN}${BOLD}${u_nick}${NC} (ID: ${GRAY}${uid}${NC})"
-        echo -e "${CYAN}║${NC}  Публикация:    ${status_str} | Ревизия: ${b_rev}"
+        echo -e "${CYAN}║${NC}  Публикация исходного: ${status_str} | Ревизия: ${b_rev}"
         echo -e "${CYAN}║${NC}  Имя коннекта:  ${BOLD}${b_name}${NC}"
         echo -e "${CYAN}║${NC}  Режим:         ${YELLOW}${b_mode}${NC} (classic: 1 URL/гр, multistream: 1-4 URL/гр)"
         echo -e "${CYAN}║${NC}  Балансировка:  ${MAGENTA}${b_bal}${NC} (roundRobin / leastPing)"
@@ -5764,7 +5794,8 @@ edit_user_openflux_sub() {
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
 
-        echo -e "${BOLD}Выбранные группы в порядке балансировки:${NC}"
+        printf "%s" "$cfg_json" | jq -r '"Дополнительных подключений: " + ((.imported_connections // [] | length) | tostring) + " (управление в [10])"'
+        echo -e "${BOLD}Выбранные группы исходного подключения:${NC}"
         if [ "$sel_ids_len" -eq 0 ]; then
             echo -e "  ${GRAY}(Ни одной группы не выбрано. Бандл OpenFlux v2 не будет опубликован!)${NC}"
         else
@@ -5788,7 +5819,7 @@ except Exception as e:
         fi
 
         echo ""
-        echo -e "  ${YELLOW}[1]${NC} ⚡ ${BOLD}Включить / отключить OpenFlux v2 в подписке${NC}"
+        echo -e "  ${YELLOW}[1]${NC} ⚡ ${BOLD}Включить / отключить исходное подключение${NC}"
         echo -e "  ${YELLOW}[2]${NC} 🏷️  ${BOLD}Изменить общее имя подключения${NC} (сейчас: '${GREEN}${b_name}${NC}')"
         echo -e "  ${YELLOW}[3]${NC} 🔄 ${BOLD}Переключить режим подписки${NC} (classic <-> multistream)"
         echo -e "  ${YELLOW}[4]${NC} ⚖️  ${BOLD}Переключить стратегию балансировщика${NC} (roundRobin <-> leastPing)"
@@ -5796,10 +5827,11 @@ except Exception as e:
         echo -e "  ${YELLOW}[6]${NC} 🎲 ${BOLD}Сгенерировать новый connection_id (UUID)${NC}"
         echo -e "  ${YELLOW}[7]${NC} 👁️  ${BOLD}Предпросмотр бандла v2 (JSON payload и URI)${NC}"
         echo -e "  ${YELLOW}[8]${NC} 📤 ${BOLD}Экспортировать ссылку подключения для другого сервера${NC}"
-        echo -e "  ${YELLOW}[9]${NC} 📥 ${BOLD}Импортировать ссылку подключения с другого сервера${NC}"
+        echo -e "  ${YELLOW}[9]${NC} 📥 ${BOLD}Добавить отдельный сервер по ссылке${NC}"
         echo -e "  ${YELLOW}[0]${NC} ⬅️  Назад к редактированию пользователя"
         echo ""
-        read -p "Выберите действие [0-9]: " of_act
+        echo "  [10] Добавленные серверы — список, публикация, ссылка, удаление"
+        read -p "Выберите действие [0-10]: " of_act
         case "$of_act" in
             1)
                 local new_en="true"
@@ -5988,6 +6020,7 @@ except Exception as e:
             9)
                 import_user_openflux_sub "$uid" "$u_nick"
                 ;;
+            10) manage_imported_openflux_sub "$uid" ;;
             0) return ;;
             *) echo "Неверный выбор"; sleep 1 ;;
         esac

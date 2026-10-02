@@ -144,7 +144,24 @@ def repaired(uri, model, host):
     return result
 
 
-def repair(db_path, request, model, host, apply=False, backup_root=Path('/var/backups')):
+def renamed(uri, model, host, name):
+    if not isinstance(name, str) or not name.strip() or len(name.encode()) > 256 or any(ord(c) < 32 for c in name):
+        raise Error('Invalid Mieru profile name')
+    repaired(uri, model, host)  # Validate the exact endpoint, credentials, ports and pattern.
+    parsed, params = parse(uri)
+    parts = parsed.query.split('&')
+    replacement = 'profile=' + quote(name, safe='')
+    found = False
+    for i, part in enumerate(parts):
+        if unquote(part.split('=', 1)[0]) == 'profile':
+            parts[i] = replacement
+            found = True
+    if not found:
+        parts.append(replacement)
+    return urlunsplit(parsed._replace(query='&'.join(parts)))
+
+
+def repair(db_path, request, model, host, apply=False, backup_root=Path('/var/backups'), new_name=None):
     with closing(sqlite3.connect('file:' + str(db_path) + '?mode=rw', uri=True, timeout=15)) as db:
         db.row_factory = sqlite3.Row
         db.execute('BEGIN IMMEDIATE')
@@ -159,7 +176,7 @@ def repair(db_path, request, model, host, apply=False, backup_root=Path('/var/ba
                 raise Error('Expected exactly one explicitly selected URI')
             index = targets[0]
             previous = lines[index].strip()
-            new = repaired(previous, model, host)
+            new = repaired(previous, model, host) if new_name is None else renamed(previous, model, host, new_name)
             result = dict(changed=new != previous, revision=row['revision'], applied=False,
                           entropy=model['entropy'], backup=None)
             if not apply or new == previous:
@@ -228,10 +245,10 @@ def restore(db_path, backup):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['export', 'preview', 'repair', 'restore', 'validate'])
+    parser.add_argument('action', choices=['export', 'preview', 'repair', 'rename', 'restore', 'validate'])
     parser.add_argument('--server-ip')
     parser.add_argument('--user')
-    parser.add_argument('--name', default='Mieru-Home')
+    parser.add_argument('--name')
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--database', type=Path)
     parser.add_argument('--backup', type=Path)
@@ -248,13 +265,16 @@ def main():
         return
     model = snapshot()
     if args.action == 'export':
-        result = export(model, args.server_ip, args.user, args.name)
+        result = export(model, args.server_ip, args.user, args.name or 'Mieru-Home')
         print(json.dumps(result, ensure_ascii=False) if args.json else result['uri'])
     else:
         if not args.database or not args.server_ip:
             raise Error('Explicit database path and local server address required')
+        if args.action == 'rename' and args.name is None:
+            raise Error('Explicit profile name required')
         print(json.dumps(repair(args.database, json.load(sys.stdin), model, args.server_ip,
-                                apply=args.action == 'repair')))
+                                apply=args.action in ('repair', 'rename'),
+                                new_name=args.name if args.action == 'rename' else None)))
 
 
 if __name__ == '__main__':

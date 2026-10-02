@@ -214,8 +214,9 @@ class ExportImportAcceptanceTests(unittest.TestCase):
         self.assertEqual(len(comm_wd_b["connections"]), 1)
 
         # 5. ЭКСПОРТ ИЗ СЕРВЕРА B
-        st, exp_of_b = self.api_call(self.port_b, "GET", f"/api/users/{u_b['id']}/openflux/export")
+        st, imported_b = self.api_call(self.port_b, "GET", f"/api/users/{u_b['id']}/openflux/imported")
         self.assertEqual(st, 200)
+        exp_of_b = imported_b['connections'][0]
         uri_of_b = exp_of_b["uri"]
 
         st, exp_wd_b = self.api_call(self.port_b, "GET", f"/api/users/{u_b['id']}/webdav/export")
@@ -228,11 +229,11 @@ class ExportImportAcceptanceTests(unittest.TestCase):
         ok_b, _, pl_b = deserialize_openflux_v2_bundle(uri_of_b)
         self.assertTrue(ok_a and ok_b)
 
-        # Проверяем, что служебные ID серверов корректно изолированы:
+        # Дополнительный сервер сохраняет исходные wire ID; локальный issuer не меняется.
         self.assertEqual(pl_a["issuer_id"], self.app_a.issuer_id)
-        self.assertEqual(pl_b["issuer_id"], self.app_b.issuer_id)
-        self.assertNotEqual(pl_a["issuer_id"], pl_b["issuer_id"])
-        self.assertNotEqual(pl_a["id"], pl_b["id"])
+        self.assertNotEqual(self.app_a.issuer_id, self.app_b.issuer_id)
+        self.assertEqual(pl_a["issuer_id"], pl_b["issuer_id"])
+        self.assertEqual(pl_a["id"], pl_b["id"])
 
         # Проверяем 100% совпадение рабочих реквизитов:
         self.assertEqual(pl_a["name"], pl_b["name"])
@@ -465,8 +466,9 @@ class ExportImportAcceptanceTests(unittest.TestCase):
 
         # Идентичный повторный импорт OpenFlux:
         # Экспортируем текущий OpenFlux пользователя bob_b
-        st_exp, of_exp = self.api_call(self.port_b, "GET", "/api/users/bob_b/openflux/export")
+        st_exp, imported = self.api_call(self.port_b, "GET", "/api/users/bob_b/openflux/imported")
         self.assertEqual(st_exp, 200)
+        of_exp = imported['connections'][0]
         uri_of = of_exp["uri"]
         rev_before = of_exp["revision"]
 
