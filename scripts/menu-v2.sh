@@ -150,12 +150,20 @@ xm_release_update() {
         return 1
     fi
 }
+xm_snell6_status() {
+    local status
+    if status=$(python3 "$(dirname "${BASH_SOURCE[0]}")/snell6-endpoints.py" status --human); then
+        printf '%s' "$status"
+    else
+        printf '%s' 'НЕ УДАЛОСЬ ПРОВЕРИТЬ'
+    fi
+}
 xm_snell_menu() {
     local choice
     while true; do
         xm_header 'Snell — версия сервера'
         printf '  [1] Snell v5   %b\n' "$(get_snell_status)"
-        printf '  [2] Snell v6\n'
+        printf '  [2] Snell v6   %s\n' "$(xm_snell6_status)"
         printf '  Выбор открывает настройки. Одновременно активна одна версия.\n'
         printf '  Включение и постоянное отключение — в настройках выбранной реализации.\n'
         printf '  [0] Назад\n'
@@ -172,7 +180,7 @@ xm_services_menu() {
     while true; do
         xm_header 'Службы и туннели'
         printf '  [1] Mieru              %b\n' "$(get_mieru_status)"
-        printf '  [2] Snell — v5 / v6\n'
+        printf '  [2] Snell — v5: %b | v6: %s\n' "$(get_snell_status)" "$(xm_snell6_status)"
         printf '  [3] WebDAV             %b\n' "$(get_wdavtunnel_status)"
         printf '  [4] OpenFlux           %b\n' "$(get_openflux_status)"
         printf '  [5] DNS-туннели        %b\n' "$(get_dns_status)"

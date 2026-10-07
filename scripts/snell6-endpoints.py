@@ -822,13 +822,33 @@ def menu(manager, user=None):
             return
 
 
+def state_label(state):
+    return {"active": "РАБОТАЕТ", "inactive": "ОСТАНОВЛЕН", "failed": "ОШИБКА",
+            "activating": "ЗАПУСКАЕТСЯ", "deactivating": "ОСТАНАВЛИВАЕТСЯ",
+            "reloading": "ПЕРЕЗАГРУЖАЕТ НАСТРОЙКИ"}.get(state, "СТАТУС НЕИЗВЕСТЕН")
+
+def status_summary(rows):
+    if not rows:
+        return "НЕ НАСТРОЕН"
+    states = [row.get("ActiveState") for row in rows]
+    if states.count("active") > 1:
+        return "ОШИБКА: одновременно работают несколько подключений"
+    for state in ("active", "failed", "activating", "deactivating", "reloading"):
+        if state in states:
+            return state_label(state)
+    return "ОСТАНОВЛЕН" if all(state == "inactive" for state in states) else "СТАТУС НЕИЗВЕСТЕН"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("create", "set", "update", "publish", "uri", "status", "menu", "firewall"))
     parser.add_argument("--slot", choices=[str(i) for i in range(1, 9)], default="1")
     parser.add_argument("--core-source", type=Path, help="Local binary, still checked against the fixed release SHA-256")
     parser.add_argument("--user")
+    parser.add_argument("--human", action="store_true", help="Readable status summary")
     args = parser.parse_args()
+    if args.human and args.action != "status":
+        parser.error("--human is only supported for status")
     if os.geteuid() != 0:
         raise Error("Run as root")
     if args.action not in ("uri", "status"):
@@ -852,6 +872,9 @@ def main():
                 value = manager.load(slot)
                 rows.append({k: v for k, v in value.items() if k not in ("psk", "probe_url")}
                             | manager.state(slot))
+        if args.human:
+            print(status_summary(rows))
+            return
         result = rows
     elif args.action == "uri":
         value = manager.load(args.slot)

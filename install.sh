@@ -667,6 +667,7 @@ xm_install_asset systemd/tuna-healthcheck.service /etc/systemd/system/tuna-healt
 xm_install_asset systemd/tuna-healthcheck.timer /etc/systemd/system/tuna-healthcheck.timer 0644
 xm_install_asset systemd/snell6@.service /etc/systemd/system/snell6@.service 0644
 systemctl daemon-reload
+# Reconcile also migrates old inhibit-directory traversal permissions for TUNA.
 python3 /usr/local/share/x-manager/scripts/service-control.py reconcile
 echo -e "  -> Создание системных алиасов (x-snell, x-mieru, x-wdtt, x-csqtt, x-dns, x-ssl, x-fw)..."
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-snell

@@ -50,6 +50,9 @@ def command(*args):
 
 def atomic_write(path, content, mode=0o600):
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Subscription service may stat inhibit markers; file contents stay private.
+    if path.parent.name in ("off", "stopped") and path.parent.parent.name == "service-control":
+        path.parent.chmod(0o711)
     if path.is_symlink():
         raise ValueError("Refusing to replace symlink: " + str(path))
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
@@ -87,7 +90,7 @@ class Controller:
     def lock(self):
         directory = self.path(RUNTIME_DIR)
         directory.mkdir(parents=True, exist_ok=True)
-        directory.chmod(0o700)
+        directory.chmod(0o711)
         with (directory / "lock").open("a") as stream:
             if os.name == "posix":
                 import fcntl
@@ -110,7 +113,7 @@ class Controller:
 
     def save(self, state):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.parent.chmod(0o700)
+        self.state_path.parent.chmod(0o711)
         atomic_write(self.state_path, json.dumps(state, sort_keys=True, indent=2) + "\n")
 
     def markers(self, unit):
@@ -290,6 +293,13 @@ class Controller:
     def reconcile(self):
         """Restore guards after installation; never enable or start a unit."""
         with self.lock():
+            # Upgrade old installations without changing stop/off intent or file contents.
+            for name in (STATE_DIR, STATE_DIR + "/off", RUNTIME_DIR + "/stopped"):
+                directory = self.path(name)
+                if directory.is_symlink():
+                    raise ValueError("Refusing symlink in lifecycle state: " + str(directory))
+                if directory.exists():
+                    directory.chmod(0o711)
             state = self.read()
             changed = []
             for unit, intent in state["units"].items():

@@ -180,7 +180,7 @@ test "$selected" = 0
         self.assertIn("HTTP-обфускация", result.stdout)
         self.assertNotIn("Snell v4", result.stdout)
         source = (ROOT / "scripts/menu-v2.sh").read_text(encoding="utf-8")
-        self.assertIn("[2] Snell — v5 / v6", source)
+        self.assertIn("[2] Snell — v5: %b | v6: %s", source)
         self.assertNotIn("[9] Snell v6", source)
 
     @unittest.skipUnless(os.name == "posix", "Bash fixture paths require a Linux runtime")
