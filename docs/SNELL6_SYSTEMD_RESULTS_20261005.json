@@ -1,0 +1,66 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "case": "start-listener-nonroot",
+      "passed": true,
+      "state": {
+        "MainPID": "822",
+        "Result": "success",
+        "NRestarts": "0",
+        "ExecMainStatus": "0",
+        "ActiveState": "active",
+        "SubState": "running"
+      }
+    },
+    {
+      "case": "manual-stop-no-restart-no-main-process",
+      "passed": true
+    },
+    {
+      "case": "invalid-config-rejected",
+      "passed": true,
+      "exit": 1,
+      "state": {
+        "MainPID": "0",
+        "Result": "exit-code",
+        "NRestarts": "3",
+        "ExecMainStatus": "0",
+        "ActiveState": "failed",
+        "SubState": "failed"
+      }
+    },
+    {
+      "case": "occupied-port-fails-visibly",
+      "passed": true,
+      "state": {
+        "MainPID": "0",
+        "Result": "exit-code",
+        "NRestarts": "3",
+        "ExecMainStatus": "1",
+        "ActiveState": "failed",
+        "SubState": "failed"
+      }
+    },
+    {
+      "case": "initial-plus-two-restarts-then-stops",
+      "passed": true,
+      "successful_starts": 3,
+      "state": {
+        "MainPID": "0",
+        "Result": "signal",
+        "NRestarts": "3",
+        "ExecMainStatus": "9",
+        "ActiveState": "failed",
+        "SubState": "failed"
+      }
+    },
+    {
+      "case": "explicit-reset-allows-recovery",
+      "passed": true
+    }
+  ],
+  "seconds": 15.42,
+  "systemd": "systemd 257 (257.13-1~deb13u1)",
+  "final_main_pid": "0"
+}

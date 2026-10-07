@@ -524,6 +524,14 @@ snell_tool() {
     python3 "$helper" "$@" --server-ip "$SERVER_IP"
 }
 
+snell6_tool() {
+    local helper="/usr/local/share/x-manager/scripts/snell6-endpoints.py"
+    if [ ! -f "$helper" ]; then
+        helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)/snell6-endpoints.py"
+    fi
+    python3 "$helper" "$@"
+}
+
 get_snell_uri() {
     snell_tool uri
 }
@@ -4849,8 +4857,12 @@ menu_fail2ban() {
         echo -e "  ${YELLOW}[7]${NC} 🛑 Остановить / Запустить Fail2ban"
         echo -e "  ${YELLOW}[0]${NC} Назад"
         echo ""
-        read -p "Выберите действие [0-7]: " f2b_ch
+        echo '  [90] Включить Fail2ban'
+        echo '  [91] Выключить Fail2ban постоянно'
+        read -p "Выберите действие: " f2b_ch
         case "$f2b_ch" in
+            90) xm_direct_service_action on fail2ban.service;;
+            91) xm_direct_service_action off fail2ban.service;;
             1) show_fail2ban_banned ;;
             2) unban_ip_fail2ban ;;
             3) ban_ip_fail2ban ;;
@@ -5303,6 +5315,43 @@ except Exception as e:
 edit_sub_user() {
     local SUB_API="http://127.0.0.1:22217"
     local sel_id="$1"
+    local snell_v5_edit_code
+    snell_v5_edit_code=$(cat <<'PY'
+import json, sys
+from urllib.parse import urlsplit, parse_qs
+
+def is_v5(uri):
+    try:
+        parsed = urlsplit(uri)
+        versions = parse_qs(parsed.query, keep_blank_values=True).get('version', ['5'])
+        return parsed.scheme == 'snell' and bool(parsed.hostname) and len(versions) == 1 and versions[0] in ('4', '5')
+    except ValueError:
+        return False
+
+action, current = sys.argv[1:3]
+lines = current.splitlines()
+if action == 'view':
+    print('\n'.join(line for line in lines if is_v5(line)))
+else:
+    incoming = [line.strip() for line in sys.argv[3].splitlines() if line.strip()]
+    if any(not is_v5(line) for line in incoming):
+        sys.exit('Ошибка: редактор Snell v5 принимает только ссылки Snell версии 4/5; изменения не сохранены.')
+    if action == '2':
+        result = lines + incoming
+    else:
+        result, inserted = [], False
+        for line in lines:
+            if is_v5(line):
+                if not inserted:
+                    result.extend(incoming)
+                    inserted = True
+            else:
+                result.append(line)
+        if not inserted:
+            result.extend(incoming)
+    print(json.dumps({'snell_uri': '\n'.join(result)}))
+PY
+)
     if [ -z "$sel_id" ]; then
         sel_id=$(select_sub_user)
         [ -z "$sel_id" ] && return
@@ -5359,12 +5408,12 @@ edit_sub_user() {
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${YELLOW}[1]${NC} 👤 ${BOLD}Изменить никнейм${NC} (сейчас: ${GREEN}${u_nick}${NC})"
-        echo -e "  ${YELLOW}[2]${NC} ⚡ ${BOLD}Snell v5${NC} (узлов: ${BOLD}${c_snell}${NC})"
+        echo -e "  ${YELLOW}[2]${NC} ⚡ ${BOLD}Snell v5 / v6${NC} (узлов: ${BOLD}${c_snell}${NC})"
         echo -e "  ${YELLOW}[3]${NC} 🏎️  ${BOLD}WDTT (qwdtt)${NC} (узлов: ${BOLD}${c_wdtt}${NC})"
         echo -e "  ${YELLOW}[4]${NC} 🌊 ${BOLD}Mieru (mita)${NC} (узлов: ${BOLD}${c_mieru}${NC})"
         echo -e "  ${YELLOW}[5]${NC} 🛡️  ${BOLD}CSQTT${NC} (узлов: ${BOLD}${c_csqtt}${NC})"
         echo -e "  ${YELLOW}[6]${NC} 🌐 ${BOLD}MasterDNS / StormDNS${NC} (узлов: ${BOLD}${c_dns}${NC})"
-        echo -e "  ${YELLOW}[7]${NC} 📦 ${BOLD}Дополнительные узлы (VLESS / Trojan / Shadowsocks / TUIC)${NC} (узлов: ${BOLD}${c_custom}${NC})"
+        echo -e "  ${YELLOW}[7]${NC} 📦 ${BOLD}Дополнительные узлы — произвольные ссылки${NC} (узлов: ${BOLD}${c_custom}${NC})"
         echo -e "  ${YELLOW}[8]${NC} 🌊 ${BOLD}OpenFlux v2 (Группы / Балансировка / Бандл)${NC} [${of_label}]"
         echo -e "  ${YELLOW}[9]${NC} 📁 ${BOLD}WebDAV (Подключения / Бэкенды / Пул)${NC} [${wd_label}]"
         echo -e "  ${YELLOW}[10]${NC} 🔄 ${BOLD}Пересобрать профиль из активных служб сервера${NC}"
@@ -5394,17 +5443,32 @@ edit_sub_user() {
                 fi
                 ;;
             2|3|4|5|6|7)
+                if [ "$e_act" = 2 ]; then
+                    echo '  [1] Snell v5'
+                    echo '  [2] Snell v6'
+                    echo '  [0] Назад'
+                    local snell_version_choice
+                    read -r -p 'Версия: ' snell_version_choice || return
+                    case "$snell_version_choice" in
+                        2) snell6_tool menu --user "$uid"; continue;;
+                        1) ;;
+                        *) continue;;
+                    esac
+                fi
                 local proto_field=""
                 local proto_label=""
                 local proto_ex=""
                 local cur_links=""
                 case "$e_act" in
-                    2) proto_field="snell_uri"; proto_label="Snell v5"; proto_ex="snell://psk@ip:port/?version=5#Node"; cur_links="$u_snell" ;;
+                    2)
+                        proto_field="snell_uri"; proto_label="Snell v5"; proto_ex="snell://psk@ip:port/?version=4#Node"
+                        cur_links=$(python3 -c "$snell_v5_edit_code" view "$u_snell") || continue
+                        ;;
                     3) proto_field="qwdtt_uri"; proto_label="WDTT (qwdtt)"; proto_ex="qwdtt://config?name=...&peer=ip%3Aport..."; cur_links="$u_wdtt" ;;
                     4) proto_field="mieru_uri"; proto_label="Mieru (mita)"; proto_ex="mierus://user:pass@ip/?profile=...&port=..."; cur_links="$u_mieru" ;;
                     5) proto_field="csqtt_uri"; proto_label="CSQTT"; proto_ex="csqtt://pass@ip:port#CSQTT"; cur_links="$u_csqtt" ;;
                     6) proto_field="masterdnsvpn_uri"; proto_label="MasterDNS / StormDNS"; proto_ex="stormdns://domain?key=...#DNS"; cur_links="$u_dns" ;;
-                    7) proto_field="custom_uri"; proto_label="Дополнительные узлы"; proto_ex="vless://... или ss://..."; cur_links="$u_custom" ;;
+                    7) proto_field="custom_uri"; proto_label="Дополнительные узлы — произвольные ссылки"; proto_ex="Произвольная ссылка подключения"; cur_links="$u_custom" ;;
                 esac
 
                 echo -e "\n${BOLD}--- Текущие ссылки ${proto_label}: ---${NC}"
@@ -5425,6 +5489,32 @@ edit_sub_user() {
                 fi
                 echo -e "  [0] Отмена"
                 read -p "Выберите вариант: " sub_opt
+                if [ "$proto_field" = "snell_uri" ] && [[ "$sub_opt" =~ ^[123]$ ]]; then
+                    local snell_input="" latest_user latest_snell p_json resp
+                    if [ "$sub_opt" = 3 ]; then
+                        read -r -p "Точно удалить все ссылки ${proto_label}? [y/N]: " conf_clr || return
+                        [[ "$conf_clr" =~ ^[YyДд]$ ]] || continue
+                    else
+                        snell_input=$(collect_multi_uris "$proto_label" "$proto_ex") || continue
+                        [ -n "$snell_input" ] || continue
+                    fi
+                    # Re-read after interactive input so newly saved v6 links are retained too.
+                    if ! latest_user=$(curl -fsS "${SUB_API}/api/users/${uid}") ||
+                       ! jq -e --arg uid "$uid" '.id == $uid and (.snell | type == "string")' <<< "$latest_user" >/dev/null; then
+                        echo 'Ошибка чтения текущих ссылок Snell; изменения не сохранены.'
+                        continue
+                    fi
+                    latest_snell=$(jq -r '.snell' <<< "$latest_user")
+                    p_json=$(python3 -c "$snell_v5_edit_code" "$sub_opt" "$latest_snell" "$snell_input") || continue
+                    if ! resp=$(curl -fsS -X PUT "${SUB_API}/api/users/${uid}" -H "Content-Type: application/json" -d "$p_json") ||
+                       ! jq -e --arg uid "$uid" '.id == $uid and (.error | not)' <<< "$resp" >/dev/null; then
+                        echo 'Ошибка сохранения ссылок Snell v5.'
+                        continue
+                    fi
+                    echo -e "${GREEN}✓ Ссылки ${proto_label} успешно обновлены!${NC}"
+                    sleep 1.5
+                    continue
+                fi
                 case "$sub_opt" in
                     1)
                         local new_u=$(collect_multi_uris "$proto_label" "$proto_ex")
@@ -8252,7 +8342,7 @@ except Exception as e:
                 local m_mieru=$(collect_multi_uris "Mieru (mita)" "mierus://user:pass@ip/?profile=...&port=...")
                 local m_csqtt=$(collect_multi_uris "CSQTT" "csqtt://pass@ip:port#CSQTT")
                 local m_dns=$(collect_multi_uris "MasterDNS / StormDNS" "stormdns://domain?key=...#DNS")
-                local m_custom=$(collect_multi_uris "Дополнительные узлы (VLESS / Trojan / Shadowsocks / TUIC)" "vless://... или ss://...")
+                local m_custom=$(collect_multi_uris "Дополнительные узлы — произвольные ссылки" "Произвольная ссылка подключения")
 
                 local count_snell=$(python3 -c "import sys; print(len([l for l in sys.argv[1].splitlines() if l.strip()]))" "$m_snell" 2>/dev/null || echo 0)
                 local count_wdtt=$(python3 -c "import sys; print(len([l for l in sys.argv[1].splitlines() if l.strip()]))" "$m_wdtt" 2>/dev/null || echo 0)
@@ -10000,8 +10090,8 @@ menu_openflux() {
                        else
                            echo 'Проверка cookies не пройдена. Причина — в [4] «Статус и журнал». При SmartCaptcha используйте [6]; черновики сохранены.' >&2
                        fi;;
-                    2) systemctl enable --now volga-cookies.timer;;
-                    3) systemctl disable --now volga-cookies.timer;;
+                    2) xm_direct_service_action on volga-cookies.timer;;
+                    3) xm_direct_service_action off volga-cookies.timer;;
                     4) systemctl show volga-cookies.service -p Result -p ExecMainStatus; systemctl list-timers volga-cookies.timer --no-pager; journalctl -u volga-cookies.service -n 15 --no-pager;;
                     5) read -rp 'Путь к Netscape cookies-файлу (Enter — отмена): ' cookie_source
                        [ -z "$cookie_source" ] || python3 /usr/local/share/x-manager/scripts/openflux-volga.py cookies "$cookie_source";;
@@ -10040,6 +10130,7 @@ menu_openflux() {
 
                 echo ""
                 echo -e "${BOLD}--- ВВОД ССЫЛКИ НА ДОКУМЕНТ ДЛЯ КАНАЛА ${target_ch} ---${NC}"
+                xm_openflux_channel_actions "$target_ch" || continue
                 local cur_u=$(get_openflux_channel_prop "$target_ch" "URL" "")
                 echo "Текущая ссылка: ${cur_u:-[не задана]}"
                 echo ""

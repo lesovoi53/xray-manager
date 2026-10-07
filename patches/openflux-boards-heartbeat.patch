@@ -1,0 +1,48 @@
+diff --git a/transport/yandex/boards.go b/transport/yandex/boards.go
+index eae34af..28fa6a5 100644
+--- a/transport/yandex/boards.go
++++ b/transport/yandex/boards.go
+@@ -30,8 +30,8 @@ const (
+ 		"(KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36"
+ 	boardsSocketHostDefault = "socket33.boards.yandex.ru"
+ 
+-	// Engine.io heartbeat. Сервер шлёт pingInterval=25000, pingTimeout=30000.
+-	// Мы пингуем сами каждые 20с, чтобы NAT не рвал idle-соединение.
++	// Application-layer dashboard heartbeat. Engine.IO v4 pings are sent by
++	// the server; handleMessage replies with pong, never an unsolicited ping.
+ 	boardsPingInterval = 20 * time.Second
+ 
+ 	// Дедлайн чтения в основном цикле. С запасом над boardsPingInterval.
+@@ -553,7 +553,6 @@ func (t *BoardsTransport) connectAndServe(info boardsInfo) error {
+ 
+ 	kaStop := make(chan struct{})
+ 	utils.SafeGo("boards.keepalive", func() { t.keepAliveLoop(sess, kaStop) })
+-	utils.SafeGo("boards.ping", func() { t.pingLoop(sess, kaStop) })
+ 	defer close(kaStop)
+ 
+ 	for {
+@@ -793,24 +792,6 @@ func (t *BoardsTransport) keepAliveLoop(sess *boardsSession, stop chan struct{})
+ 	}
+ }
+ 
+-func (t *BoardsTransport) pingLoop(sess *boardsSession, stop chan struct{}) {
+-	tick := time.NewTicker(boardsPingInterval)
+-	defer tick.Stop()
+-	for {
+-		select {
+-		case <-stop:
+-			return
+-		case <-t.done:
+-			return
+-		case <-tick.C:
+-			if err := sess.writeRaw("2"); err != nil {
+-				utils.Debugf("[BOARDS] engine.io ping: %v", err)
+-				return
+-			}
+-		}
+-	}
+-}
+-
+ // ---- приём ----
+ 
+ func (t *BoardsTransport) handleMessage(sess *boardsSession, raw []byte) {

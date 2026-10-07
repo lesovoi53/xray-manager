@@ -1,0 +1,170 @@
+{
+  "core_sha256": "af077ab347fa8bbd5ab31b4e0310f2979adb3ed3d95f53872091d25219ca06a7",
+  "core_version": "sing-box version 1.14.1-extended-2.7.2\n\nEnvironment: go1.26.4 windows/amd64\nTags: with_quic,with_utls,with_gvisor,with_clash_api,with_naive_outbound,with_wireguard,with_trusttunnel,with_trusttunnel_cronet,with_purego\nCGO: disabled\n",
+  "core_path": "C:\\Users\\Lesovoi\\Documents\\ChatGPT\\x-manager\\TunaTURN\\build\\native-cache\\singbox-extended-check.exe",
+  "scope": "loopback same-core server/client",
+  "external_network": false,
+  "cases": [
+    {
+      "case": "reuse-false/https/127.0.0.1",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/snell.test",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/1",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/28",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/stun-binding",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/127.0.0.1",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/snell.test",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/1",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/28",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/stun-binding",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/127.0.0.1",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/snell.test",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/1",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/28",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/stun-binding",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/wrong-psk-rejected",
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/127.0.0.1",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/snell.test",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/1",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/28",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/stun-binding",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/127.0.0.1",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/snell.test",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/1",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/28",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/stun-binding",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/127.0.0.1",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/snell.test",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/1",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/28",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/stun-binding",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/wrong-psk-rejected",
+      "passed": true
+    }
+  ],
+  "synthetic_uri": "snell://synthetic-local-only-0123456789abcdef@192.0.2.1:20000/?version=6&mode=default&reuse=true&udp-relay=true#Snell6-local-example",
+  "seconds": 4.56,
+  "passed": true
+}

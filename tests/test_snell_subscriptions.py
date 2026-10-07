@@ -47,13 +47,109 @@ class SnellSubscriptions(unittest.TestCase):
     def local(self):
         return self.db.execute('SELECT * FROM users WHERE id="local"').fetchone()
 
+    def v6(self, **changes):
+        return dict(dict(version=6, mode='default', port=20000,
+                         psk='test@key:/?#&%+ ключ', name='IPv6 & новое имя'), **changes)
+
+    def sync6(self, value, **kwargs):
+        with self.db:
+            return snell.synchronize(self.db, value, '192.0.2.1', endpoint_id='local-v6', **kwargs)
+
+    def test_v6_encoding_and_flags(self):
+        value = self.v6()
+        link = snell.uri(value, '2001:db8::1')
+        p = urlsplit(link)
+        self.assertEqual(p.hostname, '2001:db8::1')
+        self.assertEqual(unquote(p.username), value['psk'])
+        self.assertEqual(unquote(p.fragment), value['name'])
+        q = parse_qs(p.query)
+        self.assertEqual(q['version'], ['6'])
+        self.assertEqual(q['mode'], ['default'])
+        self.assertNotIn('obfs-mode', q)
+        previous = link.replace('reuse=true', 'reuse=false')
+        previous = previous.replace('#', '&network=auto&userkey=a%2Bb#')
+        updated = snell.uri(self.v6(name='Renamed'), '2001:db8::1', previous, False)
+        self.assertEqual(parse_qs(urlsplit(updated).query)['userkey'], ['a+b'])
+        self.assertEqual(parse_qs(urlsplit(updated).query)['reuse'], ['false'])
+        self.assertEqual(urlsplit(updated).fragment, p.fragment)
+
+    def test_v6_rejects_incompatible_parameters(self):
+        good = snell.uri(self.v6(), '192.0.2.1')
+        for extra in ('obfs-mode=none', 'obfs-host=example.invalid', 'obfs=http',
+                      'version=5', 'quic-proxy-mode=true', 'reuse=maybe',
+                      'mode=bogus', 'network=udp&udp-relay=false', 'unknown=x'):
+            with self.subTest(extra=extra), self.assertRaises(snell.Error):
+                snell.uri(self.v6(), '192.0.2.1', good.replace('#', '&'+extra+'#'))
+        for value in (self.v6(mode='bogus'), self.v6(obfs='http'), self.v6(port=0),
+                      self.v6(name='bad\nname'), self.v6(version=7), self.v6(version=5)):
+            with self.assertRaises(snell.Error):
+                snell.uri(value, '192.0.2.1')
+        with self.assertRaises(snell.Error):
+            snell.uri(self.v6(), '192.0.2.1', self.old)
+
+    def test_v6_sync_preserves_v5_foreign_groups_and_is_idempotent(self):
+        self.sync(bind_user='local', adopt=True)
+        original = self.local()
+        value = self.v6()
+        link = snell.uri(value, '192.0.2.1')
+        self.db.execute('UPDATE users SET snell_uri=? WHERE id="local"', (original[1]+'\n'+link,))
+        doc = {'profiles':[{'id':'v6-id','name':'Keep alias','uri':link}], 'groups':[{'id':'keep-group'}]}
+        self.db.execute('UPDATE user_connection_groups SET document_json=? WHERE user_id="local"', (json.dumps(doc),))
+        self.db.commit()
+        self.assertEqual(self.sync6(value, bind_user='local'), 0)
+        self.assertEqual(self.sync6(self.v6(name='New v6')), 1)
+        after = self.local()
+        self.assertEqual(after[1].splitlines()[:2], original[1].splitlines())
+        self.assertEqual(after[2], original[2]+1)
+        self.assertEqual(after[4:], original[4:])
+        stored = json.loads(self.db.execute('SELECT document_json FROM user_connection_groups WHERE user_id="local"').fetchone()[0])
+        self.assertEqual(stored['profiles'][0]['id'], 'v6-id')
+        self.assertEqual(stored['profiles'][0]['name'], 'Keep alias')
+        self.assertEqual(stored['groups'], doc['groups'])
+        self.assertEqual(self.sync6(self.v6(name='New v6')), 0)
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.local(), after)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM x_manager_snell_endpoint_links').fetchone()[0], 1)
+
+    def test_v6_requires_scope_and_does_not_adopt(self):
+        before = self.local()
+        with self.assertRaises(snell.Error), self.db:
+            snell.synchronize(self.db, self.v6(), '192.0.2.1')
+        with self.assertRaises(snell.Error):
+            self.sync6(self.v6(), bind_user='local', adopt=True)
+        self.assertEqual(before, self.local())
+
+    def test_v6_endpoint_isolation(self):
+        a, b = self.v6(), self.v6(port=20001, name='Second')
+        first, second = snell.uri(a, '192.0.2.1'), snell.uri(b, '192.0.2.1')
+        self.db.execute('UPDATE users SET snell_uri=? WHERE id="local"', (first+'\n'+second,))
+        self.db.commit()
+        self.sync6(a, bind_user='local')
+        with self.assertRaises(snell.Error), self.db:
+            snell.synchronize(self.db, a, '192.0.2.1', endpoint_id='second', bind_user='local')
+        with self.db:
+            snell.synchronize(self.db, b, '192.0.2.1', endpoint_id='second', bind_user='local')
+        self.sync6(self.v6(name='First renamed'))
+        self.assertEqual(self.local()[1].splitlines()[1], second)
+
+    def test_v6_duplicate_collision_rolls_back(self):
+        a, b = self.v6(), self.v6(name='Already exists')
+        first, second = snell.uri(a, '192.0.2.1'), snell.uri(b, '192.0.2.1')
+        self.db.execute('UPDATE users SET snell_uri=? WHERE id="local"', (first+'\n'+second,))
+        self.db.commit()
+        self.sync6(a, bind_user='local')
+        before = self.local()
+        with self.assertRaises(snell.Error):
+            self.sync6(b)
+        self.assertEqual(before, self.local())
+
     def test_uri_obfuscation_name_and_encoding(self):
         value = self.value()
         value['psk'] = 'synthetic+/@=&key'
         p = urlsplit(snell.uri(value, '192.0.2.1'))
         self.assertEqual(unquote(p.username), value['psk'])
         self.assertEqual(unquote(p.fragment), value['name'])
-        self.assertEqual(parse_qs(p.query), {'version':['5'],'reuse':['true'],'tfo':['true'],'obfs-mode':['http'],'obfs-host':['yandex.ru']})
+        self.assertEqual(parse_qs(p.query), {'version':['4'],'reuse':['true'],'tfo':['true'],'obfs-mode':['http'],'obfs-host':['yandex.ru']})
 
     def test_explicit_adoption_preserves_manual_links_tokens_and_group_ids(self):
         self.assertEqual(self.sync(), 0)

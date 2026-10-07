@@ -24,6 +24,33 @@ if [ -f "$ENV_FILE" ]; then
     set +a
 fi
 
+# Automatic or manual budgets are numeric data, never shell.
+# The service pre-start helper prepares this file before the runner reads it.
+if [ -e /etc/openflux/resources.conf ]; then
+    [ -r /etc/openflux/resources.conf ] || { echo 'OpenFlux resource budgets are unreadable' >&2; exit 1; }
+    RESOURCE_CHANNELS=" "
+    RESOURCE_FOUND=0
+    while IFS= read -r RESOURCE_LINE || [ -n "$RESOURCE_LINE" ]; do
+        case "$RESOURCE_LINE" in ''|'#'*) continue;; esac
+        if [[ ! "$RESOURCE_LINE" =~ ^([1-8])=([1-9][0-9]{0,8})MiB$ ]]; then
+            echo 'Invalid OpenFlux resource budget; run openflux-resources.py report' >&2
+            exit 1
+        fi
+        RESOURCE_CHANNEL="${BASH_REMATCH[1]}"
+        RESOURCE_MIB="${BASH_REMATCH[2]}"
+        case "$RESOURCE_CHANNELS" in *" $RESOURCE_CHANNEL "*) echo 'Duplicate OpenFlux resource budget' >&2; exit 1;; esac
+        RESOURCE_CHANNELS+="$RESOURCE_CHANNEL "
+        if [ "$RESOURCE_CHANNEL" = "$INSTANCE" ]; then
+            export GOMEMLIMIT="${RESOURCE_MIB}MiB"
+            RESOURCE_FOUND=1
+        fi
+    done < /etc/openflux/resources.conf
+    if [ "$RESOURCE_FOUND" != 1 ]; then
+        echo 'No managed OpenFlux memory budget for this channel. Run openflux-resources.py plan and apply with the complete channel list before starting it.' >&2
+        exit 1
+    fi
+fi
+
 ROLE="${ROLE:-exit}"
 MODE="${MODE:-l4}"
 TRANSPORT="${TRANSPORT:-vyandex}"

@@ -6,6 +6,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MenuNavigation(unittest.TestCase):
+    def test_profile_rollback_accessible_when_plan_not_ready(self):
+        script = r'''
+. "$1"
+xm_confirm() { return 0; }
+xm_pause() { :; }
+python3() { case "$2" in plan) return 1;; rollback) echo ROLLBACK_CALLED;; *) return 99;; esac; }
+xm_network_profile_menu
+'''
+        result = subprocess.run(['bash','-c',script,'bash',str(ROOT/'scripts/menu-v2.sh')],input='2\n',text=True,capture_output=True,timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ROLLBACK_CALLED', result.stdout)
+
     def test_firewall_menu_has_webdav_access(self):
         script = '. "$1"; xm_header() { :; }; xm_choose_action menu_firewall selected; test "$selected" = 9'
         result = subprocess.run(['bash','-c',script,'bash',str(ROOT/'scripts/menu-v2.sh')],input='1\n7\n0\n',text=True,capture_output=True,timeout=5)

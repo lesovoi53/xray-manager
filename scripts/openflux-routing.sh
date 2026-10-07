@@ -5,6 +5,11 @@
 # ==============================================================================
 
 set -e
+# All instances rebuild the same chain. iptables -w protects one command, not
+# the delete/recreate transaction. Keep this descriptor open until shell exit;
+# never unlink the shared lock file while another instance may be waiting.
+exec 9>/run/lock/x-manager-openflux-routing.lock
+flock -x 9
 iptables-save >/dev/null
 
 MODE_FILE="/etc/openflux/routing.mode"

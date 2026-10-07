@@ -1,0 +1,25 @@
+[Unit]
+Description=X-Manager Snell v6 endpoint %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=infinity
+StartLimitBurst=6
+
+[Service]
+Type=exec
+User=snell6
+Group=snell6
+ExecStartPre=+/usr/bin/python3 /usr/local/share/x-manager/scripts/snell6-endpoints.py firewall --slot %i
+ExecStartPre=/etc/snell6/endpoints/%i/core check -c /etc/snell6/endpoints/%i/config.json
+ExecStart=/etc/snell6/endpoints/%i/core run -c /etc/snell6/endpoints/%i/config.json
+Restart=on-failure
+RestartSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

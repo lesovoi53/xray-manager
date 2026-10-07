@@ -54,11 +54,48 @@ def uri(value, host, previous=None, follow_name=True):
     """Preserve per-link flags and names unless the name follows the service."""
     if not host or any(c.isspace() or c in '/?#@' for c in host):
         raise Error('Invalid server address')
+    version = value.get('version', 5)
+    if type(version) is not int or version not in (5, 6):
+        raise Error('Unsupported Snell link version')
+    if version == 5 and 'mode' in value:
+        raise Error('Snell mode requires version 6')
     parsed = urlsplit(previous) if previous else None
     query = parse_qsl(parsed.query, keep_blank_values=True) if parsed else [
-        ('version', '5'), ('reuse', 'true'), ('tfo', 'true')]
+        ('version', str(version)), ('reuse', 'true'), ('tfo', 'true')]
+    if version == 6:
+        mode = value.get('mode', 'default')
+        if mode not in ('default', 'unshaped', 'unsafe-raw'):
+            raise Error('Unsupported Snell v6 mode')
+        if value.get('obfs', 'off') not in ('off', 'none') or value.get('obfs_host'):
+            raise Error('Snell v6 cannot use legacy obfuscation')
+        if (type(value['port']) is not int or not 1 <= value['port'] <= 65535 or
+                not value['psk'] or not value['name'] or
+                any(ord(c) < 32 for key in ('psk', 'name') for c in value[key])):
+            raise Error('Invalid Snell v6 identity')
+        options = dict(query)
+        if len(options) != len(query):
+            raise Error('Duplicate Snell v6 query parameter')
+        if (options.get('version') != '6' or (parsed and parsed.scheme != 'snell') or
+                any(k in options for k in ('obfs-mode', 'obfs-host', 'obfs'))):
+            raise Error('Incompatible previous Snell link; migration must be explicit')
+        if set(options) - {'version', 'mode', 'reuse', 'tfo', 'network', 'udp-relay', 'userkey', 'quic-proxy-mode', 'quic_proxy_mode'}:
+            raise Error('Unknown Snell v6 query parameter')
+        if options.get('mode', 'default') not in ('default', 'unshaped', 'unsafe-raw'):
+            raise Error('Invalid previous Snell v6 mode')
+        for flag in ('reuse', 'tfo', 'udp-relay', 'quic-proxy-mode', 'quic_proxy_mode'):
+            if flag in options and options[flag] not in ('true', 'false'):
+                raise Error('Invalid Snell v6 boolean option')
+        if any(options.get(k) == 'true' for k in ('quic-proxy-mode', 'quic_proxy_mode')):
+            raise Error('QUIC Proxy is not supported by the selected Snell v6 server')
+        if options.get('network', 'auto') not in ('auto', 'tcp', 'udp') or (options.get('network') == 'udp' and options.get('udp-relay') == 'false'):
+            raise Error('Conflicting Snell v6 network options')
+        if not parsed:
+            query.append(('udp-relay', 'true'))
+        query = [(k, v) for k, v in query if k != 'mode'] + [('mode', mode)]
     query = [(k, v) for k, v in query if k not in ('obfs-mode', 'obfs-host')]
-    if value['obfs'] in ('http', 'tls'):
+    if version == 5:
+        query = [(k, '4' if k == 'version' else v) for k, v in query]
+    if version == 5 and value['obfs'] in ('http', 'tls'):
         query += [('obfs-mode', value['obfs']), ('obfs-host', value['obfs_host'])]
     host = (parsed.hostname if parsed else host).strip('[]')
     authority = '[' + host + ']' if ':' in host else host
@@ -72,16 +109,30 @@ def matches(link, value, host):
         p = urlsplit(link)
         return (p.scheme == 'snell' and p.hostname == host.strip('[]') and
                 p.port == value['port'] and unquote(p.username or '') == value['psk'] and
-                dict(parse_qsl(p.query)).get('version', '5') == '5')
+                dict(parse_qsl(p.query)).get('version', '5') in ('4', '5'))
     except ValueError:
         return False
 
 
-def synchronize(db, value, host, bind_user=None, adopt=False):
+def synchronize(db, value, host, bind_user=None, adopt=False, endpoint_id=None):
     """Caller owns transaction. Only exact, explicitly bound URI snapshots move."""
-    db.execute('''CREATE TABLE IF NOT EXISTS x_manager_snell_links (
+    version = value.get('version', 5)
+    uri(value, host)  # Validate before writing bindings or subscription data.
+    table = 'x_manager_snell_links'
+    scope, scope_args = '', ()
+    extra_column, extra_placeholder = '', ''
+    if version == 6:
+        if not isinstance(endpoint_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', endpoint_id):
+            raise Error('Snell v6 requires a stable explicit endpoint ID')
+        if adopt:
+            raise Error('Snell v6 adoption is not supported; bind the exact generated link')
+        table = 'x_manager_snell_endpoint_links'
+        scope, scope_args = 'endpoint_id=? AND ', (endpoint_id,)
+        extra_column, extra_placeholder = 'endpoint_id TEXT NOT NULL, ', '?, '
+    db.execute(f'''CREATE TABLE IF NOT EXISTS {table} (
+        {extra_column}
         user_id TEXT NOT NULL, uri TEXT NOT NULL, follow_name INTEGER NOT NULL,
-        PRIMARY KEY(user_id, uri))''')
+        PRIMARY KEY({'endpoint_id, ' if version == 6 else ''}user_id, uri))''')
     if bind_user:
         row = db.execute('SELECT snell_uri FROM users WHERE id=?', (bind_user,)).fetchone()
         if row is None:
@@ -91,20 +142,24 @@ def synchronize(db, value, host, bind_user=None, adopt=False):
         if len(candidates) != 1:
             raise Error('Expected one unambiguous local Snell link; no changes made')
         link = candidates[0]
-        follow = unquote(urlsplit(link).fragment) in (value['name'], 'Snell-v5', '')
-        db.execute('INSERT OR IGNORE INTO x_manager_snell_links VALUES (?,?,?)',
-                   (bind_user, link, int(follow)))
+        if version == 6 and db.execute(
+                f'SELECT 1 FROM {table} WHERE user_id=? AND uri=? AND endpoint_id<>?',
+                (bind_user, link, endpoint_id)).fetchone():
+            raise Error('Snell link is already bound to another endpoint')
+        follow = unquote(urlsplit(link).fragment) in (value['name'], 'Snell-v' + str(version), '')
+        db.execute(f'INSERT OR IGNORE INTO {table} VALUES ({extra_placeholder}?,?,?)',
+                   (*scope_args, bind_user, link, int(follow)))
     changed = 0
     groups_exist = db.execute("SELECT 1 FROM sqlite_master WHERE name='user_connection_groups'").fetchone()
     for user in db.execute('SELECT id,snell_uri FROM users').fetchall():
         uid, raw = user
         lines = (raw or '').splitlines()
         replacements = {}
-        bindings = db.execute('SELECT uri,follow_name FROM x_manager_snell_links WHERE user_id=?', (uid,)).fetchall()
+        bindings = db.execute(f'SELECT uri,follow_name FROM {table} WHERE {scope}user_id=?', (*scope_args, uid)).fetchall()
         for old, follow in bindings:
             if old not in lines:
                 # A manual edit or deletion detaches the entry; never re-enroll it.
-                db.execute('DELETE FROM x_manager_snell_links WHERE user_id=? AND uri=?', (uid, old))
+                db.execute(f'DELETE FROM {table} WHERE {scope}user_id=? AND uri=?', (*scope_args, uid, old))
                 continue
             new = uri(value, host, old, bool(follow))
             if new != old:
@@ -132,9 +187,9 @@ def synchronize(db, value, host, bind_user=None, adopt=False):
         db.execute('UPDATE users SET snell_uri=?, revision=revision+1, updated_at=? WHERE id=?',
                    ('\n'.join(updated), now, uid))
         for old, new in replacements.items():
-            db.execute('UPDATE x_manager_snell_links SET uri=? WHERE user_id=? AND uri=?', (new, uid, old))
+            db.execute(f'UPDATE {table} SET uri=? WHERE {scope}user_id=? AND uri=?', (new, *scope_args, uid, old))
         changed += 1
-    db.execute('DELETE FROM x_manager_snell_links WHERE user_id NOT IN (SELECT id FROM users)')
+    db.execute(f'DELETE FROM {table} WHERE {scope}user_id NOT IN (SELECT id FROM users)', scope_args)
     return changed
 
 

@@ -1,0 +1,89 @@
+{
+  "passed": true,
+  "failure": null,
+  "cases": [
+    {
+      "case": "set-does-not-enable-timer",
+      "passed": true
+    },
+    {
+      "case": "healthy-http-keeps-running-pid",
+      "passed": true
+    },
+    {
+      "case": "first-real-http-failure-only-counts",
+      "passed": true
+    },
+    {
+      "case": "second-failure-restarts-own-fixture",
+      "passed": true
+    },
+    {
+      "case": "cooldown-keeps-new-pid",
+      "passed": true
+    },
+    {
+      "case": "second-allowed-restart",
+      "passed": true
+    },
+    {
+      "case": "exhausted-budget-stops-restarts",
+      "passed": true
+    },
+    {
+      "case": "healthy-does-not-refill-budget",
+      "passed": true
+    },
+    {
+      "case": "remove-and-readd-retain-attempts",
+      "passed": true
+    },
+    {
+      "case": "explicit-reset-permits-recovery",
+      "passed": true
+    },
+    {
+      "case": "manual-systemctl-stop-is-preserved",
+      "passed": true
+    },
+    {
+      "case": "persistent-off-blocks-direct-systemd-start",
+      "passed": true
+    },
+    {
+      "case": "explicit-on-restores-own-fixture",
+      "passed": true
+    },
+    {
+      "case": "manual-lifecycle-stop-is-preserved",
+      "passed": true
+    },
+    {
+      "case": "external-owner-conflict-blocks-check",
+      "passed": true
+    },
+    {
+      "case": "installer-lock-skips-check",
+      "passed": true
+    },
+    {
+      "case": "real-main-process-check",
+      "passed": true
+    },
+    {
+      "case": "remote-target-refused-without-config-change",
+      "passed": true
+    },
+    {
+      "case": "report-is-read-only",
+      "passed": true
+    },
+    {
+      "case": "fixture-services-and-files-removed",
+      "passed": true
+    }
+  ],
+  "seconds": 1.79,
+  "systemd": "systemd 252 (252.39-1~deb12u2)",
+  "note": "Only two disposable fixture units changed; no package service or external network was used."
+}

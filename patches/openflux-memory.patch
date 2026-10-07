@@ -1,0 +1,116 @@
+diff --git a/transport/cupsonline/cupsonline.go b/transport/cupsonline/cupsonline.go
+index 40462fa..c8e8c9f 100644
+--- a/transport/cupsonline/cupsonline.go
++++ b/transport/cupsonline/cupsonline.go
+@@ -270,7 +270,6 @@ type channelStats struct {
+ 	batchesSent atomic.Uint64
+ 	batchesRecv atomic.Uint64
+ 	reconnects  atomic.Uint64
+-	flows       atomic.Uint64
+ }
+ 
+ // ---- WS ----
+@@ -614,11 +613,6 @@ type flowKey struct {
+ 	proto            uint8
+ }
+ 
+-type flowSender struct {
+-	seq   atomic.Uint64
+-	chIdx int
+-}
+-
+ // ---- Transport ----
+ 
+ type CupsonlineTransport struct {
+@@ -633,9 +627,6 @@ type CupsonlineTransport struct {
+ 	auths []*cupsAuth
+ 	wss   []*cupsWS
+ 
+-	flowMu sync.RWMutex
+-	flows  map[flowKey]*flowSender
+-
+ 	stopCh     chan struct{}
+ 	statsStart time.Time
+ }
+@@ -645,7 +636,6 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
+ 		BaseTransport: transport.NewBaseTransport(cfg),
+ 		config:        DefaultCupsonlineConfig(),
+ 		isClient:      isClient,
+-		flows:         make(map[flowKey]*flowSender),
+ 		stopCh:        make(chan struct{}),
+ 		statsStart:    time.Now(),
+ 	}
+@@ -765,28 +755,11 @@ func (t *CupsonlineTransport) Send(data []byte) error {
+ 		return fmt.Errorf("no ws")
+ 	}
+ 	key := extractFlowKey(data)
+-
+-	t.flowMu.RLock()
+-	fs, ok := t.flows[key]
+-	t.flowMu.RUnlock()
+-
+-	if !ok {
+-		t.flowMu.Lock()
+-		fs, ok = t.flows[key]
+-		if !ok {
+-			idx := int(flowHash(key) % uint64(len(t.wss)))
+-			fs = &flowSender{chIdx: idx}
+-			t.flows[key] = fs
+-			t.wss[idx].stats.flows.Add(1)
+-			utils.Debugf("[CUPS] new flow %s:%d -> %s:%d proto=%d -> ws[%d] %s",
+-				ipStr(key.srcIP), key.srcPort, ipStr(key.dstIP), key.dstPort, key.proto,
+-				idx, t.wss[idx].auth.roomUUID[:8])
+-		}
+-		t.flowMu.Unlock()
+-	}
+-
+-	fs.seq.Add(1)
+-	return t.wss[fs.chIdx].Send(data)
++	// Channel membership is fixed after Start. Recompute the same deterministic
++	// mapping instead of retaining every network flow for the process lifetime.
++	// The former sequence counter was never part of the wire protocol.
++	idx := int(flowHash(key) % uint64(len(t.wss)))
++	return t.wss[idx].Send(data)
+ }
+ 
+ func (t *CupsonlineTransport) handleIncoming(pkt []byte) {
+@@ -860,13 +833,12 @@ func (t *CupsonlineTransport) statsLoop() {
+ 				totalBytesSent += bs
+ 				totalBytesRecv += br
+ 
+-				utils.Debugf("[CH-%02d %s] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  flows=%d  reconn=%d  conn=%v",
++				utils.Debugf("[CH-%02d %s] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  reconn=%d  conn=%v",
+ 					i, ws.auth.roomUUID[:8],
+ 					dS/uint64(t.config.StatsInterval.Seconds()),
+ 					float64(dBS)/t.config.StatsInterval.Seconds()/1024,
+ 					dR/uint64(t.config.StatsInterval.Seconds()),
+ 					float64(dBR)/t.config.StatsInterval.Seconds()/1024,
+-					ws.stats.flows.Load(),
+ 					ws.stats.reconnects.Load(),
+ 					ws.connected.Load(),
+ 				)
+@@ -880,12 +852,11 @@ func (t *CupsonlineTransport) statsLoop() {
+ 			lastTotalBytesSent = totalBytesSent
+ 			lastTotalBytesRecv = totalBytesRecv
+ 
+-			utils.Debugf("[CUPS-TOTAL] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  flows=%d  uptime=%v",
++			utils.Debugf("[CUPS-TOTAL] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  uptime=%v",
+ 				dtS/uint64(t.config.StatsInterval.Seconds()),
+ 				float64(dtBS)/t.config.StatsInterval.Seconds()/1024,
+ 				dtR/uint64(t.config.StatsInterval.Seconds()),
+ 				float64(dtBR)/t.config.StatsInterval.Seconds()/1024,
+-				len(t.flows),
+ 				time.Since(t.statsStart).Round(time.Second),
+ 			)
+ 		}
+@@ -938,10 +909,6 @@ func flowHash(k flowKey) uint64 {
+ 	return h.Sum64()
+ }
+ 
+-func ipStr(ip uint32) string {
+-	return fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
+-}
+-
+ func firstMatch(re *regexp.Regexp, s string) string {
+ 	m := re.FindStringSubmatch(s)
+ 	if len(m) < 2 {

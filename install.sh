@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.02.4.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.07.1-rc1.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -183,7 +183,7 @@ asset() { python3 "$SCRIPT_DIR/scripts/release-assets.py" "$1" "$WORK_DIR/$2"; }
 [ "${INSTALL_WEBDAV_TUNNEL:-yes}" != yes ] || asset 'webdav-tunnel-{arch}' webdav-tunnel
 xm_begin
 if [ "$legacy_watchdog" = yes ]; then
-    XM_WATCHDOG_TRANSACTION=1 python3 "$SCRIPT_DIR/scripts/tuna-watchdog.py" retire-legacy --attempts 3 --delay 30
+    XM_WATCHDOG_TRANSACTION=1 python3 "$SCRIPT_DIR/scripts/tuna-watchdog.py" retire-legacy --attempts 5 --delay 30
 fi
 echo -e "${CYAN}==> Шаг 2: Анализ и настройка шлюзов ядра Xray (панель / standalone / заданные шлюзы)...${NC}"
 mkdir -p /etc/x-manager
@@ -300,7 +300,7 @@ EOF
     chmod +x /usr/local/bin/snell-routing.sh
 
     # Служба snell.service
-    cat << 'EOF' > /etc/systemd/system/snell.service
+    xm_write_unit /etc/systemd/system/snell.service << 'EOF'
 [Unit]
 Description=Snell Proxy Service
 After=network.target network-online.target x-ui.service
@@ -325,9 +325,9 @@ EOF
     iptables -C INPUT -p udp --dport "$SNELL_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport "$SNELL_PORT" -j ACCEPT
 
     systemctl daemon-reload
-    systemctl enable snell
+    xm_enable snell
     xm_service snell
-    echo -e "  ✓ Snell v5.0.1 запущен на порту ${SNELL_PORT} (TCP + UDP QUIC)"
+    echo -e "  ✓ Snell v5.0.1 настроен на порту ${SNELL_PORT}; состояние запуска проверено/сохранено"
 fi
 
 # Установка Mieru
@@ -431,7 +431,7 @@ EOF
     jq -e . /etc/mita/users_db.json >/dev/null
 
     which_mita=/usr/local/bin/mita
-    cat << EOF > /etc/systemd/system/mita.service
+    xm_write_unit /etc/systemd/system/mita.service << EOF
 [Unit]
 Description=Mieru proxy server
 After=network-online.target network.service networking.service NetworkManager.service systemd-networkd.service x-ui.service
@@ -475,9 +475,9 @@ EOF
 
     echo -e "  -> Запуск и проверка службы mita..."
     systemctl daemon-reload
-    systemctl enable mita
+    xm_enable mita
     xm_service mita
-    echo -e "  ✓ Mieru запущен на портах ${MIERU_PORTS}/${MIERU_PROTO} (Anti-TSPU Balanced)"
+    echo -e "  ✓ Mieru настроен на портах ${MIERU_PORTS}/${MIERU_PROTO}; состояние запуска проверено/сохранено"
 fi
 
 # Интеграция qwdtt с использованием подхваченного TPROXY порта
@@ -487,7 +487,7 @@ echo -e "  -> Настройка скрипта wdtt-tproxy.sh и правил �
 xm_install_asset scripts/wdtt-tproxy.sh /usr/local/bin/wdtt-tproxy.sh 0755
 chmod +x /usr/local/bin/wdtt-tproxy.sh
 
-cat << 'EOF' > /etc/systemd/system/wdtt-tproxy.service
+xm_write_unit /etc/systemd/system/wdtt-tproxy.service << 'EOF'
 [Unit]
 Description=WDTT TPROXY Routing to Xray
 PartOf=wdtt.service
@@ -506,9 +506,9 @@ EOF
 
 if [ "$DEFAULT_ROUTING" = "xray" ] && [ -f /etc/systemd/system/wdtt.service ]; then
     systemctl daemon-reload
-    systemctl enable wdtt-tproxy
+    xm_enable wdtt-tproxy
     xm_service wdtt-tproxy
-    echo -e "  ✓ WDTT TPROXY маршрутизация активирована (TPROXY :${XRAY_TPROXY_PORT})"
+    echo -e "  ✓ WDTT TPROXY настроен (:${XRAY_TPROXY_PORT}); состояние службы проверено/сохранено"
 else
     echo -e "  ✓ WDTT маршрутизация: Прямой выход"
 fi
@@ -655,6 +655,19 @@ install -m 0644 "$SCRIPT_DIR/components.json" /usr/local/share/x-manager/compone
 install -m 0644 "$SCRIPT_DIR/scripts/menu-actions.tsv" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/webdav-access.py" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/installer-state.py" /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/scripts/"{service-control.py,openflux-resources.py,network-diagnostics.py,network-profile.py,watchdog-health.py,openflux-watchdog.py,snell6-endpoints.py,snell-switch.py} /usr/local/share/x-manager/scripts/
+# Capture prior timer existence: upgrades preserve an existing disabled timer.
+health_bootstrap_args=()
+if [ "$(systemctl show tuna-healthcheck.timer -p LoadState --value)" = not-found ]; then
+    health_bootstrap_args+=(--new-timer)
+fi
+# Deliver the units; no Snell endpoint is implicitly created.
+# Existing administrator masks and lifecycle intent remain authoritative.
+xm_install_asset systemd/tuna-healthcheck.service /etc/systemd/system/tuna-healthcheck.service 0644
+xm_install_asset systemd/tuna-healthcheck.timer /etc/systemd/system/tuna-healthcheck.timer 0644
+xm_install_asset systemd/snell6@.service /etc/systemd/system/snell6@.service 0644
+systemctl daemon-reload
+python3 /usr/local/share/x-manager/scripts/service-control.py reconcile
 echo -e "  -> Создание системных алиасов (x-snell, x-mieru, x-wdtt, x-csqtt, x-dns, x-ssl, x-fw)..."
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-snell
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-mieru
@@ -680,12 +693,13 @@ if [ -f /etc/snell/snell-server.conf ]; then
     python3 /usr/local/share/x-manager/scripts/snell-subscriptions.py sync --server-ip "$SERVER_IP"
 fi
 if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = yes ]; then
-    systemctl enable webdav-tunnel
+    xm_enable webdav-tunnel
     xm_service webdav-tunnel
     python3 /usr/local/share/x-manager/scripts/webdav-encryption.py --if-active --server-ip "$SERVER_IP"
 fi
 # Preserve existing instance enablement; start only channels with configured URLs.
 if [ "$INSTALL_OPENFLUX" = yes ]; then
+    python3 /usr/local/share/x-manager/scripts/openflux-resources.py auto
     for channel in {1..8}; do
         if ( . "/etc/openflux/instances/$channel.env"; [ -n "${URL:-}" ] ); then
             xm_service "openflux@$channel"
@@ -696,7 +710,7 @@ fi
 # This directory is included in installer-state.py's managed backup scope.
 distribution=/usr/local/share/x-manager/distribution
 staged_distribution=$(mktemp -d /usr/local/share/x-manager/.distribution-XXXXXXXX)
-( set -o pipefail; tar -C "$SCRIPT_DIR" --exclude=__pycache__ -cf - install.sh components.json bin scripts systemd tuna-sub-server patches licenses | tar -C "$staged_distribution" -xf - )
+( set -o pipefail; tar -C "$SCRIPT_DIR" --exclude=__pycache__ -cf - install.sh components.json bin scripts systemd tuna-sub-server patches licenses tests | tar -C "$staged_distribution" -xf - )
 bash -n "$staged_distribution/install.sh"
 rm -rf -- "$distribution"
 mv "$staged_distribution" "$distribution"
@@ -707,6 +721,9 @@ for unit, previous in json.load(open(sys.argv[1]))['services'].items():
     if previous['enabled'] == 'disabled':
         subprocess.run(['systemctl', 'disable', unit], check=True)
 PY
+# Complete within the installer backup transaction. Existing custom policies win.
+python3 /usr/local/share/x-manager/scripts/tuna-watchdog.py defaults --attempts 5 --delay 30
+python3 /usr/local/share/x-manager/scripts/watchdog-health.py bootstrap --install-lock-fd 9 "${health_bootstrap_args[@]}" --human
 rm -f /etc/x-manager/volga-preview.lock
 XM_TRANSACTION=0
 rm -rf -- "$WORK_DIR"

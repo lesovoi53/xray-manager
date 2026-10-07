@@ -1,13 +1,14 @@
 {
   "repository": "lesovoi53/xray-manager",
-  "release": "v2026.10.02.4",
+  "release": "v2026.10.07.1",
   "versions": {
     "snell": "5.0.1",
     "mieru": "3.38.0",
-    "openflux": "d13aa5b7 + multistream/boards + Volga server patches",
+    "openflux": "d13aa5b7 + multistream/boards + Volga server patches + bounded flow memory + persistent Cups rooms + EIO4 heartbeat",
     "webdav": "b1af4c05",
     "cottendns": "v2026.09.01.221444-530ffbf",
-    "masterdns": "v2026.06.13.234407-7de2476"
+    "masterdns": "v2026.06.13.234407-7de2476",
+    "snell6": "1.14.1-extended-2.7.2"
   },
   "sha256": {
     "cottendns-amd64.tar.gz": "e40a51672bdfeeaf11a332a23873fb087e1c7b426e0950dfe6f5a78c6a504e25",
@@ -15,11 +16,13 @@
     "masterdns-amd64.tar.gz": "597bdc510b896a3b4ac89865ee7cefa73191025c64093f5e0f85c76a70430de9",
     "mita-amd64.deb": "5170555aace38f76862541587b632d61848bba12f2e845b057977c9f9257e59a",
     "webdav-tunnel-amd64": "aedfe85812c254ee51ebbb2cffbab3680d9cba2108c8a8323ab529ebd025137a",
-    "openflux-amd64": "6915d0da6fa7eda0041c51528239746e67f68ac6c3cd25def11562b9287fbb5b",
+    "openflux-amd64": "794de52f154a5499db70b0f2c45e840887db7015ef9bde87fad3641dca2cb95d",
     "mita-source.tar.gz": "73f0885f63e929a35d7ab8358d21913bc96020a7ffaf830cc0a69772dcd834cf",
     "openflux-source.tar.gz": "6ade7a1b7cd415edf829351eb8479f697813b546fd58fc499482167006112cbe",
     "webdav-tunnel-source.tar.gz": "f4b9c2abcf96a7fd6d0783d4bbfd8e8c8e98c74c909a6e169a2ba03441f78a9a",
-    "openflux-volga-check-amd64": "c67bff2bd55d6de9738a1111c2888b999eed3bedb639c4d5ba596d8674951b6f"
+    "openflux-volga-check-amd64": "62a74138e8c63b439139c9d73e547d983ee0aa7d14c4b7e70db7d5696fb8a1f9",
+    "snell6-amd64.tar.gz": "e4606cc7e3ee19885b5c16ad4ec8e28c8b3bacbc31949f93018cd5c77883b28b",
+    "snell6-source.tar.gz": "88bd9e63ab258f6ab07945f0b7619103ab46c2effc154cef15611adf22b67a95"
   },
   "platform": {
     "os": [

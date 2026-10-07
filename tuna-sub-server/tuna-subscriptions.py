@@ -18,7 +18,10 @@ import datetime
 import time
 import shutil
 import ipaddress
+import tuna_connection_groups
 from tuna_connection_groups import Store as ConnectionGroupStore
+from tuna_connection_groups import Invalid as InvalidConnectionGroups, validate as validate_connection_groups, snapshot as connection_groups_snapshot
+from tuna_connection_groups import GROUP_URI_PREFIX
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.parse
@@ -1673,6 +1676,126 @@ def import_server_webdav_config(env_path: str = "/etc/webdav-tunnel/config.env",
     }
     return True, "", conn
 
+SNELL_SELECTION_FILE = "/etc/x-manager/snell-active.json"
+SNELL_SERVICE_CONTROL_DIRS = (
+    "/etc/x-manager/service-control/off",
+    "/run/x-manager/service-control/stopped",
+)
+
+
+class SnellSelectionError(ValueError):
+    """Selection errors never disclose marker contents or connection credentials."""
+
+
+def snell_delivery_selection(db, user_id):
+    """Return hidden snapshots and delivery-only projections without changing storage."""
+    try:
+        with open(SNELL_SELECTION_FILE, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except FileNotFoundError:
+        return set(), {}, b""
+    except (OSError, ValueError, UnicodeError):
+        raise SnellSelectionError("Local Snell selection is unreadable or invalid") from None
+    if (not isinstance(state, dict) or not {"format", "version", "slot", "unit", "endpoint_id"}.issubset(state) or
+            type(state.get("format")) is not int or
+            state["format"] != 1 or type(state.get("version")) is not int or
+            state["version"] not in (5, 6)):
+        raise SnellSelectionError("Local Snell selection is invalid")
+    version = state["version"]
+    if version == 5:
+        valid = (state.get("slot") is None and state.get("endpoint_id") is None and
+                 state.get("unit") == "snell.service")
+    else:
+        slot, endpoint = state.get("slot"), state.get("endpoint_id")
+        valid = (isinstance(slot, str) and re.fullmatch(r"[1-8]", slot) and
+                 state.get("unit") == f"snell6@{slot}.service" and
+                 isinstance(endpoint, str) and re.fullmatch(r"[0-9a-f]{32}", endpoint))
+    if not valid:
+        raise SnellSelectionError("Local Snell selection is invalid")
+    disabled = False
+    for directory in SNELL_SERVICE_CONTROL_DIRS:
+        try:
+            os.stat(os.path.join(directory, state["unit"]))
+            disabled = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise SnellSelectionError("Local Snell service control is unreadable") from None
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    hidden = set()
+    replacements = {}
+    if "x_manager_snell_links" in tables:
+        for (uri,) in db.execute("SELECT uri FROM x_manager_snell_links WHERE user_id=?", (user_id,)):
+            if not isinstance(uri, str) or not uri.startswith("snell://"):
+                continue
+            if version == 6 or disabled:
+                hidden.add(uri)
+            else:
+                # Change only this query value: retain escaping, ordering and fragment exactly.
+                address_query, fragment_sep, fragment = uri.partition("#")
+                address, query_sep, query = address_query.partition("?")
+                projected_query = "&".join("version=4" if item == "version=5" else item
+                                           for item in query.split("&"))
+                projected = address + query_sep + projected_query + fragment_sep + fragment
+                if projected != uri:
+                    replacements[uri] = projected
+    if "x_manager_snell_endpoint_links" in tables:
+        for endpoint, uri in db.execute(
+                "SELECT endpoint_id,uri FROM x_manager_snell_endpoint_links WHERE user_id=?", (user_id,)):
+            if disabled or version == 5 or endpoint != state["endpoint_id"]:
+                hidden.add(uri)
+    hidden = {uri for uri in hidden if isinstance(uri, str) and uri.startswith("snell://")}
+    identity = json.dumps(dict(state, service_control_disabled=disabled), sort_keys=True,
+                          separators=(",", ":")).encode("utf-8")
+    return hidden, replacements, identity
+
+
+class SnellSelectedConnectionGroupStore(ConnectionGroupStore):
+    def publish(self, token):
+        db = self.connect()
+        try:
+            db.execute("BEGIN")
+            user = db.execute("SELECT * FROM users WHERE subscription_token_hash=? AND enabled=1",
+                              (hash_token(token),)).fetchone()
+            if not user:
+                return 404, {"error": "Subscription not found"}, b""
+            hidden, replacements, selection = snell_delivery_selection(db, user["id"])
+            document = validate_connection_groups(self.document(db, user["id"]), self.validators)
+            if hidden:
+                removed = {p["id"] for p in document["profiles"] if p["uri"] in hidden}
+                document["profiles"] = [p for p in document["profiles"] if p["id"] not in removed]
+                remaining = []
+                for group in document["groups"]:
+                    members = [pid for pid in group["memberIds"] if pid not in removed]
+                    # Never substitute a different source route or emit an invalid singleton.
+                    if len(members) >= 2 and group["routingProfileId"] not in removed:
+                        remaining.append(dict(group, memberIds=members))
+                document["groups"] = remaining
+            for profile in document["profiles"]:
+                profile["uri"] = replacements.get(profile["uri"], profile["uri"])
+            body = connection_groups_snapshot(user, document)
+            etag = '"' + hashlib.sha256(selection + b"\0" + body).hexdigest() + '"'
+            return 200, {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "ETag": etag}, body
+        except SnellSelectionError as error:
+            return 500, {"error": str(error)}, b""
+        except (InvalidConnectionGroups, ValueError, sqlite3.Error):
+            return 500, {"error": "Invalid structured subscription; no partial snapshot was published"}, b""
+        finally:
+            db.close()
+
+    def publish_uri(self, token):
+        status, headers, body = self.publish(token)
+        if status != 200:
+            return status, headers, body
+        line = GROUP_URI_PREFIX.encode("ascii") + base64.urlsafe_b64encode(body).rstrip(b"=") + b"\n"
+        payload = base64.b64encode(line)
+        if len(payload) > tuna_connection_groups.MAX_BODY:
+            return 500, {"error": "Group URI subscription exceeds 2 MiB; no partial snapshot was published"}, b""
+        headers = dict(headers, **{"Content-Type": "text/plain; charset=utf-8"})
+        headers["ETag"] = '"' + hashlib.sha256(headers.get("ETag", "").encode() + payload).hexdigest() + '"'
+        return 200, headers, payload
+
+
 class SubscriptionApp:
     def __init__(self, config):
         self.config = config
@@ -1685,7 +1808,7 @@ class SubscriptionApp:
         self.max_uri_len = config["limits"]["max_uri_length"]
         self.max_users = config["limits"]["max_users"]
         self.issuer_id = self.get_issuer_id()
-        self.connection_groups = ConnectionGroupStore(self.db_path, {
+        self.connection_groups = SnellSelectedConnectionGroupStore(self.db_path, {
             'WEBDAV': parse_webdav_uri, 'OPENFLUX': deserialize_openflux_v2_bundle,
         })
 
@@ -4074,6 +4197,11 @@ class SubscriptionApp:
         if not user or not user["enabled"]:
             return 404, {"error": "Subscription not found or disabled"}, b""
 
+        try:
+            hidden_snell, snell_replacements, snell_selection = snell_delivery_selection(self.conn, user["id"])
+        except (SnellSelectionError, sqlite3.Error):
+            return 500, {"error": "Local Snell selection is unavailable or invalid"}, b""
+
         candidate_fields = [
             user["csqtt_uri"],
             user["qwdtt_uri"],
@@ -4088,8 +4216,8 @@ class SubscriptionApp:
             if field_val and str(field_val).strip():
                 for line in str(field_val).splitlines():
                     clean = line.strip()
-                    if clean:
-                        non_empty.append(clean)
+                    if clean and clean not in hidden_snell:
+                        non_empty.append(snell_replacements.get(clean, clean))
 
         # OpenFlux v2 интеграция
         c.execute("SELECT * FROM user_openflux_config WHERE user_id = ?;", (user["id"],))
@@ -4196,7 +4324,7 @@ class SubscriptionApp:
             return 500, {"error": f"Subscription response exceeds maximum size of {MAX_SUBSCRIPTION_RESPONSE_BYTES} bytes"}, b""
 
         # Вычисление детерминированного ETag
-        content_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        content_hash = hashlib.sha256(raw_bytes + snell_selection).hexdigest()[:16]
         etag = f'"{user["revision"]}-{content_hash}"'
 
         headers = {
@@ -4276,6 +4404,12 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
             if status != 200:
                 self.send_json(status, {'error': headers.get('error', 'Subscription unavailable')})
                 return
+            if self.headers.get('If-None-Match', '').strip() == headers.get('ETag'):
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                return
             self.send_response(200)
             for name, value in headers.items():
                 self.send_header(name, value)
@@ -4317,7 +4451,10 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if status != 200:
-                self.send_error(HTTPStatus.NOT_FOUND, "Subscription not found")
+                if status >= 500:
+                    self.send_json(status, {'error': headers.get('error', 'Subscription unavailable')})
+                else:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Subscription not found")
                 return
 
             self.send_response(HTTPStatus.OK)

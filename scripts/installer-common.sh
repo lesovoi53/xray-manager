@@ -2,6 +2,22 @@
 # Sourced by install.sh; errors are fatal and do not expose command arguments.
 xm_die() { printf 'X-Manager: %s\n' "$*" >&2; exit 1; }
 
+xm_check_external_watchdog() {
+    local unit state status
+    for unit in vpn-watchdog.service vpn-watchdog.timer; do
+        state=$(systemctl is-active "$unit" 2>/dev/null) && status=0 || status=$?
+        case "$state" in
+            active|activating|reloading|deactivating)
+                xm_die "External watcher $unit is running. Explicitly stop the external watcher before maintenance; existing state was not changed.";;
+        esac
+        case "$status" in
+            0) xm_die "External watcher $unit is running. Explicitly stop the external watcher before maintenance; existing state was not changed.";;
+            3|4) ;; # Inactive or unknown unit; never stop/adopt it automatically.
+            *) xm_die "Cannot verify external watcher $unit; maintenance refused before changing existing state.";;
+        esac
+    done
+}
+
 xm_preflight() {
     [ "$EUID" -eq 0 ] || xm_die 'Run as root.'
     . /etc/os-release
@@ -12,11 +28,24 @@ xm_preflight() {
     case "$(uname -m)" in x86_64) ;; *) xm_die 'Unsupported architecture';; esac
     for cmd in apt-get systemctl flock tar; do command -v "$cmd" >/dev/null || xm_die "Missing prerequisite: $cmd"; done
     [ -d /run/systemd/system ] || xm_die 'A running systemd is required.'
+    # Runs before install.sh's --rollback branch, including historical helpers.
+    xm_check_external_watchdog
     exec 9>/run/lock/x-manager-install.lock
     flock -n 9 || xm_die 'Another installation or rollback is running.'
 }
 
 xm_service() {
+    local control="$SCRIPT_DIR/scripts/service-control.py"
+    [ -f "$control" ] || control=/usr/local/share/x-manager/scripts/service-control.py
+    if [ -f "$control" ]; then
+        local allowed=0
+        python3 "$control" can-start "$1" || allowed=$?
+        if [ "$allowed" = 1 ]; then
+            echo "Preserving inhibited service: $1"
+            return
+        fi
+        [ "$allowed" = 0 ] || xm_die "Cannot verify service policy: $1"
+    fi
     if [ -n "${XM_BACKUP:-}" ] && python3 - "$XM_BACKUP/state.json" "$1" <<'PY'
 import json, sys
 name = sys.argv[2] if sys.argv[2].endswith('.service') else sys.argv[2]+'.service'
@@ -34,6 +63,28 @@ PY
     systemctl is-active --quiet "$1" || xm_die "Service exited after startup: $1"
 }
 
+xm_enable() {
+    # Existing installations keep all enablement states, including masks/static.
+    if [ -n "${XM_BACKUP:-}" ] && python3 - "$XM_BACKUP/state.json" "$1" <<'PY'
+import json, sys
+name = sys.argv[2] if sys.argv[2].endswith(('.service','.timer')) else sys.argv[2]+'.service'
+previous = json.load(open(sys.argv[1]))['services'].get(name, {})
+sys.exit(0 if previous.get('enabled') not in ('not-found', '', None) else 1)
+PY
+    then
+        echo "Preserving autostart policy: $1"
+        return
+    fi
+    local control="$SCRIPT_DIR/scripts/service-control.py" allowed=0
+    [ -f "$control" ] || control=/usr/local/share/x-manager/scripts/service-control.py
+    if [ -f "$control" ]; then
+        python3 "$control" can-enable "$1" || allowed=$?
+        [ "$allowed" != 1 ] || { echo "Autostart inhibited: $1"; return; }
+        [ "$allowed" = 0 ] || xm_die "Cannot verify autostart policy: $1"
+    fi
+    systemctl enable "$1"
+}
+
 xm_validate_ports() {
     python3 - "$SNELL_PORT" "$MIERU_PORTS" <<'PY'
 import sys
@@ -48,8 +99,33 @@ PY
 xm_install_asset() {
     local relative=$1 target=$2 mode=$3
     test -s "$SCRIPT_DIR/$relative" || xm_die "Missing distribution file: $relative"
+    if [[ "$target" = /etc/systemd/system/* ]] && [ -L "$target" ] && [ "$(readlink "$target")" = /dev/null ]; then
+        echo "Preserving masked unit: $target"
+        return
+    fi
+    if [[ "$target" = /etc/systemd/system/* ]] && [ -L "/run/systemd/system/${target##*/}" ] && [ "$(readlink "/run/systemd/system/${target##*/}")" = /dev/null ]; then
+        echo "Preserving runtime-masked unit: $target"
+        return
+    fi
     case "$relative" in *.sh|bin/x-manager) bash -n "$SCRIPT_DIR/$relative";; esac
     install -m "$mode" "$SCRIPT_DIR/$relative" "$target.new"
+    mv -f "$target.new" "$target"
+}
+
+xm_write_unit() {
+    local target=$1
+    if [ -L "/run/systemd/system/${target##*/}" ] && [ "$(readlink "/run/systemd/system/${target##*/}")" = /dev/null ]; then
+        cat >/dev/null
+        echo "Preserving runtime-masked unit: $target"
+        return
+    fi
+    if [ -L "$target" ] && [ "$(readlink "$target")" = /dev/null ]; then
+        cat >/dev/null
+        echo "Preserving masked unit: $target"
+        return
+    fi
+    cat >"$target.new"
+    chmod 0644 "$target.new"
     mv -f "$target.new" "$target"
 }
 

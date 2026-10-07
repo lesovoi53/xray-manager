@@ -1,0 +1,204 @@
+{
+  "core_sha256": "187965235a83a462aa10291cfab561d0caed2fde90a608e6899b17aed9e01ea8",
+  "core_version": "sing-box version 1.14.1-extended-2.7.2\n\nEnvironment: go1.27.0-X:nodwarf5 linux/amd64\nTags: with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_openvpn,with_openconnect,with_acme,with_clash_api,with_tailscale,with_masque,with_mtproxy,with_ccm,with_ocm,with_cloudflared,with_usbip,with_trusttunnel,with_call,with_sudoku,with_manager,with_admin_panel,with_profiler,badlinkname,tfogo_checklinkname0,with_naive_outbound,with_purego\nRevision: 55faa763f986f4ca8a492d9b2719bc6330d2bef5\nCGO: disabled\n",
+  "core_path": "/opt/snell6-xray-20261005/sing-box",
+  "scope": "Snell v6 -> SOCKS5 Xray -> loopback fixtures",
+  "external_network": false,
+  "cases": [
+    {
+      "case": "reuse-false/https/127.0.0.1",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/snell.test",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/1",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/28",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/stun-binding",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/127.0.0.1",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/snell.test",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/1",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/28",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/stun-binding",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/127.0.0.1",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/https/snell.test",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/1",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/udp-dns/28",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/stun-binding",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-false/wrong-psk-rejected",
+      "passed": true
+    },
+    {
+      "case": "reuse-false/xray-access/tcp",
+      "passed": true
+    },
+    {
+      "case": "reuse-false/xray-access/udp",
+      "passed": true
+    },
+    {
+      "case": "reuse-false/xray-stopped-no-fallback/tcp",
+      "passed": true
+    },
+    {
+      "case": "reuse-false/xray-stopped-no-fallback/udp",
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/127.0.0.1",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/snell.test",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/1",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/28",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/stun-binding",
+      "round": 0,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/127.0.0.1",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/snell.test",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/1",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/28",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/stun-binding",
+      "round": 1,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/127.0.0.1",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/https/snell.test",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/1",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/udp-dns/28",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/stun-binding",
+      "round": 2,
+      "passed": true
+    },
+    {
+      "case": "reuse-true/wrong-psk-rejected",
+      "passed": true
+    },
+    {
+      "case": "reuse-true/xray-access/tcp",
+      "passed": true
+    },
+    {
+      "case": "reuse-true/xray-access/udp",
+      "passed": true
+    },
+    {
+      "case": "reuse-true/xray-stopped-no-fallback/tcp",
+      "passed": true
+    },
+    {
+      "case": "reuse-true/xray-stopped-no-fallback/udp",
+      "passed": true
+    }
+  ],
+  "xray_sha256": "c4ae6798c38e0e5343b192406746333cd0ba7ff3eb984f8c4b9939dcb68c3f8a",
+  "xray_version": "Xray 26.9.9 (Xray, Penetrates Everything.) 52a412d (go1.27.1 linux/amd64)\nA unified platform for anti-censorship.\n",
+  "synthetic_uri": "snell://synthetic-local-only-0123456789abcdef@192.0.2.1:20000/?version=6&mode=default&reuse=true&udp-relay=true#Snell6-local-example",
+  "seconds": 22.53,
+  "passed": true
+}

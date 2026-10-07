@@ -121,16 +121,18 @@ fi
 
 # 6. Установка systemd unit
 echo -e "${CYAN}[*] Настройка службы systemd...${NC}"
-cp -f "${SCRIPT_DIR}/tuna-subscriptions.service" /etc/systemd/system/tuna-subscriptions.service
-chmod 0644 /etc/systemd/system/tuna-subscriptions.service
-chown root:root /etc/systemd/system/tuna-subscriptions.service
-
-systemctl daemon-reload
-systemctl enable tuna-subscriptions.service
 if [[ "${XM_PARENT_TRANSACTION:-0}" == 1 ]]; then
     source "$SCRIPT_DIR/../scripts/installer-common.sh"
     XM_BACKUP=$XM_PARENT_BACKUP
 fi
+xm_install_asset tuna-subscriptions.service /etc/systemd/system/tuna-subscriptions.service 0644
+
+systemctl daemon-reload
+if [[ "${XM_PARENT_TRANSACTION:-0}" == 1 ]]; then
+    source "$SCRIPT_DIR/../scripts/installer-common.sh"
+    XM_BACKUP=$XM_PARENT_BACKUP
+fi
+xm_enable tuna-subscriptions.service
 xm_service tuna-subscriptions.service
 if [[ "${XM_PARENT_TRANSACTION:-0}" != 1 ]] && [[ -f /etc/webdav-tunnel/config.env ]]; then
     python3 /usr/local/share/x-manager/scripts/webdav-encryption.py --if-active

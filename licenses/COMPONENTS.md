@@ -1,4 +1,4 @@
-# Third-party components in v2026.10.02.4
+# Third-party components in v2026.10.07.1
 
 The installer does not replace the independent Xray, WDTT or CSQTT installation.
 Only amd64 release artifacts are mirrored. See `components.json` for exact hashes.
@@ -21,3 +21,18 @@ For OpenFlux use Go 1.26.4 and `scripts/build-openflux.sh`; it also builds the
 with `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' .`.
 Use each source archive's documented build procedure and Go toolchain version.
 The main installer uses prebuilt, checked assets and never fetches Go modules.
+
+
+Snell v6 uses the unmodified amd64 purego release of
+[shtorm-7/sing-box-extended v1.14.1-extended-2.7.2](https://github.com/shtorm-7/sing-box-extended/releases/tag/v1.14.1-extended-2.7.2),
+commit `55faa763f986f4ca8a492d9b2719bc6330d2bef5`. The upstream license is
+included as `snell6.txt` and remains in `snell6-amd64.tar.gz`. The source tree
+is mirrored as `snell6-source.tar.gz`; its go.mod/go.sum and upstream build
+workflows are retained. No client overlays or new Snell binary build are claimed.
+
+The pinned OpenFlux source asset is the build input, with the older
+Multi-stream/Boards/Volga patches already applied. Three additional patches
+(`openflux-memory.patch`, `openflux-cupsonline-rooms.patch`,
+`openflux-boards-heartbeat.patch`) are supplied in the full source distribution
+and applied by `scripts/build-openflux.sh`. Use that script for the current
+binary; a plain build of the source asset alone omits these fixes.

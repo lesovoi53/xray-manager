@@ -5,12 +5,15 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+# Compatibility fallback; ExecStartPre computes budgets, preserving manual choices.
+# The runner reads resources.conf. GOMEMLIMIT is a Go soft target, not an RSS cap.
 Environment="GOMEMLIMIT=150MiB"
 Environment="GODEBUG=madvdontneed=1"
 Type=simple
 User=openflux
 Group=openflux
 LimitNOFILE=65535
+ExecStartPre=+/usr/bin/python3 /usr/local/share/x-manager/scripts/openflux-resources.py auto
 ExecStartPre=+/usr/local/bin/openflux-routing.sh
 ExecStart=/usr/local/bin/openflux-runner.sh %i
 Restart=always

@@ -32,3 +32,10 @@
 Ссылки на существующие сертификаты acme.sh/Let's Encrypt означают поиск локальных файлов. Текущий раздел SSL не устанавливает acme.sh и не реализует собственный ACME-выпуск. AmneziaWG не является устанавливаемым компонентом этого выпуска; его присутствие на конкретном VPS не даёт оснований включать его в перечень возможностей X-Manager.
 
 Документ фиксирует изученные источники и приложенные уведомления, а не выдаёт универсальное заключение о правомерности любого последующего распространения компонентов. Подробное разделение функций оригиналов и интеграции: [сравнение](docs/UPSTREAM_COMPARISON.md).
+
+
+Snell v6: unmodified [sing-box-extended v1.14.1-extended-2.7.2](https://github.com/shtorm-7/sing-box-extended/releases/tag/v1.14.1-extended-2.7.2),
+source commit `55faa763f986f4ca8a492d9b2719bc6330d2bef5`, license in
+[licenses/snell6.txt](licenses/snell6.txt), source archive in the same X-Manager
+release. X-Manager provides server configuration/lifecycle and subscription
+integration. This is not a new implementation of the Snell protocol.

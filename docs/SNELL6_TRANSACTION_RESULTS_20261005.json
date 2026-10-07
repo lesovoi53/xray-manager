@@ -1,0 +1,32 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "case": "clean-install",
+      "passed": true
+    },
+    {
+      "case": "repeat-no-file-or-process-change",
+      "passed": true
+    },
+    {
+      "case": "update-preserves-config-identity-port-key",
+      "passed": true
+    },
+    {
+      "case": "partial-replacement-rollback-exact-files-active-service",
+      "passed": true
+    },
+    {
+      "case": "invalid-candidate-before-mutation",
+      "passed": true
+    },
+    {
+      "case": "stopped-service-remains-stopped-after-update",
+      "passed": true
+    }
+  ],
+  "seconds": 5.33,
+  "binary_sha256": "187965235a83a462aa10291cfab561d0caed2fde90a608e6899b17aed9e01ea8",
+  "scope": "same binary, different laboratory package markers; no subscription DB"
+}

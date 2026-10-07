@@ -6,7 +6,15 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 base=https://github.com/lesovoi53/xray-manager/releases
 fetch() { curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 --retry 2 "$1" -o "$2"; }
-if [ -n "${1:-}" ]; then
+local_archive=no
+if [ "${1:-}" = --archive ]; then
+    [ "$#" = 4 ] && [ "$3" = --sha256 ] && [[ "$4" =~ ^[a-f0-9]{64}$ ]] || { echo 'Usage: --archive PATH --sha256 SHA256' >&2; exit 1; }
+    test -f "$2" || { echo 'Candidate archive missing' >&2; exit 1; }
+    cp -- "$2" "$work/x-manager.tar.gz"
+    printf '%s  x-manager.tar.gz\n' "$4" > "$work/SHA256SUMS"
+    local_archive=yes
+elif [ -n "${1:-}" ]; then
+    [ "$#" = 1 ] || { echo 'Unexpected arguments' >&2; exit 1; }
     [[ "$1" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || { echo 'Invalid release tag' >&2; exit 1; }
     base="$base/download/$1"
 else
@@ -16,8 +24,10 @@ else
     [[ "$tag" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || { echo 'Invalid release tag' >&2; exit 1; }
     base="$base/download/$tag"
 fi
-fetch "$base/x-manager.tar.gz" "$work/x-manager.tar.gz"
-fetch "$base/SHA256SUMS" "$work/SHA256SUMS"
+if [ "$local_archive" = no ]; then
+    fetch "$base/x-manager.tar.gz" "$work/x-manager.tar.gz"
+    fetch "$base/SHA256SUMS" "$work/SHA256SUMS"
+fi
 python3 - "$work" <<'PY'
 import hashlib, pathlib, re, sys, tarfile
 root = pathlib.Path(sys.argv[1])
@@ -33,5 +43,6 @@ with tarfile.open(root/'x-manager.tar.gz') as archive:
             sys.exit('Unsafe release archive')
     archive.extractall(root/'source')
 PY
+test -s "$work/source/install.sh" || { echo 'Incomplete release archive' >&2; exit 1; }
 bash "$work/source/install.sh" --update
 echo 'Полный выпуск установлен и проверен.'

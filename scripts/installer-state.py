@@ -9,13 +9,16 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import tarfile
+import time
+import re
 
 CONFIGS = ["/etc/" + p for p in (
-    "x-manager", "snell", "mita", "mieru", "openflux", "webdav-tunnel", "tuna-subscriptions")]
+    "x-manager", "snell", "snell6", "mita", "mieru", "openflux", "webdav-tunnel", "tuna-subscriptions")]
 BINARIES = ["snell-server", "mita", "openflux", "openflux-volga-check", "webdav-tunnel", "x-manager", "tuna-subscriptions", "tuna-groups", "tuna_connection_groups.py",
             "snell-routing.sh", "wdtt-tproxy.sh", "openflux-routing.sh", "openflux-runner.sh",
             "webdav-tunnel-routing.sh", "webdav-tunnel-runner.sh"]
@@ -24,13 +27,31 @@ ALIASES = ["snell", "mieru", "wdtt", "qwdtt", "csqtt", "dns", "cottendns", "mast
 UNITS = ["snell", "mita", "wdtt-tproxy", "openflux@", "webdav-tunnel", "tuna-subscriptions", "volga-cookies"]
 SERVICES = [u + ".service" for u in UNITS if not u.endswith("@")] + ["openflux@%d.service" % n for n in range(1, 9)] + ["x-ui.service", "volga-cookies.timer"]
 SERVICES = ['tuna-watchdog.timer', 'tuna-watchdog.service'] + SERVICES
+SERVICES += ['tuna-healthcheck.timer', 'tuna-healthcheck.service'] + ['snell6@%d.service' % n for n in range(1, 9)]
 PATHS = CONFIGS + ["/usr/local/bin/" + b for b in BINARIES + ["x-" + a for a in ALIASES]]
 PATHS += ["/usr/bin/mita", "/usr/local/share/x-manager", "/var/lib/tuna-subscriptions",
           "/etc/x-ui/x-ui.db", "/etc/systemd/system/mita.service.d"] + ["/etc/systemd/system/" + u + ".service" for u in UNITS]
 PATHS += ["/etc/systemd/system/volga-cookies.timer"]
-WATCHDOG_UNITS = ['tuna-subscriptions','webdav-tunnel','snell','mita','wdtt','csqtt','masterdns','cottendns','x-ui'] + ['openflux@'+str(i) for i in range(1,9)]
+PATHS += ['/etc/systemd/system/snell6@.service', '/usr/local/lib/x-manager/snell6',
+          '/etc/systemd/system/tuna-healthcheck.service', '/etc/systemd/system/tuna-healthcheck.timer']
+# Health attempt counters are deliberately not rolled back: restoring an older
+# counter would silently replenish the persistent automatic-restart budget.
+WATCHDOG_UNITS = ['tuna-subscriptions','webdav-tunnel','snell','mita','wdtt','csqtt','masterdns','cottendns','x-ui','xray'] + ['openflux@'+str(i) for i in range(1,9)]
+WATCHDOG_UNITS += ['snell6@'+str(i) for i in range(1,9)]
 PATHS += ['/etc/systemd/system/'+unit+'.service.d' for unit in WATCHDOG_UNITS if unit != 'mita']
 PATHS += ['/etc/systemd/system/tuna-watchdog.service', '/etc/systemd/system/tuna-watchdog.timer', '/usr/local/bin/tuna-watchdog.sh']
+# Lifecycle guards include explicit opt-in external VPN services. Do not copy or
+# replace their configuration/binaries; preserve only our guard and unit state.
+LIFECYCLE_UNITS = ['wdtt','csqtt','masterdns','cottendns','sing-box','caddy','xray','vpn-watchdog','fail2ban']
+SERVICES += [u+'.service' for u in LIFECYCLE_UNITS if u+'.service' not in SERVICES]
+SERVICES += ['vpn-watchdog.timer']
+PATHS += ['/run/x-manager/service-control']
+PATHS += ['/var/lib/x-manager/openflux-resources', '/var/lib/x-manager/network-profile',
+          '/etc/sysctl.d/90-tuna-network.conf']
+for unit in SERVICES:
+    guard='/etc/systemd/system/'+unit+'.d/95-tuna-service-control.conf'
+    if not any(guard.startswith(p.rstrip('/')+'/') for p in PATHS):
+        PATHS.append(guard)
 
 
 def run(*args, **kwargs):
@@ -40,6 +61,44 @@ def run(*args, **kwargs):
 def query(*args):
     p = subprocess.run(args, capture_output=True, text=True)
     return p.stdout.strip()
+
+
+def check_external_watchdog():
+    """External pollers must not revive services while their files are restored."""
+    for unit in ('vpn-watchdog.service', 'vpn-watchdog.timer'):
+        result = subprocess.run(['systemctl', 'is-active', unit], capture_output=True, text=True)
+        if result.returncode == 0 or result.stdout.strip() in ('active', 'activating', 'reloading', 'deactivating'):
+            raise RuntimeError('External watcher '+unit+' is running. Explicitly stop the external watcher before maintenance; existing state was not changed.')
+        if result.returncode not in (3, 4):
+            raise RuntimeError('Cannot verify external watcher '+unit+'; maintenance refused before changing existing state.')
+
+
+def wait_snell_gateways(timeout=30):
+    """Type=simple panel startup does not mean its child Xray is listening yet."""
+    mode = Path('/etc/snell/routing.mode')
+    if not mode.exists() or mode.read_text().strip() != 'xray':
+        return
+    text = Path('/etc/x-manager/gateways.env').read_text()
+    ports = {}
+    for key in ('XRAY_REDIRECT_PORT', 'XRAY_TPROXY_PORT'):
+        match = re.search(r'^'+key+r'=["\']?([0-9]+)["\']?\s*$', text, re.M)
+        if not match or not 1 <= int(match[1]) <= 65535:
+            raise RuntimeError('Cannot validate restored gateway: '+key)
+        ports[key] = int(match[1])
+    expected = '0100007F:'+format(ports['XRAY_TPROXY_PORT'], '04X')
+    deadline = time.monotonic()+timeout
+    while True:
+        try:
+            udp = any(len(row.split()) > 1 and row.split()[1] == expected
+                      for row in Path('/proc/net/udp').read_text().splitlines()[1:])
+            if udp:
+                with socket.create_connection(('127.0.0.1', ports['XRAY_REDIRECT_PORT']), timeout=.5):
+                    return
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Restored Xray TCP/UDP gateways not ready; Snell left stopped')
+        time.sleep(.25)
 
 
 def snell_policy():
@@ -117,9 +176,16 @@ def snapshot(dest, config_module):
 
 
 def restore(dest):
+    # Keep this guard before snapshot reads, service stops and every file write.
+    check_external_watchdog()
     state = json.loads((dest / "state.json").read_text())
     failures = []
     for unit in SERVICES:
+        if unit in [u+'.service' for u in LIFECYCLE_UNITS] + ['vpn-watchdog.timer']:
+            previous = state['services'].get(unit)
+            if previous is None or previous.get('active'):
+                # No external service binary/config belongs to this transaction.
+                continue
         if query("systemctl", "show", "-p", "LoadState", "--value", unit) != "not-found":
             if subprocess.run(["systemctl", "stop", unit]).returncode:
                 raise RuntimeError("Cannot stop " + unit + "; refusing to restore files beneath a running service")
@@ -157,8 +223,15 @@ def restore(dest):
             for link in Path("/etc/systemd/system").glob("*.wants/" + unit):
                 if link.is_symlink():
                     link.unlink()
-        if previous["active"] and subprocess.run(["systemctl", "start", unit]).returncode:
-            failures.append(unit + ": start")
+        if previous["active"]:
+            if unit == 'snell.service':
+                try:
+                    wait_snell_gateways()
+                except (OSError, RuntimeError) as error:
+                    failures.append(unit+': '+str(error))
+                    continue
+            if subprocess.run(["systemctl", "start", unit]).returncode:
+                failures.append(unit + ": start")
     with open(dest / "iptables") as f:
         run("iptables-restore", stdin=f)
     if (dest / "ip6tables").is_file():

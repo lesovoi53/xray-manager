@@ -1,0 +1,11 @@
+[Unit]
+Description=Opt-in local X-Manager service health checks
+After=network.target
+ConditionPathExists=/etc/x-manager/healthcheck.json
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /usr/local/share/x-manager/scripts/watchdog-health.py check
+TimeoutStartSec=180
+UMask=0077

@@ -1,0 +1,65 @@
+diff --git a/transport/cupsonline/cupsonline.go b/transport/cupsonline/cupsonline.go
+index c8e8c9f..3c026b2 100644
+--- a/transport/cupsonline/cupsonline.go
++++ b/transport/cupsonline/cupsonline.go
+@@ -92,6 +92,7 @@ var (
+ 	reMetaSubURL    = regexp.MustCompile(`<meta[^>]+name="centrifuge-subscription-token-url"[^>]+content="([^"]+)"`)
+ 	reDataRoomUUID  = regexp.MustCompile(`data-room="\{&quot;uuid&quot;:\s*&quot;([0-9a-f-]{36})&quot;`)
+ 	reDataUserUUID  = regexp.MustCompile(`data-user="\{&quot;uuid&quot;:\s*&quot;([0-9a-f-]{36})&quot;`)
++	reRoomUUID      = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+ )
+ 
+ type cupsAuth struct {
+@@ -640,7 +641,9 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
+ 		statsStart:    time.Now(),
+ 	}
+ 
+-	if !isClient {
++	// Only an empty exit URL requests fresh rooms. Explicit room identities
++	// must survive a process restart without changing the transport's role.
++	if !isClient && rawURL == "" {
+ 		t.baseURL = baseRoomURL
+ 		return t
+ 	}
+@@ -664,14 +667,20 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
+ 		}
+ 	}
+ 	if len(ids) == 0 {
+-		t.clientErr = fmt.Errorf("client mode: --url must contain base64 room list")
++		t.clientErr = fmt.Errorf("--url must contain an explicit room or base64 room list")
+ 		return t
+ 	}
+ 	t.urls = make([]string, 0, len(ids))
++	seen := make(map[string]bool, len(ids))
+ 	for _, id := range ids {
++		if !reRoomUUID.MatchString(id) || seen[id] {
++			t.clientErr = fmt.Errorf("--url contains an invalid or duplicate room identity")
++			return t
++		}
++		seen[id] = true
+ 		t.urls = append(t.urls, baseRoomURL+"?room="+id)
+ 	}
+-	utils.Debugf("[CUPS] client mode: %d rooms from base64", len(t.urls))
++	utils.Debugf("[CUPS] explicit rooms: %d", len(t.urls))
+ 	return t
+ }
+ 
+@@ -687,12 +696,15 @@ func (t *CupsonlineTransport) Start() error {
+ 	var auths []*cupsAuth
+ 	var err error
+ 
+-	if t.isClient {
++	if len(t.urls) > 0 {
+ 		for i, u := range t.urls {
+ 			a, e := authorize(u)
+ 			if e != nil {
+-				utils.Debugf("[CUPS] join %d failed: %v", i, e)
+-				continue
++				// A partial room set changes flow affinity between the peers.
++				return fmt.Errorf("join configured room %d: %w", i+1, e)
++			}
++			if a.roomUUID != mustParseURL(u).Query().Get("room") {
++				return fmt.Errorf("configured room %d was replaced by the server", i+1)
+ 			}
+ 			auths = append(auths, a)
+ 		}
