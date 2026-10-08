@@ -1,0 +1,8 @@
+[Unit]
+Description=X-Manager scheduled daily reboot
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/share/x-manager/scripts/reboot-schedule.py run
+TimeoutStartSec=90

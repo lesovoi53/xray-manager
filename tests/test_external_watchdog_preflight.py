@@ -203,6 +203,7 @@ if mode == 'watchdog-pause' and os.environ.get('PAUSE_FAILURE') == 'yes': sys.ex
 if mode == 'restore' and os.environ.get('ROLLBACK_FAILURE') == 'yes': sys.exit(6)
 '''
             (root/'scripts/installer-state.py').write_text(helper)
+            (root/'scripts/network-profile.py').write_text('# Network helper fixture\n')
             script = '''set -eE
 source "$COMMON"
 SCRIPT_DIR="$FIXTURE"

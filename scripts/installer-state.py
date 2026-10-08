@@ -139,6 +139,11 @@ SERVICES += ['vpn-watchdog.timer']
 PATHS += ['/run/x-manager/service-control']
 PATHS += ['/var/lib/x-manager/openflux-resources', '/var/lib/x-manager/network-profile',
           '/etc/sysctl.d/90-tuna-network.conf']
+PATHS += ['/etc/modules-load.d/90-tuna-network.conf',
+          '/etc/systemd/system/x-manager-reboot.service', '/etc/systemd/system/x-manager-reboot.timer',
+          '/etc/systemd/system/x-manager-reboot.timer.d']
+PATHS += ['/var/lib/webdav-tunnel']
+SERVICES = ['x-manager-reboot.timer', 'x-manager-reboot.service'] + SERVICES
 for unit in SERVICES:
     guard='/etc/systemd/system/'+unit+'.d/95-tuna-service-control.conf'
     if not any(guard.startswith(p.rstrip('/')+'/') for p in PATHS):
@@ -224,9 +229,43 @@ def restore_snell_policy(previous, current):
         run('ip','-4','rule','add','priority','1988','fwmark',str(0x534e),'table','1988')
 
 
+def network_module():
+    helper = Path(__file__).with_name('network-profile.py')
+    spec = importlib.util.spec_from_file_location('installer_network_profile', helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def network_runtime():
+    helper = network_module()
+    result = {}
+    for key in helper.MANAGED_KEYS:
+        path = Path('/proc/sys/' + key.replace('.', '/'))
+        if path.exists():
+            value = ' '.join(path.read_text().split())
+            if not helper.valid_value(key, value):
+                raise ValueError('Invalid network sysctl value: '+key)
+            result[key] = value
+    return result
+
+
+def restore_network_runtime(values):
+    helper = network_module()
+    if not isinstance(values, dict) or any(not helper.valid_value(k, v) for k, v in values.items()):
+        raise ValueError('Invalid network runtime backup')
+    for key, value in values.items():
+        path = Path('/proc/sys/' + key.replace('.', '/'))
+        if ' '.join(path.read_text().split()) != value:
+            run('sysctl', '-w', key+'='+value, stdout=subprocess.DEVNULL)
+        if ' '.join(path.read_text().split()) != value:
+            raise RuntimeError('Network rollback verification failed: '+key)
+
+
 def snapshot(dest, config_module):
     state = {"present": [], "services": {}, "paths": list(PATHS), "databases": []}
     state['snell_policy']=snell_policy()
+    state['network_runtime']=network_runtime()
     sys.path.insert(0, str(Path(config_module).parent))
     spec = importlib.util.spec_from_file_location('tuna_backup_config', config_module)
     module = importlib.util.module_from_spec(spec)
@@ -347,6 +386,21 @@ def restore(dest):
     # Keep this guard before snapshot reads, service stops and every file write.
     check_external_watchdog()
     state = validate_backup(dest)
+    network_values = state.get('network_runtime')
+    if network_values is not None:
+        helper = network_module()
+        if not isinstance(network_values, dict) or any(not helper.valid_value(k, v) for k, v in network_values.items()):
+            raise ValueError('Invalid network runtime backup')
+        # Modules absent before installation acquire defaults on prepare; the
+        # profile captures those before its first sysctl write.
+        if '/var/lib/x-manager/network-profile' not in state['present']:
+            current = Path('/var/lib/x-manager/network-profile/snapshot.json')
+            if current.is_file() and not current.is_symlink():
+                previous = json.loads(current.read_text()).get('before', {})
+                for key, value in previous.items():
+                    if not helper.valid_value(key, value):
+                        raise ValueError('Invalid current network snapshot')
+                    network_values.setdefault(key, value)
     watcher_policy = save_watcher_policy()
     failures = []
     for unit in SERVICES:
@@ -380,6 +434,8 @@ def restore(dest):
         else:
             archive.extractall("/")
     restore_watcher_policy(watcher_policy)
+    if network_values is not None:
+        restore_network_runtime(network_values)
     for database in state['databases']:
         filename, target = database['backup'], database['path']
         # Preserve restored ownership/mode while replacing only DB contents.

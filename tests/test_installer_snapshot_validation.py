@@ -105,6 +105,25 @@ class SnapshotValidation(unittest.TestCase):
         (self.backup/'state.json').write_text(json.dumps(self.description))
         self.assertEqual(state.validate_backup(self.backup), self.description)
 
+    def test_network_backup_rejects_unmanaged_keys_before_any_mutation(self):
+        self.description['network_runtime'] = {'kernel.panic': '1'}
+        (self.backup/'state.json').write_text(json.dumps(self.description))
+        before = self.database.read_bytes()
+        with patch.object(state, 'check_external_watchdog'), patch.object(state, 'run') as commands:
+            with self.assertRaisesRegex(ValueError, 'Invalid network runtime backup'):
+                state.restore(self.backup)
+            commands.assert_not_called()
+        self.assertEqual(self.database.read_bytes(), before)
+
+    def test_network_restore_verifies_tcp_triples_and_fails_on_ineffective_write(self):
+        values = {'net.ipv4.tcp_rmem': '4096 87380 4194304'}
+        with patch.object(Path, 'read_text', side_effect=['4096\t87380\t8388608', values['net.ipv4.tcp_rmem']]), patch.object(state, 'run') as command:
+            state.restore_network_runtime(values)
+            command.assert_called_once_with('sysctl', '-w', 'net.ipv4.tcp_rmem=4096 87380 4194304', stdout=subprocess.DEVNULL)
+        with patch.object(Path, 'read_text', return_value='4096 87380 8388608'), patch.object(state, 'run'):
+            with self.assertRaisesRegex(RuntimeError, 'verification failed'):
+                state.restore_network_runtime(values)
+
 
 if __name__ == '__main__':
     unittest.main()

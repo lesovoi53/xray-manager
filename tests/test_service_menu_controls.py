@@ -148,6 +148,10 @@ class ServiceMenuControls(unittest.TestCase):
             "wdtt", "csqtt", "cottendns", "masterdns", "mita", "snell", "x-ui",
             "xray", "sing-box", "caddy", "vpn-watchdog", "tuna-watchdog", "fail2ban"))
         expected.update(("vpn-watchdog.timer", "tuna-watchdog.timer", "tuna-healthcheck.timer", "volga-cookies.timer"))
+        # Reboot is governed by reboot-schedule.py, never generic service actions.
+        scheduled_reboot = {'x-manager-reboot.service', 'x-manager-reboot.timer'}
+        self.assertFalse(scheduled_reboot & set(control.UNITS))
+        expected -= scheduled_reboot
         self.assertFalse(expected - set(control.UNITS), "Missing managed units: " + repr(sorted(expected - set(control.UNITS))))
         self.assertEqual(len(control.UNITS), len(set(control.UNITS)))
         self.assertIn("fail2ban.service", installer.SERVICES)

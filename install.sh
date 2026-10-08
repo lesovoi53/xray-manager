@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.08.3.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.08.4.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -84,6 +84,7 @@ echo 'Checking system dependencies...'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl wget jq unzip iptables qrencode openssl python3 iproute2 ca-certificates
+apt-get install -y -qq kmod
 for dependency in curl wget jq unzip iptables iptables-save iptables-restore openssl python3 ip runuser; do
     command -v "$dependency" >/dev/null || xm_die "Missing dependency: $dependency"
 done
@@ -93,6 +94,21 @@ external_ports=$(python3 "$SCRIPT_DIR/scripts/external-listener-ports.py")
 eval "$external_ports"
 port_plan=$(python3 "$SCRIPT_DIR/scripts/plan-ports.py")
 eval "$port_plan"
+# Existing service/configuration state is an upgrade even without a manifest.
+# A new X-Manager installation may coexist with a panel; never reset that panel.
+XM_CLEAN_INSTALL=1
+for existing in /usr/local/share/x-manager/components.json /etc/x-manager /etc/snell /etc/snell6 /etc/mita /etc/mieru /etc/openflux /etc/webdav-tunnel /etc/tuna-subscriptions /var/lib/tuna-subscriptions; do
+    if [ -e "$existing" ] || [ -L "$existing" ]; then XM_CLEAN_INSTALL=0; break; fi
+done
+if [ "$XM_CLEAN_INSTALL" = 1 ]; then
+    echo 'Чистая установка: предварительная проверка адаптивного сетевого профиля.'
+    if network_plan=$(python3 "$SCRIPT_DIR/scripts/network-profile.py" plan --adaptive --json); then
+        :
+    elif ! printf '%s' "$network_plan" | jq -e '.preflight_ready == true and .needs_prepare' >/dev/null; then
+        printf '%s\n' "$network_plan" >&2
+        xm_die 'Сетевой профиль недоступен; установка ещё не изменяла службы.'
+    fi
+fi
 WORK_DIR=$(mktemp -d)
 
 # Архитектура и сетевой интерфейс
@@ -198,6 +214,13 @@ asset() { python3 "$SCRIPT_DIR/scripts/release-assets.py" "$1" "$WORK_DIR/$2"; }
 [ "$INSTALL_OPENFLUX" != yes ] || asset 'openflux-volga-check-{arch}' openflux-volga-check
 [ "${INSTALL_WEBDAV_TUNNEL:-yes}" != yes ] || asset 'webdav-tunnel-{arch}' webdav-tunnel
 xm_begin
+if [ "$XM_CLEAN_INSTALL" = 1 ]; then
+    XM_NETWORK_TRANSACTION=1
+    python3 "$SCRIPT_DIR/scripts/network-profile.py" prepare --adaptive --human
+    python3 "$SCRIPT_DIR/scripts/network-profile.py" apply --adaptive --human
+else
+    echo 'Повторная установка: сетевой профиль и ручные настройки сохраняются.'
+fi
 if [ "$legacy_watchdog" = yes ]; then
     XM_WATCHDOG_TRANSACTION=1 python3 "$SCRIPT_DIR/scripts/tuna-watchdog.py" retire-legacy --attempts 5 --delay 30
 fi
@@ -579,6 +602,12 @@ if [ "${INSTALL_WEBDAV_TUNNEL:-yes}" = "yes" ]; then
 
     id -u "$WDAVTUNNEL_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$WDAVTUNNEL_USER"
     mkdir -p "$WDAVTUNNEL_DIR" "$WDAVTUNNEL_STORAGE" "/var/log/webdav-tunnel"
+    # mkdir inherits the caller's umask. The service must traverse the parent,
+    # including when the installer is launched from a private root session.
+    chown root:"$WDAVTUNNEL_USER" /var/lib/webdav-tunnel
+    chmod 0750 /var/lib/webdav-tunnel
+    chmod 0700 "$WDAVTUNNEL_STORAGE"
+    chmod 0750 /var/log/webdav-tunnel
 
     install -m 0755 "$WORK_DIR/webdav-tunnel" /usr/local/bin/webdav-tunnel.new
     mv -f /usr/local/bin/webdav-tunnel.new /usr/local/bin/webdav-tunnel
@@ -670,6 +699,7 @@ install -m 0644 "$SCRIPT_DIR/scripts/menu-actions.tsv" /usr/local/share/x-manage
 install -m 0644 "$SCRIPT_DIR/scripts/webdav-access.py" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/installer-state.py" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/"{service-control.py,openflux-resources.py,network-diagnostics.py,network-profile.py,watchdog-health.py,openflux-watchdog.py,snell6-endpoints.py,snell-switch.py} /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/scripts/reboot-schedule.py" /usr/local/share/x-manager/scripts/
 # Capture prior timer existence: upgrades preserve an existing disabled timer.
 health_bootstrap_args=()
 if [ "$(systemctl show tuna-healthcheck.timer -p LoadState --value)" = not-found ]; then
@@ -679,10 +709,15 @@ fi
 # Existing administrator masks and lifecycle intent remain authoritative.
 xm_install_asset systemd/tuna-healthcheck.service /etc/systemd/system/tuna-healthcheck.service 0644
 xm_install_asset systemd/tuna-healthcheck.timer /etc/systemd/system/tuna-healthcheck.timer 0644
+xm_install_asset systemd/x-manager-reboot.service /etc/systemd/system/x-manager-reboot.service 0644
 xm_install_asset systemd/snell6@.service /etc/systemd/system/snell6@.service 0644
 systemctl daemon-reload
 # Reconcile also migrates old inhibit-directory traversal permissions for TUNA.
 python3 /usr/local/share/x-manager/scripts/service-control.py reconcile
+python3 /usr/local/share/x-manager/scripts/reboot-schedule.py bootstrap --human
+if [ "$XM_CLEAN_INSTALL" = 1 ] && [ -n "${XM_REBOOT_TIME:-}" ]; then
+    python3 /usr/local/share/x-manager/scripts/reboot-schedule.py configure --time "$XM_REBOOT_TIME" --timezone "${XM_REBOOT_TIMEZONE:-Europe/Moscow}"
+fi
 echo -e "  -> Создание системных алиасов (x-snell, x-mieru, x-wdtt, x-csqtt, x-dns, x-ssl, x-fw)..."
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-snell
 ln -sf /usr/local/bin/x-manager /usr/local/bin/x-mieru

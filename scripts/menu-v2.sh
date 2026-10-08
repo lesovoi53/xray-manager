@@ -240,10 +240,12 @@ xm_network_has_snapshot() {
     [ -f /var/lib/x-manager/network-profile/snapshot.json ] && [ ! -L /var/lib/x-manager/network-profile/snapshot.json ]
 }
 xm_network_profile_menu() {
-    local choice helper ready=0
+    local choice helper
     helper="$(dirname "${BASH_SOURCE[0]}")/network-profile.py"
-    xm_header 'Профиль сети BBR/fq'
-    python3 "$helper" plan --human || ready=$?
+    xm_header 'Адаптивный профиль сети'
+    if ! python3 "$helper" plan --adaptive --human; then
+        echo 'Перед применением будут проверены зависимости и конфликты.'
+    fi
     printf '\n  [1] Сохранить профиль под управлением X-Manager\n'
     if xm_network_has_snapshot; then
         printf '  [2] Восстановить предыдущие настройки\n'
@@ -253,11 +255,11 @@ xm_network_profile_menu() {
     printf '  [3] Подробности проверки\n  [0] Назад\n'
     read -r -p 'Действие: ' choice || return
     case "$choice" in
-        1) [ "$ready" = 0 ] || { echo 'План не готов; доступен откат и диагностика.' >&2; return 1; }
-           xm_confirm 'Сохранить и применить BBR/fq для новых соединений и очередей?' && python3 "$helper" apply --human;;
+        1) xm_confirm 'Подготовить модули и применить показанные настройки с резервной копией?' &&
+           python3 "$helper" prepare --adaptive --human && python3 "$helper" apply --adaptive --human;;
         2) xm_network_has_snapshot || { echo 'Откат недоступен: сохранённой копии нет.'; return 1; }
            xm_confirm 'Восстановить сохранённые значения профиля?' && python3 "$helper" rollback --human;;
-        3) python3 "$helper" plan --human --details;;
+        3) python3 "$helper" plan --adaptive --human --details;;
         0) return;;
         *) echo 'Выберите номер из списка.';;
     esac
@@ -422,17 +424,43 @@ xm_backup_menu() {
     ) 9>/run/lock/x-manager-install.lock || { echo 'Восстановление не завершено' >&2; xm_pause; return 1; }
     exec /usr/local/bin/x-manager
 }
+xm_reboot_menu() {
+    local choice reboot_time helper
+    helper="$(dirname "${BASH_SOURCE[0]}")/reboot-schedule.py"
+    while true; do
+        xm_header 'Ежедневная перезагрузка VPS'
+        python3 "$helper" status --human || return 1
+        echo 'Перезагрузка прерывает все соединения. Во время установки запуск пропускается.'
+        printf '  [1] Включить в 04:00 по Москве\n  [2] Выбрать время по Москве\n  [3] Выключить\n  [0] Назад\n'
+        read -r -p 'Действие: ' choice || return
+        case "$choice" in
+            1|2)
+                reboot_time=04:00
+                if [ "$choice" = 2 ]; then
+                    read -r -p 'Время ЧЧ:ММ (Enter — назад): ' reboot_time || return
+                    [ -n "$reboot_time" ] || continue
+                fi
+                xm_confirm "Перезагружать VPS ежедневно в $reboot_time по Москве, с задержкой до 10 минут?" || continue
+                python3 "$helper" configure --time "$reboot_time" --timezone Europe/Moscow --human;;
+            3) python3 "$helper" disable --human;;
+            0) return;;
+            *) echo 'Выберите номер из списка.';;
+        esac
+        xm_pause
+    done
+}
 xm_maintenance_menu() {
     local choice
     while true; do
         xm_header 'Обслуживание'
-        printf '  [1] Обновить полный выпуск\n  [2] Восстановить резервную копию\n  [3] Пересканировать и подхватить службы\n  [4] Перезапустить службы пакета\n  [5] Watchdog — восстановление служб\n  [0] Назад\n'
+        printf '  [1] Обновить полный выпуск\n  [2] Восстановить резервную копию\n  [3] Пересканировать и подхватить службы\n  [4] Перезапустить службы пакета\n  [5] Watchdog — восстановление служб\n  [6] Ежедневная перезагрузка VPS\n  [0] Назад\n'
         read -r -p 'Действие: ' choice || return
         case "$choice" in
             1) xm_release_update;; 2) xm_backup_menu;;
             3) xm_confirm 'Подхватить обнаруженные службы? Это может обновить служебные настройки.' && rescan_and_adopt_protocols;;
             4) xm_confirm 'Перезапуск прервёт текущие подключения.' && restart_all_services;;
             5) xm_watchdog_menu;;
+            6) xm_reboot_menu;;
             0) return;; *) echo 'Неверный выбор';;
         esac
     done

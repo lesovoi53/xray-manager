@@ -36,6 +36,12 @@ class ProfileTests(unittest.TestCase):
 
     def run_command(self, *args):
         self.calls.append(args)
+        if args[0] == "modprobe":
+            if args[1] == "tcp_bbr":
+                self.write("/proc/sys/net/ipv4/tcp_available_congestion_control", "reno cubic bbr")
+            elif args[1] == "nf_conntrack":
+                self.write("/proc/sys/net/netfilter/nf_conntrack_max", "32768")
+            return ""
         self.assertEqual(args[:2], ("sysctl", "-w"))
         key, value = args[2].split("=", 1)
         if value == self.fail_once:
@@ -155,6 +161,117 @@ class ProfileTests(unittest.TestCase):
                                  "managed_content": profile.CONTENT})
         self.assertEqual(self.tool.rollback()["status"], "restored")
         self.assertFalse(self.tool.path(profile.STATE).exists())
+
+    def adaptive_fixture(self, ram_kib=2 * 1024**2):
+        self.write('/proc/meminfo', 'MemTotal: %d kB\nSwapTotal: 999999999 kB\n' % ram_kib)
+        self.write('/proc/self/cgroup', '0::/test\n')
+        for key, value in profile.ADAPTIVE.items():
+            if key in profile.VALUES:
+                continue
+            initial = '4096\t87380\t1048576' if key == 'net.ipv4.tcp_rmem' else (
+                '4096 16384 1048576' if key == 'net.ipv4.tcp_wmem' else '1024')
+            self.write('/proc/sys/' + key.replace('.', '/'), initial)
+
+    def test_adaptive_tiers_cgroup_ancestors_and_unlimited_without_swap(self):
+        for mib, tier, buf, ct, backlog in ((512, '<1 GiB', 4, 65536, 4096),
+                    (1024, '1–<2 GiB', 8, 131072, 8192), (2048, '2–<4 GiB', 16, 262144, 16384),
+                    (4096, '>=4 GiB', 16, 524288, 16384)):
+            self.adaptive_fixture(mib * 1024)
+            m = self.tool.memory()
+            self.assertEqual((m['tier'], m['buffer_bytes'], m['conntrack_max'], m['backlog']),
+                             (tier, buf * 1024**2, ct, backlog))
+        self.write('/sys/fs/cgroup/memory.max', str(1536 * 1024**2))
+        self.write('/sys/fs/cgroup/test/memory.max', 'max')
+        self.assertEqual(self.tool.memory()['effective_bytes'], 1536 * 1024**2)
+        self.write('/proc/self/cgroup', '3:memory:/test\n')
+        self.tool.path('/sys/fs/cgroup/memory.max').unlink()
+        self.write('/sys/fs/cgroup/memory/test/memory.limit_in_bytes', str(512 * 1024**2))
+        self.assertEqual(self.tool.memory()['effective_bytes'], 512 * 1024**2)
+
+    def test_adaptive_plan_read_only_prepare_and_repeat_preserve_original_snapshot(self):
+        self.adaptive_fixture()
+        self.write('/proc/sys/net/ipv4/tcp_available_congestion_control', 'cubic')
+        self.tool.path('/proc/sys/net/netfilter/nf_conntrack_max').unlink()
+        plan = self.tool.plan(adaptive=True)
+        self.assertFalse(plan['ready'])
+        self.assertTrue(plan['preflight_ready'])
+        self.assertIn('tcp_bbr', plan['needs_prepare'])
+        self.assertEqual(self.calls, [])
+        self.tool.prepare(adaptive=True)
+        self.assertEqual(self.tool.read(profile.MODULES), profile.MODULE_CONTENT)
+        before = self.tool.effective(profile.MANAGED_KEYS)
+        self.assertEqual(self.tool.apply(adaptive=True)['status'], 'applied')
+        original = self.tool.read(profile.STATE)
+        self.calls.clear()
+        self.assertEqual(self.tool.apply(adaptive=True)['status'], 'unchanged')
+        self.assertEqual(self.tool.read(profile.STATE), original)
+        self.assertEqual(self.calls, [])
+        self.tool.rollback()
+        self.assertEqual(self.tool.effective(profile.MANAGED_KEYS), before)
+        self.assertFalse(self.tool.path(profile.MODULES).exists())
+
+    def test_adaptive_retains_larger_buffers_and_triple_defaults_and_reports_all(self):
+        self.adaptive_fixture(512 * 1024)
+        self.write('/proc/sys/net/core/rmem_max', '33554432')
+        self.write('/proc/sys/net/netfilter/nf_conntrack_max', '1048576')
+        self.write('/proc/sys/net/ipv4/tcp_rmem', '4096 87380 33554432')
+        plan = self.tool.plan(adaptive=True)
+        self.assertEqual(plan['desired']['net.core.rmem_max'], '33554432')
+        self.assertEqual(plan['desired'][profile.CT + 'max'], '1048576')
+        self.assertEqual(plan['desired']['net.ipv4.tcp_rmem'], '4096 87380 33554432')
+        text = profile.human_report(plan)
+        self.assertIn('512 MiB', text)
+        self.assertTrue(all(key in text for key in plan['desired']))
+        self.assertGreaterEqual(len(plan['warnings']), 3)
+
+    def test_adaptive_failed_write_restores_runtime_files_and_original_modules_file(self):
+        self.adaptive_fixture()
+        self.write(profile.MODULES, profile.HEADER + '# previous\n')
+        before = self.tool.effective(profile.MANAGED_KEYS)
+        self.tool.prepare(adaptive=True)
+        self.fail_once = '7200'
+        with self.assertRaisesRegex(RuntimeError, 'original runtime and file restored'):
+            self.tool.apply(adaptive=True)
+        self.assertEqual(self.tool.effective(profile.MANAGED_KEYS), before)
+        self.assertEqual(self.tool.read(profile.MODULES), profile.HEADER + '# previous\n')
+        self.assertFalse(self.tool.path(profile.CONFIG).exists())
+        self.assertFalse(self.tool.path(profile.STATE).exists())
+
+    def test_adaptive_unsupported_optional_keys_and_admin_conflicts(self):
+        self.adaptive_fixture()
+        self.tool.path('/proc/sys/' + next(iter(profile.TIMEOUTS)).replace('.', '/')).unlink()
+        plan = self.tool.plan(adaptive=True)
+        self.assertTrue(plan['preflight_ready'])
+        self.assertEqual(len(plan['warnings']), 1)
+        self.tool.path('/proc/sys/net/ipv4/tcp_keepalive_time').unlink()
+        self.assertFalse(self.tool.plan(adaptive=True)['preflight_ready'])
+        self.write('/proc/sys/net/ipv4/tcp_keepalive_time', '1024')
+        self.write('/etc/sysctl.d/99-admin.conf', 'net.ipv4.tcp_rmem = 4096 87380 99999999\n')
+        self.assertFalse(self.tool.plan(adaptive=True)['preflight_ready'])
+        self.assertEqual(self.calls, [])
+
+    def test_adaptive_prepared_rollback_and_admin_runtime_change(self):
+        self.adaptive_fixture()
+        self.tool.prepare(adaptive=True)
+        self.tool.rollback()
+        self.assertFalse(self.tool.path(profile.MODULES).exists())
+        self.tool.prepare(adaptive=True)
+        self.tool.apply(adaptive=True)
+        self.write('/proc/sys/net/core/rmem_max', '99999999')
+        with self.assertRaisesRegex(ValueError, 'Runtime changed'):
+            self.tool.apply(adaptive=True)
+        with self.assertRaisesRegex(ValueError, 'Runtime changed'):
+            self.tool.rollback()
+
+    def test_adaptive_rejects_invalid_tcp_triples_and_legacy_snapshot(self):
+        self.adaptive_fixture()
+        self.tool.apply()
+        self.assertFalse(self.tool.plan(adaptive=True)['preflight_ready'])
+        self.tool.rollback()
+        for value in ('1 2', '0 2 3', '5 4 3', '1 2 bad'):
+            self.write('/proc/sys/net/ipv4/tcp_rmem', value)
+            with self.assertRaisesRegex(ValueError, 'Unexpected effective'):
+                self.tool.plan(adaptive=True)
 
 
 if __name__ == "__main__":

@@ -119,6 +119,7 @@ xm_begin() {
     XM_BACKUP=$(mktemp -d /var/backups/x-manager-XXXXXXXX)
     chmod 0700 "$XM_BACKUP"
     cp "$SCRIPT_DIR/scripts/installer-state.py" "$XM_BACKUP/installer-state.py"
+    cp "$SCRIPT_DIR/scripts/network-profile.py" "$XM_BACKUP/network-profile.py"
     python3 "$XM_BACKUP/installer-state.py" backup "$XM_BACKUP" "$SCRIPT_DIR/tuna-sub-server/tuna-subscriptions.py"
     printf 'Backup: %s\n' "$XM_BACKUP"
     # The EXIT trap also resumes a partially paused watchdog on stop failure.
@@ -134,6 +135,13 @@ xm_exit() {
     trap - EXIT
     if [ "$status" -ne 0 ] && [ "${XM_TRANSACTION:-0}" = 1 ]; then
         printf 'Installation failed. Restoring backup: %s\n' "$XM_BACKUP" >&2
+        if [ "${XM_NETWORK_TRANSACTION:-0}" = 1 ] && [ -f /var/lib/x-manager/network-profile/snapshot.json ]; then
+            if ! python3 "$SCRIPT_DIR/scripts/network-profile.py" rollback --human; then
+                printf 'Не удалось полностью откатить сетевой профиль; проверьте сохранённую копию.\n' >&2
+                cp /var/lib/x-manager/network-profile/snapshot.json "$XM_BACKUP/network-failure.json"
+                rollback_failed=1
+            fi
+        fi
         if ! python3 "$XM_BACKUP/installer-state.py" restore "$XM_BACKUP"; then
             printf 'ROLLBACK FAILED. Keep backup %s and inspect services before retrying.\n' "$XM_BACKUP" >&2
             rollback_failed=1
