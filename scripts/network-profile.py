@@ -219,19 +219,81 @@ class Profile:
             return {"action": "rollback", "status": "restored", "effective": self.effective(), "note": NOTE}
 
 
+def human_problem(message):
+    translations = {
+        "BBR is not available in the running kernel; no modules will be loaded automatically.": "BBR недоступен в текущем ядре. Модули автоматически не загружаются.",
+        "Managed target already belongs to another configuration; refusing replacement.": "Файл профиля принадлежит другой конфигурации; замена запрещена.",
+        "An existing transaction snapshot requires rollback or inspection first.": "Есть сохранённая копия предыдущего применения. Сначала выполните откат или проверьте её.",
+        "Invalid transaction snapshot": "Сохранённая копия повреждена или имеет неподдерживаемый формат.",
+        "Runtime changed after transaction; refusing to overwrite administrator changes": "Настройки изменены после применения профиля. Чужие изменения не перезаписаны.",
+        "Managed file changed after transaction; refusing to overwrite administrator changes": "Файл профиля изменён после применения. Чужие изменения не перезаписаны.",
+        "Apply failed; original runtime and file restored": "Применение не удалось. Исходные настройки и файл восстановлены.",
+    }
+    for prefix, replacement in (
+        ("Potential later override: ", "Возможное переопределение другим файлом: "),
+        ("Rollback incomplete; snapshot retained at ", "Откат не завершён. Копия сохранена: "),
+        ("Apply failed and rollback incomplete; snapshot retained at ", "Применение и откат не завершены. Копия сохранена: "),
+    ):
+        if message.startswith(prefix):
+            return replacement + message[len(prefix):]
+    return translations.get(message, message)
+
+
+def human_report(report, details=False):
+    if report.get("status") == "error":
+        return "Ошибка профиля: " + human_problem(report["error"])
+    values = report.get("current", report.get("effective", {}))
+    lines = ["TCP:                  " + values["net.ipv4.tcp_congestion_control"],
+             "Очередь по умолчанию:  " + values["net.core.default_qdisc"]]
+    if report["action"] == "plan":
+        matches = report["current"] == report["desired"]
+        lines += ["Состояние:            " + ("уже соответствует BBR/fq" if matches else "отличается от BBR/fq"),
+                  "Применение:           " + ("доступно" if report["ready"] else "недоступно"),
+                  "План изменений:       сохранить BBR/fq в отдельный файл X-Manager"]
+        if matches:
+            lines.append("Повторное включение BBR не требуется. Применение добавит управляемый файл и копию для отката.")
+        for problem in report["blockers"]:
+            lines.append("  • " + human_problem(problem))
+        # Show only relevant later declarations in the brief view; keep every
+        # source/line available in details without changing conflict detection.
+        sources = {}
+        for item in report["declarations"]:
+            if item["potential_later_override"]:
+                sources.setdefault(item["file"], []).append(item)
+        if sources:
+            lines.append("Дополнительные конфигурации:")
+            for name, entries in sources.items():
+                match = all(item["value"] == report["desired"][item["key"]] for item in entries)
+                lines.append("  " + Path(name).name + " — " + ("значения совпадают" if match else "есть отличающиеся значения"))
+        if details:
+            lines += ["", "Файл X-Manager: " + report["file"], "Найденные объявления:"]
+            for item in report["declarations"]:
+                lines.append(f"  {item['file']}:{item['line']} — {item['key']} = {item['value']}")
+            lines += ["Содержимое предлагаемого файла:", report["file_preview"].rstrip()]
+    else:
+        lines.append("Результат: " + ("профиль применён" if report["action"] == "apply" else "предыдущие настройки восстановлены"))
+        if report.get("snapshot"):
+            lines.append("Копия для отката: " + report["snapshot"])
+    lines.append("Настройки относятся к новым TCP-соединениям и новым очередям. Очереди действующих интерфейсов не меняются.")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "apply", "rollback"))
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--human", action="store_true")
+    parser.add_argument("--details", action="store_true")
     args = parser.parse_args()
     if args.action != "plan" and os.geteuid() != 0:
         parser.error("apply/rollback require root")
     try:
         report = getattr(Profile(), args.action)()
     except (OSError, ValueError, RuntimeError) as error:
-        print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
+        report = {"status": "error", "error": str(error)}
+        print(human_report(report) if args.human and not args.json else json.dumps(report, ensure_ascii=False))
         return 1
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(human_report(report, args.details) if args.human and not args.json else json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report.get("ready", True) else 1
 
 

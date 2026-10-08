@@ -236,17 +236,30 @@ xm_security_menu() {
         case "$choice" in 1) menu_firewall;; 2) menu_ssl;; 3) menu_system_opt;; 4) xm_network_profile_menu;; 0) return;; *) echo 'Неверный выбор';; esac
     done
 }
+xm_network_has_snapshot() {
+    [ -f /var/lib/x-manager/network-profile/snapshot.json ] && [ ! -L /var/lib/x-manager/network-profile/snapshot.json ]
+}
 xm_network_profile_menu() {
     local choice helper ready=0
     helper="$(dirname "${BASH_SOURCE[0]}")/network-profile.py"
-    python3 "$helper" plan || ready=$?
-    printf '  [1] Применить показанный профиль\n  [2] Откатить профиль\n  [0] Назад\n'
+    xm_header 'Профиль сети BBR/fq'
+    python3 "$helper" plan --human || ready=$?
+    printf '\n  [1] Сохранить профиль под управлением X-Manager\n'
+    if xm_network_has_snapshot; then
+        printf '  [2] Восстановить предыдущие настройки\n'
+    else
+        printf '  Откат недоступен: сохранённой копии нет.\n'
+    fi
+    printf '  [3] Подробности проверки\n  [0] Назад\n'
     read -r -p 'Действие: ' choice || return
     case "$choice" in
         1) [ "$ready" = 0 ] || { echo 'План не готов; доступен откат и диагностика.' >&2; return 1; }
-           xm_confirm 'Применить BBR/fq для новых соединений и очередей?' && python3 "$helper" apply;;
-        2) xm_confirm 'Восстановить сохранённые значения профиля?' && python3 "$helper" rollback;;
+           xm_confirm 'Сохранить и применить BBR/fq для новых соединений и очередей?' && python3 "$helper" apply --human;;
+        2) xm_network_has_snapshot || { echo 'Откат недоступен: сохранённой копии нет.'; return 1; }
+           xm_confirm 'Восстановить сохранённые значения профиля?' && python3 "$helper" rollback --human;;
+        3) python3 "$helper" plan --human --details;;
         0) return;;
+        *) echo 'Выберите номер из списка.';;
     esac
     xm_pause
 }

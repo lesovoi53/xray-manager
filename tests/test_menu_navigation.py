@@ -11,6 +11,8 @@ class MenuNavigation(unittest.TestCase):
 . "$1"
 xm_confirm() { return 0; }
 xm_pause() { :; }
+xm_header() { :; }
+xm_network_has_snapshot() { return 0; }
 python3() { case "$2" in plan) return 1;; rollback) echo ROLLBACK_CALLED;; *) return 99;; esac; }
 xm_network_profile_menu
 '''

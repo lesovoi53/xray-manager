@@ -2,6 +2,9 @@
 from contextlib import nullcontext
 import importlib.util
 import json
+import io
+from contextlib import redirect_stdout
+from unittest.mock import patch
 from pathlib import Path
 import tempfile
 import unittest
@@ -49,6 +52,36 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(before, {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()})
         self.assertFalse(self.tool.path(profile.STATE).parent.exists())
+
+    def test_human_cli_shows_matching_files_without_json_or_mutation(self):
+        for key, value in profile.VALUES.items():
+            self.write('/proc/sys/' + key.replace('.', '/'), value)
+        self.write('/etc/sysctl.d/99-network.conf', profile.CONTENT)
+        with patch.object(profile, 'Profile', return_value=self.tool), patch('sys.argv', ['network-profile.py', 'plan', '--human']):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(profile.main(), 0)
+        self.assertIn('уже соответствует BBR/fq', output.getvalue())
+        self.assertIn('99-network.conf — значения совпадают', output.getvalue())
+        self.assertNotIn('"action"', output.getvalue())
+        self.assertNotIn('file_preview', output.getvalue())
+        self.assertEqual(self.calls, [])
+        with patch.object(profile, 'Profile', return_value=self.tool), patch('sys.argv', ['network-profile.py', 'plan', '--json']):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(profile.main(), 0)
+        self.assertEqual(json.loads(output.getvalue()), self.tool.plan())
+
+    def test_human_conflict_and_details_keep_real_blocker_visible(self):
+        self.write('/etc/sysctl.d/99-network.conf', 'net.core.default_qdisc = fq_codel\n')
+        plan = self.tool.plan()
+        self.assertFalse(plan['ready'])
+        text = profile.human_report(plan, details=True)
+        self.assertIn('Применение:           недоступно', text)
+        self.assertIn('Возможное переопределение другим файлом:', text)
+        self.assertIn('/etc/sysctl.d/99-network.conf:1', text)
+        self.assertIn('есть отличающиеся значения', text)
+        self.assertEqual(self.calls, [])
 
     def test_apply_rollback_preserves_original_state_and_unrelated_config(self):
         self.write("/etc/sysctl.d/20-existing.conf", "net.ipv4.ip_forward=1\n")
