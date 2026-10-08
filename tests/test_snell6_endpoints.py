@@ -175,6 +175,18 @@ class Endpoints(unittest.TestCase):
         self.assertEqual(self.system.rules, rules)
         self.assertEqual(self.system.states["snell6@1.service"]["ActiveState"], "active")
 
+    def test_server_host_change_updates_published_link_preserving_identity(self):
+        self.create()
+        self.manager.publish(1, "user-1", self.db_path)
+        previous = self.manager.load(1)
+        before = self.user()
+        self.manager.apply(1, {"server_host": "new.example"}, source=self.binary, db_path=self.db_path)
+        current = self.manager.load(1)
+        self.assertEqual(current, dict(previous, server_host="new.example"))
+        self.assertEqual(self.user()[1].splitlines(), before[1].splitlines()[:2] +
+                         [snell6.load_helper("snell-subscriptions").uri(current, "new.example")])
+        self.assertEqual(self.user()[4:], before[4:])
+
     def test_clean_start_failure_removes_only_new_endpoint_files_and_rule(self):
         self.system.fail_once = "start"
         user = self.user()

@@ -50,7 +50,7 @@ def settings(path, tag_path):
     return value
 
 
-def uri(value, host, previous=None, follow_name=True):
+def uri(value, host, previous=None, follow_name=True, previous_host=None):
     """Preserve per-link flags and names unless the name follows the service."""
     if not host or any(c.isspace() or c in '/?#@' for c in host):
         raise Error('Invalid server address')
@@ -97,7 +97,11 @@ def uri(value, host, previous=None, follow_name=True):
         query = [(k, '4' if k == 'version' else v) for k, v in query]
     if version == 5 and value['obfs'] in ('http', 'tls'):
         query += [('obfs-mode', value['obfs']), ('obfs-host', value['obfs_host'])]
-    host = (parsed.hostname if parsed else host).strip('[]')
+    # Only an explicit endpoint-address change migrates matching bound hosts.
+    # Per-link address overrides and ordinary key/name updates retain their host.
+    if parsed and (previous_host is None or parsed.hostname != previous_host.strip('[]').lower()):
+        host = parsed.hostname
+    host = host.strip('[]')
     authority = '[' + host + ']' if ':' in host else host
     authority = quote(value['psk'], safe='') + '@' + authority + ':' + str(value['port'])
     name = quote(value['name'], safe='') if follow_name or not parsed else parsed.fragment
@@ -114,7 +118,7 @@ def matches(link, value, host):
         return False
 
 
-def synchronize(db, value, host, bind_user=None, adopt=False, endpoint_id=None):
+def synchronize(db, value, host, bind_user=None, adopt=False, endpoint_id=None, previous_host=None):
     """Caller owns transaction. Only exact, explicitly bound URI snapshots move."""
     version = value.get('version', 5)
     uri(value, host)  # Validate before writing bindings or subscription data.
@@ -156,12 +160,18 @@ def synchronize(db, value, host, bind_user=None, adopt=False, endpoint_id=None):
         lines = (raw or '').splitlines()
         replacements = {}
         bindings = db.execute(f'SELECT uri,follow_name FROM {table} WHERE {scope}user_id=?', (*scope_args, uid)).fetchall()
+        document = None
+        if groups_exist and bindings:
+            row = db.execute('SELECT document_json FROM user_connection_groups WHERE user_id=?', (uid,)).fetchone()
+            if row:
+                document = json.loads(row[0])
+        group_uris = {profile['uri'] for profile in document['profiles']} if document else set()
         for old, follow in bindings:
-            if old not in lines:
-                # A manual edit or deletion detaches the entry; never re-enroll it.
+            if old not in lines and old not in group_uris:
+                # Detach only once no exact snapshot remains in either delivery.
                 db.execute(f'DELETE FROM {table} WHERE {scope}user_id=? AND uri=?', (*scope_args, uid, old))
                 continue
-            new = uri(value, host, old, bool(follow))
+            new = uri(value, host, old, bool(follow), previous_host=previous_host)
             if new != old:
                 replacements[old] = new
         if not replacements:
@@ -169,20 +179,17 @@ def synchronize(db, value, host, bind_user=None, adopt=False, endpoint_id=None):
         updated = [replacements.get(line, line) for line in lines]
         if len(set(updated)) != len(set(lines)):
             raise Error('Synchronization would duplicate a Snell link')
-        if groups_exist:
-            row = db.execute('SELECT document_json FROM user_connection_groups WHERE user_id=?', (uid,)).fetchone()
-            if row:
-                document = json.loads(row[0])
-                touched = False
-                for profile in document['profiles']:
-                    if profile['uri'] in replacements:
-                        profile['uri'] = replacements[profile['uri']]
-                        touched = True
-                if touched:
-                    if len({p['uri'] for p in document['profiles']}) != len(document['profiles']):
-                        raise Error('Synchronization would duplicate a group profile')
-                    db.execute('UPDATE user_connection_groups SET document_json=? WHERE user_id=?',
-                               (json.dumps(document, ensure_ascii=False), uid))
+        if document:
+            touched = False
+            for profile in document['profiles']:
+                if profile['uri'] in replacements:
+                    profile['uri'] = replacements[profile['uri']]
+                    touched = True
+            if touched:
+                if len({p['uri'] for p in document['profiles']}) != len(document['profiles']):
+                    raise Error('Synchronization would duplicate a group profile')
+                db.execute('UPDATE user_connection_groups SET document_json=? WHERE user_id=?',
+                           (json.dumps(document, ensure_ascii=False), uid))
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         db.execute('UPDATE users SET snell_uri=?, revision=revision+1, updated_at=? WHERE id=?',
                    ('\n'.join(updated), now, uid))

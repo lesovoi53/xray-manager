@@ -109,6 +109,27 @@ class SnellSelectionTests(unittest.TestCase):
         self.assertEqual({p['id'] for p in document['profiles']}, set(self.links))
         self.assertEqual(len(document['groups']), 3)
 
+    def test_plain_removal_keeps_group_provenance_and_inactive_v6_hidden(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('removal_endpoints', ROOT.parent / 'scripts/snell6-endpoints.py')
+        endpoints = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(endpoints)
+        self.select(5)
+        link = self.links['local6a']
+        before = self.structured()[1]
+        path = self.app.conn.execute('PRAGMA database_list').fetchone()[2]
+        try:
+            endpoints.remove_subscription_link(path, self.user['id'], link)
+            self.assertNotIn(link, self.plain()[2])
+            after = self.structured()[1]
+            self.assertEqual(after['profiles'], before['profiles'])
+            self.assertEqual(after['groups'], before['groups'])
+            saved = self.app.conn.execute('SELECT document_json FROM user_connection_groups WHERE user_id=?', (self.user['id'],)).fetchone()[0]
+            self.assertIn(link, [p['uri'] for p in json.loads(saved)['profiles']])
+            self.assertIsNotNone(self.app.conn.execute('SELECT 1 FROM x_manager_snell_endpoint_links WHERE user_id=? AND uri=?', (self.user['id'], link)).fetchone())
+        finally:
+            self.stored = '\n'.join(self.app.conn.iterdump())
+
     def test_v5_filters_owned_v6_only_and_preserves_other_protocol(self):
         self.select(5)
         status, _, lines = self.plain()

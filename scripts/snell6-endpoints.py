@@ -6,7 +6,7 @@ Rollback restores this endpoint's files/service and owned firewall rule; SQLite
 is rolled back transactionally, never replaced with a stale whole-database copy.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import datetime
 import hashlib
 import getpass
@@ -461,7 +461,10 @@ class Manager:
             try:
                 if db:
                     db.execute("BEGIN IMMEDIATE")
-                    load_helper("snell-subscriptions").synchronize(db, value, value["server_host"], endpoint_id=value["endpoint_id"])
+                    previous_host = (previous["server_host"] if previous and
+                                     previous["server_host"] != value["server_host"] else None)
+                    load_helper("snell-subscriptions").synchronize(
+                        db, value, value["server_host"], endpoint_id=value["endpoint_id"], previous_host=previous_host)
                 # A separate UID/group is used; v5's owner-match routing never applies.
                 directory.mkdir(parents=True, exist_ok=True)
                 for parent in (self.path("/etc/snell6"), self.path(BASE), directory):
@@ -720,7 +723,7 @@ def subscription_links(database, user):
 
 
 def remove_subscription_link(database, user, link):
-    with sqlite3.connect(Path(database).as_uri() + "?mode=rw", uri=True) as db:
+    with closing(sqlite3.connect(Path(database).as_uri() + "?mode=rw", uri=True)) as db, db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT snell_uri FROM users WHERE id=?", (user,)).fetchone()
         if row is None:
@@ -730,7 +733,14 @@ def remove_subscription_link(database, user, link):
             raise Error("Список изменился; выберите ссылку заново")
         db.execute("UPDATE users SET snell_uri=?,revision=revision+1,updated_at=? WHERE id=?",
                    ("\n".join(line for line in lines if line != link), datetime.datetime.now(datetime.timezone.utc).isoformat(), user))
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='x_manager_snell_endpoint_links'").fetchone():
+        group_reference = False
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_connection_groups'").fetchone():
+            group = db.execute("SELECT document_json FROM user_connection_groups WHERE user_id=?", (user,)).fetchone()
+            if group:
+                group_reference = any(profile['uri'] == link for profile in json.loads(group[0])['profiles'])
+        # Groups are independent saved configurations. Keep exact local ownership
+        # while they reference this URI, so inactive endpoints stay filtered.
+        if not group_reference and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='x_manager_snell_endpoint_links'").fetchone():
             db.execute("DELETE FROM x_manager_snell_endpoint_links WHERE user_id=? AND uri=?", (user, link))
 
 
@@ -745,7 +755,7 @@ def subscription_menu(manager, user):
                 ("Показать сохранённые ссылки (содержат ключи)", "show"),
                 ("Добавить активное локальное подключение", "local"),
                 ("Добавить внешнюю ссылку", "import"),
-                ("Удалить ссылку из подписки", "remove")])
+                ("Удалить из списка ссылок", "remove")])
             if action is None:
                 return
             if action == "show":
@@ -769,11 +779,11 @@ def subscription_menu(manager, user):
                 if not links:
                     print("Ссылок Snell v6 пока нет.")
                     continue
-                link = choose("Удалить только из этой подписки", [
+                link = choose("Удалить только из списка ссылок этого пользователя", [
                     (unquote(urlsplit(item).fragment) or urlsplit(item).hostname or "Snell v6", item) for item in links])
-                if link and confirm("Удалить выбранную ссылку из подписки? Серверное подключение сохранится."):
+                if link and confirm("Удалить выбранную ссылку из списка? Профили групп и серверное подключение сохранятся."):
                     remove_subscription_link(database, user, link)
-                    print("Ссылка удалена из подписки.")
+                    print("Ссылка удалена из списка. Профили групп сохранены.")
         except (Error, ValueError, OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
             print("Snell v6: " + (str(error) if isinstance(error, (Error, ValueError)) else type(error).__name__))
         except (EOFError, KeyboardInterrupt):

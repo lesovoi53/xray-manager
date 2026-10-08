@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.08.1.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.08.2.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -89,6 +89,8 @@ for dependency in curl wget jq unzip iptables iptables-save iptables-restore ope
 done
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "Python 3.9 or newer is required before installation")'
 xm_check_external_watchdog
+external_ports=$(python3 "$SCRIPT_DIR/scripts/external-listener-ports.py")
+eval "$external_ports"
 port_plan=$(python3 "$SCRIPT_DIR/scripts/plan-ports.py")
 eval "$port_plan"
 WORK_DIR=$(mktemp -d)
@@ -626,9 +628,8 @@ iptables -C INPUT -i "$WAN_IF" -p udp --dport "${XRAY_TPROXY_PORT}" -j DROP 2>/d
 iptables -C INPUT -i "$WAN_IF" -p tcp --dport "${XRAY_REDIRECT_PORT}" -j DROP 2>/dev/null || iptables -I INPUT 1 -i "$WAN_IF" -p tcp --dport "${XRAY_REDIRECT_PORT}" -j DROP
 echo -e "  ✓ Внутренние порты ядра Xray (${XRAY_TPROXY_PORT}, ${XRAY_REDIRECT_PORT}) защищены от внешнего доступа"
 
-if command -v wdtt >/dev/null 2>&1 || [ -f "/etc/systemd/system/wdtt.service" ] || [ -d "/etc/wdtt" ]; then
-    wdtt_p="56000"
-    [ -f "/etc/systemd/system/wdtt.service" ] && wdtt_p=$(grep -oP -- '(^|\s)-listen\s+[0-9.]+:\K[0-9]+' /etc/systemd/system/wdtt.service 2>/dev/null | head -n 1 || echo "56000")
+if [ -n "$WDTT_PORT" ]; then
+    wdtt_p=$WDTT_PORT
     iptables -C INPUT -p udp --dport "$wdtt_p" -m comment --comment "WDTT_MANAGED" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport "$wdtt_p" -m comment --comment "WDTT_MANAGED" -j ACCEPT
     iptables -C INPUT -p tcp --dport "$wdtt_p" -m comment --comment "WDTT_MANAGED" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport "$wdtt_p" -m comment --comment "WDTT_MANAGED" -j ACCEPT
     iptables -C INPUT -p tcp --dport 56002 -m comment --comment "WDTT_MANAGED" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 56002 -m comment --comment "WDTT_MANAGED" -j ACCEPT
@@ -637,9 +638,8 @@ if command -v wdtt >/dev/null 2>&1 || [ -f "/etc/systemd/system/wdtt.service" ] 
     echo -e "  ✓ Порты WDTT (:${wdtt_p}, :56002, :56003) открыты в фаерволе"
 fi
 
-if command -v csqtt >/dev/null 2>&1 || [ -f "/etc/systemd/system/csqtt.service" ] || [ -d "/etc/csqtt" ]; then
-    csqtt_p="37000"
-    [ -f "/etc/systemd/system/csqtt.service" ] && csqtt_p=$(grep -oP -- '--listen\s+0\.0\.0\.0:\K[0-9]+' /etc/systemd/system/csqtt.service 2>/dev/null | head -n 1 || echo "37000")
+if [ -n "$CSQTT_PORT" ]; then
+    csqtt_p=$CSQTT_PORT
     iptables -C INPUT -p udp --dport "$csqtt_p" -m comment --comment "CSQTT_MANAGED" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport "$csqtt_p" -m comment --comment "CSQTT_MANAGED" -j ACCEPT
     echo -e "  ✓ Порт VPN-туннеля CSQTT (:${csqtt_p}/UDP) открыт в фаерволе"
 fi

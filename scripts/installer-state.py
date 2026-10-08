@@ -17,6 +17,7 @@ import tarfile
 import time
 import re
 import tempfile
+from contextlib import closing
 
 EXTERNAL_WATCHDOGS = ('vpn-watchdog.timer', 'vpn-watchdog.service')
 MAINTENANCE = Path('/var/lib/x-manager/maintenance-watchdog.json')
@@ -273,6 +274,28 @@ def validate_backup(dest):
                 raise ValueError('Invalid backup member')
     if not (dest/'iptables').is_file():
         raise ValueError('Incomplete firewall backup')
+    # The tar contains a raw copy of the live main DB, which can omit committed
+    # WAL transactions. Only the SQLite backup API snapshot is restorable.
+    if not isinstance(state['databases'], list):
+        raise ValueError('Invalid SQLite snapshot metadata')
+    for database in state['databases']:
+        if (not isinstance(database, dict) or not isinstance(database.get('backup'), str)
+                or not re.fullmatch(r'database-[0-9]+\.sqlite', database['backup'])
+                or not isinstance(database.get('path'), str) or not Path(database['path']).is_absolute()):
+            raise ValueError('Invalid SQLite snapshot metadata')
+        snapshot = dest/database['backup']
+        try:
+            if snapshot.is_symlink() or not snapshot.is_file():
+                raise ValueError('Missing or invalid SQLite snapshot: '+database['backup'])
+            with snapshot.open('rb') as stream:
+                if stream.read(16) != b'SQLite format 3\x00':
+                    raise ValueError('Invalid SQLite snapshot: '+database['backup'])
+            # immutable prevents journal creation/recovery in the backup itself.
+            with closing(sqlite3.connect(snapshot.resolve().as_uri()+'?mode=ro&immutable=1', uri=True)) as connection:
+                if connection.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                    raise ValueError('Corrupt SQLite snapshot: '+database['backup'])
+        except (OSError, sqlite3.Error) as error:
+            raise ValueError('Unreadable or corrupt SQLite snapshot: '+database['backup']) from error
     return state
 
 
@@ -359,12 +382,12 @@ def restore(dest):
     restore_watcher_policy(watcher_policy)
     for database in state['databases']:
         filename, target = database['backup'], database['path']
-        if (dest / filename).exists():
-            # Preserve restored ownership/mode while replacing only DB contents.
-            with open(dest / filename, "rb") as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            for suffix in ("-wal", "-shm"):
-                Path(target + suffix).unlink(missing_ok=True)
+        # Preserve restored ownership/mode while replacing only DB contents.
+        # Disappearance after validation remains fatal; never use the raw tar DB.
+        with open(dest / filename, "rb") as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        for suffix in ("-wal", "-shm"):
+            Path(target + suffix).unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
     # Transparent Snell routing checks the actual Xray listeners at start.
     # Restore the managed core before dependent services, timers last.

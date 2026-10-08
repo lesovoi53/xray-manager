@@ -119,6 +119,49 @@ class SnellSubscriptions(unittest.TestCase):
             self.sync6(self.v6(), bind_user='local', adopt=True)
         self.assertEqual(before, self.local())
 
+    def test_explicit_v6_host_change_moves_only_matching_bound_snapshots(self):
+        value = self.v6()
+        link = snell.uri(value, 'old.example')
+        override = snell.uri(value, 'override.example')
+        manual = link.replace('#', '&network=tcp#')
+        self.db.execute('UPDATE users SET snell_uri=? WHERE id="local"',
+                        ('\n'.join([link, override, manual, self.foreign]),))
+        snell.synchronize(self.db, value, 'old.example', bind_user='local', endpoint_id='local-v6')
+        snell.synchronize(self.db, value, 'override.example', bind_user='local', endpoint_id='local-v6')
+        self.db.commit()
+        before = self.local()
+        with self.db:
+            count = snell.synchronize(self.db, value, 'new.example', endpoint_id='local-v6',
+                                      previous_host='old.example')
+        self.assertEqual(count, 1)
+        after = self.local()
+        self.assertEqual(after[1].splitlines(), [snell.uri(value, 'new.example'), override, manual, self.foreign])
+        self.assertEqual(after[2], before[2] + 1)
+        self.assertEqual(after[4:], before[4:])
+
+    def test_group_only_v6_binding_survives_sync_and_updates_without_plain_reinsertion(self):
+        value = self.v6()
+        link = snell.uri(value, '192.0.2.1')
+        self.db.execute('UPDATE users SET snell_uri=? WHERE id="local"', (link,))
+        self.sync6(value, bind_user='local')
+        document = {'profiles': [{'id': 'keep', 'name': 'Alias', 'uri': link}], 'groups': []}
+        self.db.execute('UPDATE user_connection_groups SET document_json=? WHERE user_id="local"', (json.dumps(document),))
+        self.db.execute('UPDATE users SET snell_uri=? WHERE id="local"', (self.foreign,))
+        self.db.commit()
+        self.assertEqual(self.sync6(value), 0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM x_manager_snell_endpoint_links').fetchone()[0], 1)
+        self.assertEqual(self.sync6(self.v6(name='Renamed')), 1)
+        self.assertEqual(self.local()[1], self.foreign)
+        saved = json.loads(self.db.execute('SELECT document_json FROM user_connection_groups WHERE user_id="local"').fetchone()[0])
+        self.assertEqual(saved['profiles'][0], dict(id='keep', name='Alias', uri=snell.uri(self.v6(name='Renamed'), '192.0.2.1')))
+        after = self.local()
+        self.assertEqual(self.sync6(self.v6(name='Renamed')), 0)
+        self.assertEqual(self.local(), after)
+        self.db.execute('DELETE FROM user_connection_groups WHERE user_id="local"')
+        self.db.commit()
+        self.assertEqual(self.sync6(self.v6(name='Renamed')), 0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM x_manager_snell_endpoint_links').fetchone()[0], 0)
+
     def test_v6_endpoint_isolation(self):
         a, b = self.v6(), self.v6(port=20001, name='Second')
         first, second = snell.uri(a, '192.0.2.1'), snell.uri(b, '192.0.2.1')
