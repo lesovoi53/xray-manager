@@ -1,9 +1,8 @@
-"""Maintenance refuses active external pollers before any managed mutation."""
+"""Maintenance tests use real transaction code and a stateful systemd boundary."""
 import importlib.util
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -14,111 +13,239 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('watchdog_guard_state', ROOT/'scripts/installer-state.py')
 state = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(state)
+TIMER, SERVICE = state.EXTERNAL_WATCHDOGS
 
 
-class ExternalWatchdogPreflight(unittest.TestCase):
-    def shell_preflight(self, active='', status='3', reported='inactive'):
+class ExternalWatchdogMaintenance(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.backup = self.root/'backup'
+        self.backup.mkdir()
+        (self.backup/'state.json').write_text(json.dumps({'services': {}, 'paths': [], 'databases': []}))
+        (self.backup/'iptables').write_text('')
+        with tarfile.open(self.backup/'files.tar', 'w'):
+            pass
+        self.marker = self.root/'maintenance.json'
+        self.units = {unit: dict(LoadState='loaded', ActiveState='active', UnitFileState='enabled')
+                      for unit in state.EXTERNAL_WATCHDOGS}
+        self.calls = []
+        self.fail = None
+        self.addCleanup(patch.stopall)
+        patch.object(state, 'MAINTENANCE', self.marker).start()
+        patch.object(state.subprocess, 'run', side_effect=self.system).start()
+
+    def system(self, args, **kwargs):
+        args = list(args)
+        self.calls.append(args)
+        if args[:2] == ['systemctl', 'show']:
+            self.assertEqual(kwargs['timeout'], 30)
+            return subprocess.CompletedProcess(args, 0, stdout='\n'.join(k+'='+v for k, v in self.units[args[2]].items()))
+        if args[:2] in (['systemctl', 'start'], ['systemctl', 'stop']):
+            self.assertTrue(self.marker.exists(), 'intent must be durable before any stop/start')
+            self.assertEqual(kwargs['timeout'], 30)
+            if self.fail == tuple(args[1:]):
+                return subprocess.CompletedProcess(args, 1, stdout='', stderr='synthetic failure')
+            self.units[args[2]]['ActiveState'] = 'active' if args[1] == 'start' else 'inactive'
+            return subprocess.CompletedProcess(args, 0, stdout='')
+        self.assertIn(args, [['systemctl', 'daemon-reload'], ['iptables-restore']])
+        return subprocess.CompletedProcess(args, 0, stdout='')
+
+    def changes(self):
+        return [args[1:] for args in self.calls if len(args) > 1 and args[1] in ('start', 'stop', 'enable', 'disable', 'restart')]
+
+    def test_success_preserves_order_and_enablement(self):
+        state.watchdog_preflight()
+        self.assertFalse(self.marker.exists())
+        state.watchdog_pause(self.backup)
+        original = json.loads(self.marker.read_text())
+        self.assertEqual(original['backup'], str(self.backup))
+        self.assertEqual(original['units'][SERVICE]['ActiveState'], 'active')
+        state.watchdog_resume()
+        self.assertEqual(self.changes(), [['stop', TIMER], ['stop', SERVICE], ['start', SERVICE], ['start', TIMER]])
+        self.assertFalse(self.marker.exists())
+
+    def test_stopped_disabled_masked_and_missing_not_started(self):
+        for load, enabled in [('loaded', 'disabled'), ('masked', 'masked'), ('not-found', '')]:
+            for unit in self.units:
+                self.units[unit].update(LoadState=load, UnitFileState=enabled, ActiveState='inactive')
+            state.watchdog_pause(self.backup)
+            state.watchdog_resume()
+        self.assertEqual(self.changes(), [])
+
+    def test_active_timer_inactive_service(self):
+        self.units[SERVICE]['ActiveState'] = 'inactive'
+        state.watchdog_pause(self.backup)
+        state.watchdog_resume()
+        self.assertEqual(self.changes(), [['stop', TIMER], ['start', TIMER]])
+
+    def test_partial_pause_failure(self):
+        self.fail = ('stop', SERVICE)
+        with self.assertRaisesRegex(RuntimeError, 'Cannot stop'):
+            state.watchdog_pause(self.backup)
+        self.fail = None
+        state.watchdog_resume()
+        self.assertEqual(self.changes(), [['stop', TIMER], ['stop', SERVICE], ['start', TIMER]])
+        self.assertFalse(self.marker.exists())
+
+    def test_stop_timeout_keeps_recovery_marker(self):
+        actual = self.system
+        def timeout(args, **kwargs):
+            if list(args)[:2] == ['systemctl', 'stop']:
+                raise subprocess.TimeoutExpired(args, 30)
+            return actual(args, **kwargs)
+        with patch.object(state.subprocess, 'run', side_effect=timeout):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                state.watchdog_pause(self.backup)
+        self.assertTrue(self.marker.exists())
+        state.watchdog_resume()
+
+    def test_restore_failure_is_recoverable_and_idempotent(self):
+        state.watchdog_pause(self.backup)
+        self.fail = ('start', TIMER)
+        with self.assertRaisesRegex(RuntimeError, 'Cannot start'):
+            state.watchdog_resume()
+        self.assertTrue(self.marker.exists())
+        self.fail = None
+        state.watchdog_resume()
+        self.assertEqual(self.changes().count(['start', SERVICE]), 1)
+        self.assertFalse(self.marker.exists())
+
+    def test_interrupted_marker_blocks_overwrite(self):
+        state.watchdog_pause(self.backup)
+        before = self.marker.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, '--recover-watchdog'):
+            state.watchdog_pause(self.backup)
+        self.assertEqual(self.marker.read_bytes(), before)
+
+    def test_concurrent_policy_change_is_not_undone(self):
+        state.watchdog_pause(self.backup)
+        self.units[SERVICE]['UnitFileState'] = 'masked'
+        with self.assertRaisesRegex(RuntimeError, 'policy changed'):
+            state.watchdog_resume()
+        self.assertTrue(self.marker.exists())
+        self.assertFalse(any(c[0] == 'start' for c in self.changes()))
+
+    def test_manual_stop_intent_is_respected(self):
+        state.watchdog_pause(self.backup)
+        exists = Path.exists
+        def inhibited(path):
+            return str(path) == '/run/x-manager/service-control/stopped/'+SERVICE or exists(path)
+        with patch.object(Path, 'exists', inhibited):
+            with self.assertRaisesRegex(RuntimeError, 'manually inhibited'):
+                state.watchdog_resume()
+        self.assertFalse(any(c[0] == 'start' for c in self.changes()))
+
+    def test_transition_is_read_only_failure(self):
+        self.units[SERVICE]['ActiveState'] = 'activating'
+        with self.assertRaisesRegex(RuntimeError, 'stable external watcher'):
+            state.watchdog_preflight()
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(self.changes(), [])
+
+    def test_backup_precedes_stop(self):
+        (self.backup/'files.tar').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'Complete backup'):
+            state.watchdog_pause(self.backup)
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(self.changes(), [])
+
+    def test_rollback_does_not_restore_historical_watchdog_state(self):
+        historical = {'services': {SERVICE: {'active': True, 'enabled': 'disabled'},
+                                   TIMER: {'active': True, 'enabled': 'disabled'}},
+                      'paths': [], 'databases': []}
+        (self.backup/'state.json').write_text(json.dumps(historical))
+        self.units[SERVICE]['ActiveState'] = 'inactive'
+        state.watchdog_pause(self.backup)
+        with patch.object(state, 'SERVICES', [SERVICE, TIMER]), patch.object(state, 'save_watcher_policy', return_value=({}, {})), patch.object(state, 'restore_watcher_policy'):
+            state.restore(self.backup)
+        self.assertEqual(self.changes(), [['stop', TIMER]])
+        state.watchdog_resume()
+        self.assertEqual(self.changes(), [['stop', TIMER], ['start', TIMER]])
+
+    def test_historical_policy_restore_preserves_current_stop_off_and_guards(self):
+        policy = self.root/'etc/x-manager/service-control/state.json'
+        policy.parent.mkdir(parents=True)
+        intent = {'off': True, 'autostart': False}
+        policy.write_text(json.dumps({'version': 1, 'units': {SERVICE: intent}}))
+        files = state.watcher_policy_files(self.root)
+        for path in files[:3]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('current guard')
+            path.chmod(0o600)
+        saved = state.save_watcher_policy(self.root)
+        policy.write_text(json.dumps({'version': 1, 'units': {SERVICE: {'off': False}, TIMER: {'off': False}, 'snell.service': {'off': True}}}))
+        for path in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('historical guard')
+        state.restore_watcher_policy(saved, self.root)
+        restored = json.loads(policy.read_text())['units']
+        self.assertEqual(restored[SERVICE], intent)
+        self.assertNotIn(TIMER, restored)
+        self.assertEqual(restored['snell.service'], {'off': True})
+        self.assertTrue(all(path.read_text() == 'current guard' for path in files[:3]))
+        self.assertTrue(all(not path.exists() for path in files[3:]))
+
+
+class ExitTrapMaintenance(unittest.TestCase):
+    def exercise(self, failure=False, rollback=False, restore_failure=False, pause_failure=False, rollback_failure=False):
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = Path(temporary)
-            (fixture/'os-release').write_text('ID=debian\nVERSION_ID=13\n')
-            (fixture/'systemd').mkdir()
-            # Only filesystem endpoints are redirected. Execute the real
-            # production xm_preflight, including its call to the watcher guard.
-            common = (ROOT/'scripts/installer-common.sh').read_text()
-            common = common.replace('. /etc/os-release', '. '+shlex.quote(str(fixture/'os-release')))
-            common = common.replace('/run/systemd/system', str(fixture/'systemd'))
-            common = common.replace('/run/lock/x-manager-install.lock', str(fixture/'install.lock'))
-            script = common + r'''
-systemctl() {
-    printf '%s\n' "$*" >> "$FIXTURE/commands"
-    if [ "$2" = "$ACTIVE" ]; then printf '%s\n' active; return 0; fi
-    printf '%s\n' "$REPORTED"
-    return "$STATUS"
-}
-uname() { printf '%s\n' x86_64; }
-flock() { :; }
-xm_preflight
-printf '%s\n' passed
+            root = Path(temporary)
+            (root/'scripts').mkdir()
+            (root/'backup').mkdir()
+            helper = '''import os, pathlib, sys
+root = pathlib.Path(os.environ['FIXTURE'])
+mode = sys.argv[1]
+with (root/'calls').open('a') as out: out.write(mode+'\\n')
+if mode == 'watchdog-resume' and os.environ.get('RESTORE_FAILURE') == 'yes': sys.exit(9)
+if mode == 'watchdog-pause' and os.environ.get('PAUSE_FAILURE') == 'yes': sys.exit(8)
+if mode == 'restore' and os.environ.get('ROLLBACK_FAILURE') == 'yes': sys.exit(6)
 '''
-            result = subprocess.run(['bash', '-c', script], text=True, capture_output=True,
-                                    env=dict(os.environ, FIXTURE=temporary, ACTIVE=active, STATUS=status, REPORTED=reported))
-            return result, (fixture/'commands').read_text(), (fixture/'install.lock').exists()
+            (root/'scripts/installer-state.py').write_text(helper)
+            script = '''set -eE
+source "$COMMON"
+SCRIPT_DIR="$FIXTURE"
+mktemp() { printf '%s\\n' "$FIXTURE/backup"; }
+xm_begin
+if [ "$ROLLBACK" = yes ]; then python3 "$XM_BACKUP/installer-state.py" restore "$FIXTURE/old"; fi
+if [ "$FAILURE" = yes ]; then exit 7; fi
+xm_finish
+'''
+            result = subprocess.run(['bash', '-c', script], capture_output=True, text=True,
+                env=dict(os.environ, COMMON=str(ROOT/'scripts/installer-common.sh'), FIXTURE=temporary,
+                         FAILURE='yes' if failure else 'no', ROLLBACK='yes' if rollback else 'no',
+                         RESTORE_FAILURE='yes' if restore_failure else 'no', PAUSE_FAILURE='yes' if pause_failure else 'no',
+                         ROLLBACK_FAILURE='yes' if rollback_failure else 'no'))
+            return result, (root/'calls').read_text().splitlines()
 
-    def test_real_shell_preflight_refuses_each_active_poller_before_lock_write(self):
-        for unit in ('vpn-watchdog.service', 'vpn-watchdog.timer'):
-            with self.subTest(unit=unit):
-                result, commands, lock_created = self.shell_preflight(active=unit)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn('Explicitly stop the external watcher', result.stderr)
-                self.assertFalse(lock_created)
-                self.assertTrue(all(line.startswith('is-active ') for line in commands.splitlines()))
+    def test_failure_rolls_back_before_resume(self):
+        result, calls = self.exercise(failure=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(calls, ['backup', 'watchdog-pause', 'restore', 'watchdog-resume'])
 
-    def test_real_shell_preflight_accepts_inactive_and_missing_watchers(self):
-        for status, reported in (('3', 'inactive'), ('4', 'unknown')):
-            with self.subTest(status=status):
-                result, commands, lock_created = self.shell_preflight(status=status, reported=reported)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('passed', result.stdout)
-                self.assertTrue(lock_created)
-                self.assertEqual(commands.splitlines(), ['is-active vpn-watchdog.service', 'is-active vpn-watchdog.timer'])
+    def test_success_and_explicit_rollback_resume(self):
+        for rollback in (False, True):
+            result, calls = self.exercise(rollback=rollback)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, ['backup', 'watchdog-pause'] + (['restore'] if rollback else []) + ['watchdog-resume'])
 
-    def test_real_shell_preflight_fails_closed_on_query_error_or_transition(self):
-        for status, reported in (('1', ''), ('3', 'activating'), ('3', 'deactivating')):
-            with self.subTest(status=status, reported=reported):
-                result, _, lock_created = self.shell_preflight(status=status, reported=reported)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertFalse(lock_created)
+    def test_partial_pause_does_not_restore_managed_files(self):
+        result, calls = self.exercise(pause_failure=True)
+        self.assertEqual(result.returncode, 8)
+        self.assertEqual(calls, ['backup', 'watchdog-pause', 'watchdog-resume'])
 
-    def test_direct_restore_refuses_before_read_stop_or_write(self):
-        for active in ('vpn-watchdog.service', 'vpn-watchdog.timer'):
-            calls = []
+    def test_resume_failure_is_nonzero_with_recovery_instruction(self):
+        result, calls = self.exercise(restore_failure=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--recover-watchdog', result.stderr)
+        self.assertNotIn('restore', calls)
 
-            def system(args, **kwargs):
-                calls.append(args)
-                self.assertEqual(args[:2], ['systemctl', 'is-active'])
-                return subprocess.CompletedProcess(args, 0 if args[2] == active else 3,
-                                                   stdout='active' if args[2] == active else 'inactive', stderr='')
-
-            with self.subTest(active=active), patch.object(state.subprocess, 'run', side_effect=system), \
-                    patch.object(Path, 'read_text') as read, patch.object(Path, 'unlink') as unlink, \
-                    patch.object(state.shutil, 'rmtree') as remove:
-                with self.assertRaisesRegex(RuntimeError, 'Explicitly stop the external watcher'):
-                    state.restore(Path('/unused-readonly-guard-fixture'))
-                read.assert_not_called()
-                unlink.assert_not_called()
-                remove.assert_not_called()
-                self.assertTrue(calls)
-
-    def test_direct_restore_rejects_query_error_before_snapshot_read(self):
-        result = subprocess.CompletedProcess([], 1, stdout='', stderr='synthetic unavailable bus')
-        with patch.object(state.subprocess, 'run', return_value=result), patch.object(Path, 'read_text') as read:
-            with self.assertRaisesRegex(RuntimeError, 'Cannot verify external watcher'):
-                state.restore(Path('/unused-readonly-guard-fixture'))
-            read.assert_not_called()
-
-    def test_direct_restore_accepts_inactive_watchers_without_touching_them(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            backup = Path(temporary)
-            (backup/'state.json').write_text(json.dumps({'services': {}, 'paths': [], 'databases': []}))
-            (backup/'iptables').write_text('')
-            with tarfile.open(backup/'files.tar', 'w'):
-                pass
-            calls = []
-
-            def system(args, **kwargs):
-                calls.append(tuple(args))
-                if args[:2] == ['systemctl', 'is-active']:
-                    return subprocess.CompletedProcess(args, 3, stdout='inactive', stderr='')
-                if args[:2] == ('systemctl', 'show'):
-                    return subprocess.CompletedProcess(args, 0, stdout='not-found', stderr='')
-                self.assertIn(tuple(args), [('systemctl', 'daemon-reload'), ('iptables-restore',)])
-                return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
-
-            with patch.object(state.subprocess, 'run', side_effect=system):
-                state.restore(backup)
-            self.assertEqual(calls[:2], [('systemctl', 'is-active', 'vpn-watchdog.service'),
-                                        ('systemctl', 'is-active', 'vpn-watchdog.timer')])
-            self.assertFalse(any(len(c) > 1 and c[1] in ('stop', 'disable', 'restart') for c in calls))
+    def test_failed_rollback_keeps_watchdog_paused_for_recovery(self):
+        result, calls = self.exercise(failure=True, rollback_failure=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(calls, ['backup', 'watchdog-pause', 'restore'])
+        self.assertIn('--recover-watchdog', result.stderr)
 
 
 if __name__ == '__main__':

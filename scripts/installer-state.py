@@ -16,6 +16,96 @@ import sys
 import tarfile
 import time
 import re
+import tempfile
+
+EXTERNAL_WATCHDOGS = ('vpn-watchdog.timer', 'vpn-watchdog.service')
+MAINTENANCE = Path('/var/lib/x-manager/maintenance-watchdog.json')
+
+
+def watchdog_state(unit):
+    result = subprocess.run(['systemctl', 'show', unit,
+                             '--property=LoadState,ActiveState,UnitFileState'],
+                            capture_output=True, text=True, timeout=30)
+    values = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    if result.returncode or values.get('LoadState') not in ('loaded', 'not-found', 'masked') or values.get('ActiveState') not in ('active', 'inactive', 'failed'):
+        raise RuntimeError('Cannot verify stable external watcher state: '+unit)
+    return values
+
+
+def watchdog_preflight():
+    if MAINTENANCE.exists():
+        raise RuntimeError('Interrupted watchdog maintenance. Inspect the saved backup and run install.sh --recover-watchdog before retrying: '+str(MAINTENANCE))
+    for unit in EXTERNAL_WATCHDOGS:
+        watchdog_state(unit)
+
+
+def watchdog_save(value):
+    MAINTENANCE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.watchdog-', dir=MAINTENANCE.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, MAINTENANCE)
+        watchdog_sync()
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def watchdog_sync():
+    fd = os.open(MAINTENANCE.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def watchdog_command(action, unit):
+    result = subprocess.run(['systemctl', action, unit], capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError('Cannot '+action+' external watcher '+unit+'; maintenance marker retained')
+
+
+def watchdog_pause(dest):
+    watchdog_preflight()
+    # A complete backup must exist before either external unit is stopped.
+    json.loads((dest/'state.json').read_text())
+    if not (dest/'files.tar').is_file():
+        raise RuntimeError('Complete backup required before watchdog maintenance')
+    previous = {unit: watchdog_state(unit) for unit in EXTERNAL_WATCHDOGS}
+    watchdog_save({'version': 1, 'backup': str(dest), 'units': previous})
+    for unit in EXTERNAL_WATCHDOGS:  # Timer first: do not launch another service run.
+        if previous[unit]['ActiveState'] == 'active':
+            watchdog_command('stop', unit)
+    check_external_watchdog()
+
+
+def watchdog_resume():
+    if not MAINTENANCE.exists():
+        return
+    saved = json.loads(MAINTENANCE.read_text())
+    if saved.get('version') != 1 or set(saved.get('units', {})) != set(EXTERNAL_WATCHDOGS):
+        raise RuntimeError('Invalid watchdog maintenance marker; manual recovery required')
+    # Refuse concurrent policy changes instead of enabling/unmasking foreign units.
+    for unit in EXTERNAL_WATCHDOGS:
+        current, previous = watchdog_state(unit), saved['units'][unit]
+        if any(current.get(key) != previous.get(key) for key in ('LoadState', 'UnitFileState')):
+            raise RuntimeError('External watcher policy changed during maintenance: '+unit)
+        if previous['ActiveState'] != 'active' and current['ActiveState'] == 'active':
+            raise RuntimeError('External watcher activated outside maintenance: '+unit)
+        if previous['ActiveState'] == 'active' and any(Path(base, unit).exists() for base in (
+                '/etc/x-manager/service-control/off', '/run/x-manager/service-control/stopped')):
+            raise RuntimeError('External watcher manually inhibited; refusing to resume: '+unit)
+    for unit in reversed(EXTERNAL_WATCHDOGS):  # Service before timer.
+        previous = saved['units'][unit]
+        if previous['ActiveState'] == 'active' and watchdog_state(unit)['ActiveState'] != 'active':
+            watchdog_command('start', unit)
+            if watchdog_state(unit)['ActiveState'] != 'active':
+                raise RuntimeError('External watcher did not become active: '+unit)
+    MAINTENANCE.unlink()
+    watchdog_sync()
 
 CONFIGS = ["/etc/" + p for p in (
     "x-manager", "snell", "snell6", "mita", "mieru", "openflux", "webdav-tunnel", "tuna-subscriptions")]
@@ -65,12 +155,9 @@ def query(*args):
 
 def check_external_watchdog():
     """External pollers must not revive services while their files are restored."""
-    for unit in ('vpn-watchdog.service', 'vpn-watchdog.timer'):
-        result = subprocess.run(['systemctl', 'is-active', unit], capture_output=True, text=True)
-        if result.returncode == 0 or result.stdout.strip() in ('active', 'activating', 'reloading', 'deactivating'):
-            raise RuntimeError('External watcher '+unit+' is running. Explicitly stop the external watcher before maintenance; existing state was not changed.')
-        if result.returncode not in (3, 4):
-            raise RuntimeError('Cannot verify external watcher '+unit+'; maintenance refused before changing existing state.')
+    for unit in EXTERNAL_WATCHDOGS:
+        if watchdog_state(unit)['ActiveState'] == 'active':
+            raise RuntimeError('External watcher '+unit+' is running during maintenance; refusing managed changes')
 
 
 def wait_snell_gateways(timeout=30):
@@ -175,12 +262,73 @@ def snapshot(dest, config_module):
     (dest / "state.json").write_text(json.dumps(state))
 
 
+def validate_backup(dest):
+    state = json.loads((dest/'state.json').read_text())
+    for key in ('services', 'paths', 'databases'):
+        if key not in state:
+            raise ValueError('Incomplete backup: '+key)
+    with tarfile.open(dest/'files.tar') as archive:
+        for member in archive.getmembers():
+            if member.name.startswith('/') or '..' in Path(member.name).parts:
+                raise ValueError('Invalid backup member')
+    if not (dest/'iptables').is_file():
+        raise ValueError('Incomplete firewall backup')
+    return state
+
+
+def watcher_policy_files(root=Path('/')):
+    return [root / base.lstrip('/') / (unit+suffix) for unit in EXTERNAL_WATCHDOGS for base, suffix in (
+        ('/etc/x-manager/service-control/off', ''),
+        ('/run/x-manager/service-control/stopped', ''),
+        ('/etc/systemd/system', '.d/95-tuna-service-control.conf'))]
+
+
+def save_watcher_policy(root=Path('/')):
+    """Historical rollback must not revive a watcher disabled after that backup."""
+    policy = root/'etc/x-manager/service-control/state.json'
+    data = json.loads(policy.read_text()) if policy.exists() else {'units': {}}
+    entries = {unit: data['units'].get(unit) for unit in EXTERNAL_WATCHDOGS}
+    files = {}
+    for path in watcher_policy_files(root):
+        if path.is_symlink():
+            raise RuntimeError('Symlink in external watcher policy; manual recovery required: '+str(path))
+        files[path] = (path.read_bytes(), path.stat()) if path.exists() else None
+    return entries, files
+
+
+def restore_watcher_policy(saved, root=Path('/')):
+    entries, files = saved
+    policy = root/'etc/x-manager/service-control/state.json'
+    if policy.exists() or any(value is not None for value in entries.values()):
+        data = json.loads(policy.read_text()) if policy.exists() else {'version': 1, 'units': {}}
+        for unit, entry in entries.items():
+            data['units'].pop(unit, None)
+            if entry is not None:
+                data['units'][unit] = entry
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(json.dumps(data))
+        policy.chmod(0o600)
+    for path, value in files.items():
+        if value is None:
+            path.unlink(missing_ok=True)
+        else:
+            content, previous = value
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.unlink(missing_ok=True)
+            path.write_bytes(content)
+            path.chmod(previous.st_mode & 0o777)
+            os.chown(path, previous.st_uid, previous.st_gid)
+
+
 def restore(dest):
     # Keep this guard before snapshot reads, service stops and every file write.
     check_external_watchdog()
-    state = json.loads((dest / "state.json").read_text())
+    state = validate_backup(dest)
+    watcher_policy = save_watcher_policy()
     failures = []
     for unit in SERVICES:
+        if unit in EXTERNAL_WATCHDOGS:
+            continue  # Resumed separately after all files/firewall are restored.
         if unit in [u+'.service' for u in LIFECYCLE_UNITS] + ['vpn-watchdog.timer']:
             previous = state['services'].get(unit)
             if previous is None or previous.get('active'):
@@ -202,7 +350,13 @@ def restore(dest):
         for member in archive.getmembers():
             if member.name.startswith("/") or ".." in Path(member.name).parts:
                 raise ValueError("Invalid backup member")
-        archive.extractall("/", filter="fully_trusted") if sys.version_info >= (3, 12) else archive.extractall("/")
+        # Root-owned backup preserves absolute admin symlinks and file metadata.
+        # Feature detection also handles Debian's Python 3.11 filter backport.
+        if hasattr(tarfile, 'fully_trusted_filter'):
+            archive.extractall("/", filter='fully_trusted')
+        else:
+            archive.extractall("/")
+    restore_watcher_policy(watcher_policy)
     for database in state['databases']:
         filename, target = database['backup'], database['path']
         if (dest / filename).exists():
@@ -215,6 +369,8 @@ def restore(dest):
     # Transparent Snell routing checks the actual Xray listeners at start.
     # Restore the managed core before dependent services, timers last.
     for unit, previous in sorted(state["services"].items(), key=lambda pair: (pair[0].endswith(".timer"), pair[0] != 'x-ui.service')):
+        if unit in EXTERNAL_WATCHDOGS:
+            continue
         if previous["enabled"] in ("enabled", "disabled"):
             if subprocess.run(["systemctl", "enable" if previous["enabled"] == "enabled" else "disable", unit]).returncode:
                 failures.append(unit + ": enable state")
@@ -246,7 +402,14 @@ def restore(dest):
 if __name__ == "__main__":
     if os.geteuid() != 0:
         sys.exit("Run as root")
-    mode, directory = sys.argv[1:3]
+    mode = sys.argv[1]
+    if mode == 'watchdog-check':
+        watchdog_preflight()
+        sys.exit(0)
+    if mode == 'watchdog-resume':
+        watchdog_resume()
+        sys.exit(0)
+    directory = sys.argv[2]
     dest = Path(directory).resolve()
     if not str(dest).startswith("/var/backups/x-manager-") or dest.stat().st_uid != 0 or dest.stat().st_mode & 0o077:
         sys.exit("Expected a root-owned private /var/backups/x-manager-* directory")
@@ -254,5 +417,9 @@ if __name__ == "__main__":
         snapshot(dest, sys.argv[3])
     elif mode == "restore":
         restore(dest)
+    elif mode == 'watchdog-pause':
+        watchdog_pause(dest)
+    elif mode == 'validate':
+        validate_backup(dest)
     else:
         sys.exit("Expected backup or restore")

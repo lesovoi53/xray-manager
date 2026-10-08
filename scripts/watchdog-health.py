@@ -222,6 +222,10 @@ class Health:
             for name in names:
                 path = self.path(name)
                 path.parent.mkdir(parents=True, exist_ok=True)
+                if name == HEALTH_LOCK:
+                    # This shared parent may be created first after boot under UMask=0077.
+                    # TUNA must be able to stat service-control inhibit markers beneath it.
+                    path.parent.chmod((path.parent.stat().st_mode & 0o777) | 0o111)
                 fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
                 stream = os.fdopen(fd, "a")
                 streams.append(stream)

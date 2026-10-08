@@ -1,6 +1,7 @@
 """Execute actual update entrypoint with isolated synthetic distributions."""
 import hashlib
 import io
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -21,7 +22,8 @@ class CandidateUpdate(unittest.TestCase):
                     if kind=='symlink':entry.type=tarfile.SYMTYPE;entry.linkname='/tmp/escape';entry.size=0
                     tar.addfile(entry,io.BytesIO(data) if kind!='symlink' else None)
             sha=checksum or hashlib.sha256(archive.read_bytes()).hexdigest()
-            result=subprocess.run(['bash',str(ROOT/'scripts/update-release.sh'),'--archive',str(archive),'--sha256',sha],text=True,capture_output=True,timeout=15)
+            result=subprocess.run(['bash',str(ROOT/'scripts/update-release.sh'),'--archive',str(archive),'--sha256',sha],text=True,capture_output=True,timeout=15,
+                                  env=dict(os.environ, PYTHONWARNINGS='error::DeprecationWarning'))
             return result,marker.exists()
 
     def test_verified_candidate_reaches_real_update_entrypoint(self):

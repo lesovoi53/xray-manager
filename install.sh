@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.07.1-rc1.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.08.1.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -20,9 +20,22 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
 fi
 . "$SCRIPT_DIR/scripts/installer-common.sh"
 xm_preflight
+if [ "${1:-}" = --recover-watchdog ]; then
+    [ "$#" = 1 ] || xm_die 'Usage: install.sh --recover-watchdog'
+    python3 "$SCRIPT_DIR/scripts/installer-state.py" watchdog-resume
+    exit
+fi
 if [ "${1:-}" = --rollback ]; then
-    [ -n "${2:-}" ] || xm_die 'Usage: install.sh --rollback /var/backups/x-manager-XXXXXXXX'
-    python3 "$2/installer-state.py" restore "$2"
+    [ "$#" = 2 ] || xm_die 'Usage: install.sh --rollback /var/backups/x-manager-XXXXXXXX'
+    for dependency in python3 ip iptables-save iptables-restore ip6tables-save ip6tables-restore; do
+        command -v "$dependency" >/dev/null || xm_die "Missing rollback dependency: $dependency"
+    done
+    xm_check_external_watchdog
+    # Validate the requested private snapshot before creating the recovery backup.
+    python3 "$SCRIPT_DIR/scripts/installer-state.py" validate "$2"
+    xm_begin
+    python3 "$XM_BACKUP/installer-state.py" restore "$2"
+    xm_finish
     exit
 fi
 case "${1:-}" in ''|--quick|--update|--direct|--manual|-m|--interactive|-i) ;; *) xm_die 'Unknown option';; esac
@@ -75,6 +88,7 @@ for dependency in curl wget jq unzip iptables iptables-save iptables-restore ope
     command -v "$dependency" >/dev/null || xm_die "Missing dependency: $dependency"
 done
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "Python 3.9 or newer is required before installation")'
+xm_check_external_watchdog
 port_plan=$(python3 "$SCRIPT_DIR/scripts/plan-ports.py")
 eval "$port_plan"
 WORK_DIR=$(mktemp -d)
@@ -726,7 +740,7 @@ PY
 python3 /usr/local/share/x-manager/scripts/tuna-watchdog.py defaults --attempts 5 --delay 30
 python3 /usr/local/share/x-manager/scripts/watchdog-health.py bootstrap --install-lock-fd 9 "${health_bootstrap_args[@]}" --human
 rm -f /etc/x-manager/volga-preview.lock
-XM_TRANSACTION=0
+xm_finish
 rm -rf -- "$WORK_DIR"
 echo "Rollback: bash /usr/local/share/x-manager/distribution/install.sh --rollback $XM_BACKUP"
 

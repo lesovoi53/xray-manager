@@ -3,19 +3,7 @@
 xm_die() { printf 'X-Manager: %s\n' "$*" >&2; exit 1; }
 
 xm_check_external_watchdog() {
-    local unit state status
-    for unit in vpn-watchdog.service vpn-watchdog.timer; do
-        state=$(systemctl is-active "$unit" 2>/dev/null) && status=0 || status=$?
-        case "$state" in
-            active|activating|reloading|deactivating)
-                xm_die "External watcher $unit is running. Explicitly stop the external watcher before maintenance; existing state was not changed.";;
-        esac
-        case "$status" in
-            0) xm_die "External watcher $unit is running. Explicitly stop the external watcher before maintenance; existing state was not changed.";;
-            3|4) ;; # Inactive or unknown unit; never stop/adopt it automatically.
-            *) xm_die "Cannot verify external watcher $unit; maintenance refused before changing existing state.";;
-        esac
-    done
+    python3 "$SCRIPT_DIR/scripts/installer-state.py" watchdog-check
 }
 
 xm_preflight() {
@@ -28,8 +16,6 @@ xm_preflight() {
     case "$(uname -m)" in x86_64) ;; *) xm_die 'Unsupported architecture';; esac
     for cmd in apt-get systemctl flock tar; do command -v "$cmd" >/dev/null || xm_die "Missing prerequisite: $cmd"; done
     [ -d /run/systemd/system ] || xm_die 'A running systemd is required.'
-    # Runs before install.sh's --rollback branch, including historical helpers.
-    xm_check_external_watchdog
     exec 9>/run/lock/x-manager-install.lock
     flock -n 9 || xm_die 'Another installation or rollback is running.'
 }
@@ -134,21 +120,44 @@ xm_begin() {
     chmod 0700 "$XM_BACKUP"
     cp "$SCRIPT_DIR/scripts/installer-state.py" "$XM_BACKUP/installer-state.py"
     python3 "$XM_BACKUP/installer-state.py" backup "$XM_BACKUP" "$SCRIPT_DIR/tuna-sub-server/tuna-subscriptions.py"
-    XM_TRANSACTION=1
     printf 'Backup: %s\n' "$XM_BACKUP"
+    # The EXIT trap also resumes a partially paused watchdog on stop failure.
+    XM_WATCHDOG_MAINTENANCE=1
+    echo 'Обслуживание: временная пауза активных vpn-watchdog.timer/service; автозапуск сохраняется.'
+    python3 "$XM_BACKUP/installer-state.py" watchdog-pause "$XM_BACKUP"
+    XM_TRANSACTION=1
 }
 
 xm_exit() {
     local status=$?
+    local rollback_failed=0
     trap - EXIT
     if [ "$status" -ne 0 ] && [ "${XM_TRANSACTION:-0}" = 1 ]; then
         printf 'Installation failed. Restoring backup: %s\n' "$XM_BACKUP" >&2
         if ! python3 "$XM_BACKUP/installer-state.py" restore "$XM_BACKUP"; then
             printf 'ROLLBACK FAILED. Keep backup %s and inspect services before retrying.\n' "$XM_BACKUP" >&2
+            rollback_failed=1
+        fi
+    fi
+    if [ "$rollback_failed" = 1 ]; then
+        printf 'Watchdog remains paused after rollback failure. Repair the saved backup state, then run install.sh --recover-watchdog.\n' >&2
+    elif [ "${XM_WATCHDOG_MAINTENANCE:-0}" = 1 ]; then
+        if ! python3 "$XM_BACKUP/installer-state.py" watchdog-resume; then
+            printf 'WATCHDOG RESTORE FAILED. Inspect /var/lib/x-manager/maintenance-watchdog.json; run install.sh --recover-watchdog after resolving the conflict.\n' >&2
+            status=1
         fi
     fi
     if [ -n "${WORK_DIR:-}" ] && [[ "$WORK_DIR" = /tmp/* ]]; then rm -rf -- "$WORK_DIR"; fi
     exit "$status"
 }
+
+xm_finish() {
+    XM_TRANSACTION=0
+    python3 "$XM_BACKUP/installer-state.py" watchdog-resume
+    XM_WATCHDOG_MAINTENANCE=0
+    echo 'Обслуживание завершено: исходное активное состояние vpn-watchdog восстановлено.'
+}
 trap xm_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap 'printf "Installation failed at line %s (exit %s).\n" "$LINENO" "$?" >&2' ERR

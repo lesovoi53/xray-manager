@@ -19,6 +19,26 @@ def load(path):
 
 
 class SnellStatusPermissions(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'POSIX permissions')
+    def test_boot_creators_keep_runtime_parent_searchable_under_private_umask(self):
+        control = load(ROOT/'scripts/service-control.py')
+        health = load(ROOT/'scripts/watchdog-health.py')
+        for first in ('health', 'lifecycle'):
+            with self.subTest(first=first), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root/'run/lock').mkdir(parents=True)
+                old = os.umask(0o077)
+                try:
+                    engine = health.Health(root) if first == 'health' else control.Controller(root)
+                    with engine.lock():
+                        parent = root/'run/x-manager'
+                        self.assertEqual(parent.stat().st_mode & 0o111, 0o111)
+                        self.assertEqual(parent.stat().st_mode & 0o066, 0)
+                    if first == 'health':
+                        self.assertEqual((parent/'healthcheck.lock').stat().st_mode & 0o777, 0o600)
+                finally:
+                    os.umask(old)
+
     @unittest.skipUnless(hasattr(os, 'geteuid') and os.geteuid() == 0, 'requires Linux root to drop privileges')
     def test_upgrade_and_repeated_writes_allow_subscription_reader_only_stat(self):
         control = load(Path(os.environ.get('XM_CONTROL_UNDER_TEST', ROOT/'scripts/service-control.py')))
@@ -34,7 +54,7 @@ class SnellStatusPermissions(unittest.TestCase):
                 for folder in (control.STATE_DIR, control.STATE_DIR+'/off', control.RUNTIME_DIR, control.RUNTIME_DIR+'/stopped'):
                     ctl.path(folder).mkdir(parents=True, exist_ok=True)
                     ctl.path(folder).chmod(0o700)
-                for folder in ('etc', 'etc/x-manager', 'run', 'run/x-manager'):
+                for folder in ('etc', 'run'):
                     (root/folder).chmod(0o755)
                 original = '{"version":1,"units":{}}\n'
                 ctl.state_path.write_text(original)

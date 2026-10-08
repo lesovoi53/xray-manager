@@ -41,7 +41,12 @@ with tarfile.open(root/'x-manager.tar.gz') as archive:
         p = pathlib.PurePosixPath(member.name)
         if p.is_absolute() or '..' in p.parts or not (member.isfile() or member.isdir()):
             sys.exit('Unsafe release archive')
-    archive.extractall(root/'source')
+    # Debian 12 backports extraction filters to Python 3.11. Detect capability,
+    # not the interpreter minor version; older versions use the checks above.
+    if hasattr(tarfile, 'data_filter'):
+        archive.extractall(root/'source', filter='data')
+    else:
+        archive.extractall(root/'source')
 PY
 test -s "$work/source/install.sh" || { echo 'Incomplete release archive' >&2; exit 1; }
 bash "$work/source/install.sh" --update

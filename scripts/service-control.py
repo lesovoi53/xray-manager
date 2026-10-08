@@ -86,9 +86,17 @@ class Controller:
     def ctl(self, *args):
         return self.run("systemctl", *args)
 
+    def searchable_parent(self, directory):
+        """Allow stat of known public markers without exposing private file data."""
+        if directory.is_symlink():
+            raise ValueError("Refusing symlink in lifecycle state: " + str(directory))
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod((directory.stat().st_mode & 0o777) | 0o111)
+
     @contextmanager
     def lock(self):
         directory = self.path(RUNTIME_DIR)
+        self.searchable_parent(directory.parent)
         directory.mkdir(parents=True, exist_ok=True)
         directory.chmod(0o711)
         with (directory / "lock").open("a") as stream:
@@ -112,6 +120,7 @@ class Controller:
         return state
 
     def save(self, state):
+        self.searchable_parent(self.state_path.parent.parent)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.parent.chmod(0o711)
         atomic_write(self.state_path, json.dumps(state, sort_keys=True, indent=2) + "\n")
@@ -294,6 +303,7 @@ class Controller:
         """Restore guards after installation; never enable or start a unit."""
         with self.lock():
             # Upgrade old installations without changing stop/off intent or file contents.
+            self.searchable_parent(self.state_path.parent.parent)
             for name in (STATE_DIR, STATE_DIR + "/off", RUNTIME_DIR + "/stopped"):
                 directory = self.path(name)
                 if directory.is_symlink():
