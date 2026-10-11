@@ -25,7 +25,7 @@ APT Debian. Xray, WDTT и CSQTT, установленные пользовате
 Загрузите `x-manager.tar.gz` и `SHA256SUMS` из одного выпуска:
 
 ```bash
-tag=v2026.10.08.3
+tag=v2026.10.11.0-rc1
 base="https://github.com/lesovoi53/xray-manager/releases/download/$tag"
 mkdir -p x-manager-install && cd x-manager-install
 curl -fLO "$base/x-manager.tar.gz"
@@ -101,6 +101,9 @@ sudo bash install.sh --rollback /var/backups/x-manager-XXXXXXXX
 не удаляются. Откат к более старой копии заменяет более новые данные.
 
 ## Приёмка
+
+Этот раздел сохраняет исторические результаты. Для выпуска 11 октября основной отчёт — [VERIFICATION_20261011_STEPS_1_4.txt](VERIFICATION_20261011_STEPS_1_4.txt), обновление семи VPS — [FLEET_20261011.txt](FLEET_20261011.txt). Debian 12 в новом цикле не проверялся.
+
 
 В изолированных Debian 12 и 13 amd64 с настоящим systemd прошли чистая
 установка, повторный запуск, проверки API HTTP 200 и WebDAV PROPFIND 207,

@@ -1,5 +1,7 @@
 # Opt-in local health checks
 
+> Исторический документ этапа 7 октября. Текущее поведение выпуска 11 октября, включая автосброс watchdog и автоматические пути настройки ресурсов, описано в [OPERATIONS.md](OPERATIONS.md) и [ENGINEERING.md](ENGINEERING.md).
+
 `watchdog-health.py` supplements bounded systemd crash recovery with explicit
 checks of a **currently running** service. It does not start inactive services,
 automatically adopt an external watchdog, or enable its timer. Installation

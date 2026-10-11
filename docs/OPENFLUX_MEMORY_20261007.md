@@ -1,5 +1,7 @@
 # OpenFlux memory: local diagnosis and candidate, 2026-10-07
 
+> Исторический документ этапа 7 октября. Текущее поведение выпуска 11 октября, включая автосброс watchdog и автоматические пути настройки ресурсов, описано в [OPERATIONS.md](OPERATIONS.md) и [ENGINEERING.md](ENGINEERING.md).
+
 ## Evidence boundary
 
 The parent task obtained a read-only snapshot of the existing Debian 13 host.

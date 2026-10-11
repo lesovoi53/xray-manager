@@ -1,6 +1,8 @@
 # Руководство для дальнейшей разработки
 
-Актуальная серверная база: **v2026.10.08.3**. Поддерживаемая платформа — Debian 12/13 amd64 с systemd. Android-клиент разрабатывается отдельно. Это руководство дополняет [пользовательскую документацию](USER_GUIDE.md), [описание Волги](VOLGA_SERVER.md) и [API](../tuna-sub-server/README.md).
+Актуальная серверная база: **v2026.10.11.0-rc1**, код `853056c6b8fd624cd162bbd9df31fa3cdafb7443`. Поддерживаемая платформа — Debian 12/13 amd64 с systemd. Android-клиент разрабатывается отдельно. Это руководство дополняет [пользовательскую документацию](USER_GUIDE.md), [описание Волги](VOLGA_SERVER.md) и [API](../tuna-sub-server/README.md).
+
+[Навигация по документации](INDEX.md) · [Эксплуатация и диагностика](OPERATIONS.md) · [Контракты и изменения](ENGINEERING.md)
 
 ## Карта кода
 
@@ -14,7 +16,13 @@
 | Xray и порты | `scripts/xray-discovery.py`, `detect-gateways.py`, `plan-ports.py`, routing-скрипты |
 | OpenFlux runtime | `systemd/openflux@.service`, `scripts/openflux-runner.sh`, `openflux-routing.sh` |
 | Волга / cookies | `scripts/openflux-volga.py`, `systemd/volga-cookies.*`, Windows-помощник |
-| Ограниченные рестарты | `scripts/tuna-watchdog.py`; постоянного watchdog-процесса нет |
+| Аварийные рестарты | `scripts/tuna-watchdog.py`, `openflux-watchdog.py`; systemd drop-in и общий бюджет OpenFlux |
+| Автосброс после исчерпания | `scripts/tuna-recovery.py`, `systemd/tuna-recovery.service`, `.timer` |
+| Проверки зависаний | `scripts/watchdog-health.py`, `tuna-healthcheck.service`, `.timer` |
+| Состояния stop/off | `scripts/service-control.py`; общий приоритет намерения пользователя |
+| Snell v6 и переключение | `snell6-endpoints.py`, `snell-switch.py`, `snell-subscriptions.py` |
+| Сеть и RAM | `network-profile.py`, `openflux-resources.py`, `network-diagnostics.py` |
+| Ежедневная перезагрузка | `reboot-schedule.py`; только выбранное расписание |
 | TUNA HTTP / SQLite / bundles | `tuna-sub-server/tuna-subscriptions.py` |
 | Группы автовыбора | `tuna-sub-server/tuna_connection_groups.py` и CLI этого каталога; контракт в `docs/CONNECTION_GROUPS_RC11.md` |
 | WebDAV и шифрование | `scripts/webdav-config.py`, `webdav-encryption.py`, runner и каталог TUNA |
@@ -49,7 +57,7 @@ Bundle имеет `schema=tuna.openflux.bundle`, `version=2`, идентифик
 
 Базовый upstream commit: `d13aa5b701c8ee5311aa638de16c70ea094d9dfd`. Сначала применяется `openflux-multistream.patch`, затем `openflux-volga-server.patch`. Второй патч рассчитан на уже изменённую первым патчем базу. Источником выбранных исправлений Волги служил [PR #115](https://github.com/p1neappleXpress/OpenFlux/pull/115), ревизия `ad516948d881009542ef7a89c01b3b5535bbc9dc`; это не полное включение PR или новой upstream main.
 
-Полный опубликованный source asset уже содержит оба патча. Повторно накладывать их на него нельзя. Он включает Go-модули и тесты, но не vendor-копию всех зависимостей; для чистой сборки нужен доступ к зависимостям либо подготовленный Go-cache. Установка на VPS использует готовые бинарники и не скачивает Go/upstream source.
+Закреплённый source asset содержит базовые multistream/Volga-патчи. Повторно накладывать их нельзя. Текущий build-openflux.sh строго, с --fuzz=0, добавляет по порядку openflux-memory.patch, openflux-cupsonline-rooms.patch, openflux-boards-heartbeat.patch и openflux-carriers-20261011.patch. В процессе добавляются три Go-регрессионных теста из tests/. Полный порядок и подготовку CRLF следует брать из самого build-openflux.sh, а не собирать вручную по именам файлов. Он включает Go-модули и тесты, но не vendor-копию всех зависимостей; для чистой сборки нужен доступ к зависимостям либо подготовленный Go-cache. Установка на VPS использует готовые бинарники и не скачивает Go/upstream source.
 
 В этой сборке собственный флаг `--upstream-socks5` охватывает CONNECT и UDP ASSOCIATE. Не заменять его автоматически на одноимённую/похожую upstream опцию: поведение UDP может отличаться. Новые upstream sessions/Noise/автоматический direct fallback не включались. Совместимость старых codec/encryption/multistream должна быть самостоятельным критерием миграции ядра.
 
@@ -72,11 +80,11 @@ Go-логи не должны содержать URL документов, relay
 
 ## Установка как транзакция
 
-Порядок: preflight ОС/архитектуры/systemd → зависимости и план портов → проверенная загрузка компонентов → snapshot → изменения → проверка конфигураций и служб → сохранение полного дистрибутива → commit.
+Общий путь: preflight ОС/архитектуры/systemd → зависимости, план портов и проверенная загрузка → snapshot перед заменой рабочих файлов → применение → валидация/проверки служб → сохранение полного дистрибутива → завершение транзакции. Это не ACID-транзакция для всей ОС: пакетные операции имеют отдельные ограничения, описанные ниже.
 
-`installer-state.py` — явный allowlist. При добавлении нового бинарника, unit или каталога добавляйте его в snapshot/restore одновременно с установкой. Таймеры имеют суффикс `.timer`, их нельзя автоматически записывать как `.service`. В этом выпуске в откат включены `openflux-volga-check`, `volga-cookies.service` и `.timer`.
+`installer-state.py` — явный allowlist. При добавлении нового бинарника, unit или каталога добавляйте его в snapshot/restore одновременно с установкой. Таймеры имеют суффикс `.timer`, их нельзя автоматически записывать как `.service`. В откат включены также `openflux-volga-check`, `volga-cookies.service`/`.timer`, recovery service/timer и их управляемое состояние; полный список всегда проверяйте в коде snapshot.
 
-Пакеты APT и созданные системные пользователи не удаляются откатом. Новые watchdog drop-in не создаются установщиком: настройка через меню имеет собственную копию. Уже существующие политики сохраняются. Не перезаписывать instance override ради единообразия шаблона.
+Пакеты APT и созданные системные пользователи не удаляются откатом. Установщик создаёт базовые управляемые watchdog-политики для подходящих служб и включает собственное восстановление. Точно распознанные старые политики мигрируют; существующие пользовательские бюджеты OpenFlux и ручной stop/off сохраняются. Неизвестные политики нельзя молча считать своими. Не перезаписывать instance override ради единообразия шаблона.
 
 В ранней тестовой установке может остаться `volga-preview.lock` и старый update-helper, который отказывается обновляться. Для неё выполните полную установку закреплённого выпуска по [инструкции релиза](RELEASE_20260929.md); установщик удаляет маркер только после успешных проверок. Не удалять защиту вручную перед загрузкой неизвестного комплекта.
 
@@ -108,6 +116,9 @@ for script in install.sh bin/x-manager scripts/*.sh; do bash -n "$script" || exi
 6. Проверьте опубликованный tag/commit и доступность полного комплекта. GitHub-публикация сама по себе не даёт разрешения обновлять остальные VPS.
 
 ## Открытые границы
+
+Актуальная матрица проверок и ограничения: [ENGINEERING.md](ENGINEERING.md#матрица-приёмки). Старые записи о конкретных rc клиента являются историческими и требуют повторной проверки.
+
 
 - SmartCaptcha остаётся ручной; её частота определяется Яндексом. Нет гарантии бессрочной работы одного файла cookies.
 - Изменения внешнего API возможны; не обещать вечную совместимость закреплённого бинарника.
