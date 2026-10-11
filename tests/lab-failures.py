@@ -35,7 +35,11 @@ if mode in ('dependency', 'download'):
     command = tools / name
     command.write_text('#!/bin/sh\necho "Injected ' + mode + ' failure" >&2\nexit 22\n')
     command.chmod(0o755)
-    run_failure(source, mode, dict(os.environ, PATH=str(tools) + ':' + os.environ['PATH']))
+    env = dict(os.environ, PATH=str(tools) + ':' + os.environ['PATH'])
+    if mode == 'download':
+        # Exercise the network path even when the lab has verified local assets.
+        env.pop('XM_COMPONENT_DIR', None)
+    run_failure(source, mode, env)
 elif mode == 'service':
     # The real newly installed service exits with failure. No systemctl mock.
     installer = source / 'install.sh'

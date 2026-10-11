@@ -69,6 +69,28 @@ class HealthContract(unittest.TestCase):
     def outcome(self):
         return self.engine.check()["units"][0]
 
+    def test_exhausted_budget_resumes_at_300_seconds_and_survives_reload(self):
+        self.engine.configure("set", "snell", settings(failures=1, cooldown=5, max_restarts=5))
+        for _ in range(5):
+            self.assertEqual(self.outcome()["status"], "restarted")
+            self.clock += 5
+        self.clock += 294
+        self.assertEqual(self.outcome()["status"], "exhausted")
+        self.engine = health.Health(self.root, self.services.command,
+                                   lambda spec, pid: (False, "synthetic probe"),
+                                   lambda: self.clock, self.services)
+        self.clock += 1
+        self.assertEqual(self.outcome()["status"], "restarted")
+        self.assertEqual(self.outcome()["status"], "cooldown")
+
+    def test_exhausted_budget_never_overrides_manual_stop(self):
+        self.engine.configure("set", "snell", settings(failures=1, cooldown=5, max_restarts=1))
+        self.assertEqual(self.outcome()["status"], "restarted")
+        self.clock += 301
+        self.services.inhibited = True
+        self.assertEqual(self.outcome()["status"], "skipped")
+        self.assertEqual(len(self.services.restarts), 1)
+
     def test_consecutive_failures_cooldown_and_persistent_restart_limit(self):
         self.assertEqual(self.outcome()["status"], "unhealthy")
         self.assertEqual(self.outcome()["status"], "restarted")
@@ -300,6 +322,19 @@ class BootstrapServices:
 
 
 class BootstrapContract(unittest.TestCase):
+    def test_installer_migrates_only_exact_old_baseline_and_backs_it_up(self):
+        previous = dict(kind='xray', host='127.0.0.1', port=None, path='/',
+                        failures=2, cooldown=60, max_restarts=5, timeout=3)
+        self.engine.save(health.CONFIG, {'schema': 1, 'units': {'x-ui.service': previous}})
+        before = self.engine.path(health.CONFIG).read_bytes()
+        with mock.patch.object(self.engine, 'lock', return_value=contextlib.nullcontext(True)):
+            result = self.engine.bootstrap(install_lock_fd=9)
+            self.assertEqual(result['status'], 'migrated')
+            self.assertEqual(Path(result['backup']).read_bytes(), before)
+            self.assertEqual(self.engine.read_json(health.CONFIG)['units']['x-ui.service']['cooldown'], 30)
+            self.assertEqual(self.engine.bootstrap(install_lock_fd=9)['status'], 'preserved')
+        self.assertEqual(self.services.mutations, [])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -313,7 +348,7 @@ class BootstrapContract(unittest.TestCase):
         self.assertEqual(result["status"], "configured")
         check = self.engine.read_json(health.CONFIG)["units"]["x-ui.service"]
         self.assertEqual((check["kind"], check["failures"], check["max_restarts"], check["cooldown"], check["timeout"]),
-                         ("xray", 2, 5, 60, 3))
+                         ("xray", 2, 5, 30, 3))
         before = self.engine.path(health.CONFIG).read_bytes()
         mutations = list(self.services.mutations)
         self.assertEqual(self.engine.bootstrap(enable_timer=True)["status"], "preserved")

@@ -250,6 +250,23 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(self.tool.plan(adaptive=True)['preflight_ready'])
         self.assertEqual(self.calls, [])
 
+    def test_adaptive_ignores_explicit_admin_value_overridden_by_later_file(self):
+        self.adaptive_fixture()
+        key = 'net.core.rmem_max'
+        desired = self.tool.plan(adaptive=True)['desired'][key]
+        self.write('/etc/sysctl.d/99-csqtt.conf', key + '=99999999\n')
+        self.write('/etc/sysctl.d/99-network.conf', key + '=' + desired + '\n')
+        self.assertTrue(self.tool.plan(adaptive=True)['preflight_ready'])
+        self.write('/etc/sysctl.d/99-network.conf', key + '=99999999\n')
+        self.assertFalse(self.tool.plan(adaptive=True)['preflight_ready'])
+        self.assertEqual(self.calls, [])
+
+    def test_adaptive_keeps_wildcard_conflicts_conservative(self):
+        self.adaptive_fixture()
+        self.write('/etc/sysctl.d/99-a.conf', 'net.core.*mem_max=99999999\n')
+        self.write('/etc/sysctl.d/99-z.conf', 'net.core.rmem_max=16777216\n')
+        self.assertFalse(self.tool.plan(adaptive=True)['preflight_ready'])
+
     def test_adaptive_prepared_rollback_and_admin_runtime_change(self):
         self.adaptive_fixture()
         self.tool.prepare(adaptive=True)

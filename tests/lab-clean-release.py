@@ -6,8 +6,12 @@ import subprocess
 
 assert Path('/.x-manager-test-lab').is_file(), 'Disposable lab only'
 root = Path('/work/x-manager')
-pristine = [p.parent for p in Path('/var/backups').glob('x-manager-*/state.json')
-            if '/etc/snell' not in json.loads(p.read_text())['present']]
+pristine = []
+for p in Path('/var/backups').glob('x-manager-*/state.json'):
+    state = json.loads(p.read_text())
+    # Other X-Manager helpers also keep state.json, with different schemas.
+    if 'present' in state and '/etc/snell' not in state['present']:
+        pristine.append(p.parent)
 if pristine:
     backup = min(pristine, key=lambda p: p.stat().st_mtime)
     subprocess.run(['python3', str(backup/'installer-state.py'), 'restore', str(backup)], check=True)

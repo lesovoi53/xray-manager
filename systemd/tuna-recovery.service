@@ -1,0 +1,9 @@
+[Unit]
+Description=TUNA recovery after exhausted restart budget
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/share/x-manager/scripts/tuna-recovery.py
+TimeoutStartSec=120
+UMask=0077

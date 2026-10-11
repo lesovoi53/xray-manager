@@ -134,8 +134,22 @@ class Profile:
                         else:
                             value = " ".join(value.split())
                         records.append({"key": target, "value": value, "file": name, "line": line_no,
+                                        "explicit": key == target,
                                         "potential_later_override": path.name >= Path(CONFIG).name or
                                         name == "/etc/sysctl.conf"})
+        # Exact assignments within /etc/sysctl.d have unambiguous filename/line
+        # precedence. Keep all records for diagnosis, but do not treat an earlier
+        # replaced assignment as a current conflict. Wildcards and cross-directory
+        # shadowing remain conservative; /etc/sysctl.conf is considered separately.
+        latest = {}
+        for record in records:
+            if record['explicit'] and Path(record['file']).parent == Path('/etc/sysctl.d'):
+                rank = (Path(record['file']).name, record['line'])
+                latest[record['key']] = max(latest.get(record['key'], rank), rank)
+        for record in records:
+            record['superseded'] = (record['explicit'] and
+                Path(record['file']).parent == Path('/etc/sysctl.d') and
+                (Path(record['file']).name, record['line']) < latest[record['key']])
         return records
 
     def plan(self, adaptive=False):
@@ -148,7 +162,7 @@ class Profile:
         if "bbr" not in available:
             blockers.append("BBR is not available in the running kernel; no modules will be loaded automatically.")
         for declaration in declarations:
-            if declaration["potential_later_override"] and declaration["value"] != VALUES[declaration["key"]]:
+            if not declaration['superseded'] and declaration["potential_later_override"] and declaration["value"] != VALUES[declaration["key"]]:
                 blockers.append("Potential later override: %s:%d (%s)" % (
                     declaration["file"], declaration["line"], declaration["key"]))
         config = self.path(CONFIG)
@@ -378,7 +392,7 @@ class Profile:
                 warnings.append("Сохранён больший текущий лимит: " + key)
         declarations = self.source_declarations(ADAPTIVE)
         for declaration in declarations:
-            if declaration["key"] not in desired:
+            if declaration['superseded'] or declaration["key"] not in desired:
                 continue
             admin = declaration["file"].startswith(("/etc/", "/run/"))
             if (declaration["potential_later_override"] or admin) and declaration["value"] != desired[declaration["key"]]:

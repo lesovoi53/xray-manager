@@ -18,11 +18,11 @@ import tempfile
 
 SERVICES = ["tuna-subscriptions", "webdav-tunnel", "snell", "mita", "wdtt",
             "wdtt-tproxy", "csqtt", "masterdns", "cottendns", "x-ui", "volga-cookies",
-            "xray", "sing-box", "caddy", "vpn-watchdog", "tuna-watchdog", "tuna-healthcheck", "fail2ban"]
+            "xray", "sing-box", "caddy", "vpn-watchdog", "tuna-watchdog", "tuna-healthcheck", "tuna-recovery", "fail2ban"]
 UNITS = tuple([name + ".service" for name in SERVICES]
               + ["openflux@%d.service" % i for i in range(1, 9)]
               + ["snell6@%d.service" % i for i in range(1, 9)]
-              + ["volga-cookies.timer", "vpn-watchdog.timer", "tuna-watchdog.timer", "tuna-healthcheck.timer"])
+              + ["volga-cookies.timer", "vpn-watchdog.timer", "tuna-watchdog.timer", "tuna-healthcheck.timer", "tuna-recovery.timer"])
 EXTERNAL_WATCHDOGS = ("vpn-watchdog.service", "vpn-watchdog.timer",
                       "tuna-watchdog.service", "tuna-watchdog.timer")
 STATE_DIR = "/etc/x-manager/service-control"

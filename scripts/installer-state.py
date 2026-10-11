@@ -144,6 +144,8 @@ PATHS += ['/etc/modules-load.d/90-tuna-network.conf',
           '/etc/systemd/system/x-manager-reboot.timer.d']
 PATHS += ['/var/lib/webdav-tunnel']
 SERVICES = ['x-manager-reboot.timer', 'x-manager-reboot.service'] + SERVICES
+SERVICES += ['tuna-recovery.timer','tuna-recovery.service']
+PATHS += ['/etc/systemd/system/tuna-recovery.timer','/etc/systemd/system/tuna-recovery.service']
 for unit in SERVICES:
     guard='/etc/systemd/system/'+unit+'.d/95-tuna-service-control.conf'
     if not any(guard.startswith(p.rstrip('/')+'/') for p in PATHS):
@@ -465,6 +467,12 @@ def restore(dest):
                 except (OSError, RuntimeError) as error:
                     failures.append(unit+': '+str(error))
                     continue
+            # Restoring a previously active service is explicit maintenance,
+            # not another crash retry. Repeated upgrades/rollbacks otherwise
+            # exhaust StartLimitIntervalSec=infinity even for healthy services.
+            if subprocess.run(["systemctl", "reset-failed", unit]).returncode:
+                failures.append(unit + ": reset maintenance start limit")
+                continue
             if subprocess.run(["systemctl", "start", unit]).returncode:
                 failures.append(unit + ": start")
     with open(dest / "iptables") as f:

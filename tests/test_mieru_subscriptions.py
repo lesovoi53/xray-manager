@@ -34,6 +34,29 @@ def model(mode=1, rotation=7):
                 entropy=m.entropy(original))
 
 
+class MieruExportCompatibility(unittest.TestCase):
+    def test_max_preset_retains_legacy_slash_and_padding(self):
+        pattern = 'EAEaBAgBEBQiCAgBEAEYBiAIKgYIgAEQ/wEyBAgBEAc='
+        value = dict(config=dict(users=[dict(name='demo', password='synthetic:+&@')],
+                     portBindings=[dict(portRange='2020-2030', protocol='TCP')]),
+                     payload=pattern, entropy={})
+        uri = m.export(value, '192.0.2.1', 'demo', 'Name + & /')['uri']
+        wire = urlsplit(uri).query.split('traffic-pattern=', 1)[1].split('&', 1)[0]
+        # Older clients pass slash/padding directly to their Base64 decoder.
+        self.assertEqual(wire, pattern)
+        self.assertEqual(len(base64.b64decode(wire, validate=True)), 32)
+        self.assertEqual(parse_qs(urlsplit(uri).query)['profile'], ['Name + & /'])
+        self.assertEqual(unquote(urlsplit(uri).password), 'synthetic:+&@')
+
+    def test_plus_is_not_changed_to_a_space_by_standard_url_parsers(self):
+        pattern = base64.b64encode(b'\xfb\xff').decode()
+        value = dict(config=dict(users=[dict(name='demo', password='synthetic')],
+                     portBindings=[dict(port=2020, protocol='TCP')]), payload=pattern, entropy={})
+        uri = m.export(value, '192.0.2.1', 'demo', 'Synthetic')['uri']
+        self.assertIn('traffic-pattern=%2B/8=', uri)
+        self.assertEqual(base64.b64decode(parse_qs(urlsplit(uri).query)['traffic-pattern'][0]), b'\xfb\xff')
+
+
 class MieruSubscriptions(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

@@ -31,6 +31,156 @@ class Controller:
 
 
 class SharedBudget(unittest.TestCase):
+    def test_recovery_start_and_execcondition_spend_exactly_one_attempt(self):
+        self.budget.now = lambda: 1000
+        self.budget.configure(5, 5)
+        unit = wd.UNITS[0]
+        self.states[unit] = {'NRestarts': '8', 'Result': 'exec-condition'}
+        wd.atomic(self.budget.path(wd.STATE), wd.encoded({
+            'version': 1, 'spent': 5, 'receipts': {}, 'exhausted_at': 700, 'pending': [unit]}))
+        original = self.command
+        self.budget.run = lambda *args: '' if args[1] == 'start' else original(*args)
+        self.budget.recover()
+        self.assertEqual(self.budget.status()['spent'], 1)
+        self.assertTrue(self.budget.gate(unit))
+        self.assertEqual(self.budget.status()['spent'], 1)
+        self.states[unit]['InvocationID'] = '2' * 32
+        self.assertTrue(self.budget.gate(unit))
+        self.assertEqual(self.budget.status()['spent'], 2)
+
+    def test_explicit_start_is_not_blocked_by_external_watcher(self):
+        self.budget.configure(5, 5)
+        self.controller.pollers = [{'conflict': True}]
+        before = self.budget.path(wd.STATE).read_bytes()
+        self.assertTrue(self.budget.gate(wd.UNITS[0]))
+        self.assertEqual(self.budget.path(wd.STATE).read_bytes(), before)
+        self.states[wd.UNITS[0]] = {'NRestarts': '1'}
+        with self.assertRaises(ValueError):
+            self.budget.gate(wd.UNITS[0])
+
+    def test_failed_recovery_preserves_condition_and_respects_delay(self):
+        self.budget.now = lambda: 1000
+        self.budget.configure(5, 5)
+        unit = wd.UNITS[0]
+        self.states[unit] = {'NRestarts': '7', 'Result': 'exec-condition'}
+        wd.atomic(self.budget.path(wd.STATE), wd.encoded({
+            'version': 1, 'spent': 5, 'receipts': {}, 'exhausted_at': 700, 'pending': [unit]}))
+        original, calls = self.command, []
+        def run(*args):
+            if args[1] == 'reset-failed':
+                self.fail('reset-failed would erase the reason for resuming this channel')
+            if args[1] == 'start':
+                calls.append(args)
+                raise RuntimeError('synthetic start failure')
+            return original(*args)
+        self.budget.run = run
+        with self.assertRaises(RuntimeError): self.budget.recover()
+        self.assertEqual(self.budget.recover()['status'], 'cooldown')
+        self.assertEqual(len(calls), 1)
+        self.budget.now = lambda: 1005
+        with self.assertRaises(RuntimeError): self.budget.recover()
+        self.assertEqual(self.budget.status()['spent'], 2)
+
+    def test_recovery_never_exceeds_shared_budget_with_multiple_waiting_channels(self):
+        self.budget.now = lambda: 1000
+        self.budget.configure(2, 5)
+        waiting = list(wd.UNITS[:3])
+        for unit in waiting:
+            self.states[unit] = {'NRestarts': '2', 'Result': 'exec-condition'}
+        wd.atomic(self.budget.path(wd.STATE), wd.encoded({
+            'version': 1, 'spent': 2, 'receipts': {}, 'exhausted_at': 700,
+            'pending': waiting,
+        }))
+        original, calls = self.command, []
+        def run(*args):
+            if args[1] in ('reset-failed', 'start'):
+                calls.append(args)
+                return ''
+            return original(*args)
+        self.budget.run = run
+        self.assertEqual(self.budget.recover()['started'], waiting[:2])
+        state = self.budget.read(wd.STATE)
+        self.assertEqual(state['spent'], 2)
+        self.assertEqual(state['pending'], waiting[2:])
+        self.assertEqual([row for row in calls if row[1] == 'start'], [
+            ('systemctl', 'start', '--no-block', waiting[0]),
+            ('systemctl', 'start', '--no-block', waiting[1]),
+        ])
+
+    def test_timer_recovers_only_budget_blocked_channels_after_300_seconds(self):
+        self.budget.now = lambda: 1000
+        self.budget.configure(1, 5)
+        self.budget.reserve(wd.UNITS[0], 'used')
+        self.states[wd.UNITS[0]] = {'NRestarts': '2', 'Result': 'exec-condition'}
+        self.assertFalse(self.budget.gate(wd.UNITS[0]))
+        self.budget.now = lambda: 1299
+        self.assertEqual(self.budget.recover()['status'], 'cooldown')
+        self.budget.now = lambda: 1300
+        original = self.command
+        starts = []
+        def run(*args):
+            if args[1] in ('reset-failed', 'start'):
+                starts.append(args)
+                return ''
+            return original(*args)
+        self.budget.run = run
+        self.assertEqual(self.budget.recover()['started'], [wd.UNITS[0]])
+        self.assertEqual(starts[-1], ('systemctl', 'start', '--no-block', wd.UNITS[0]))
+        self.assertEqual(self.budget.status()['spent'], 1)
+        self.assertEqual(self.budget.recover()['started'], [])
+
+    def test_timer_preserves_manual_stop_and_off_after_exhaustion(self):
+        self.budget.now = lambda: 1000
+        self.budget.configure(1, 5)
+        self.budget.reserve(wd.UNITS[0], 'used')
+        for unit in wd.UNITS[:2]:
+            self.states[unit] = {'NRestarts': '2', 'Result': 'exec-condition'}
+            self.assertFalse(self.budget.gate(unit))
+        self.controller.off.add(wd.UNITS[0])
+        self.states[wd.UNITS[1]]['Result'] = 'success'
+        self.budget.now = lambda: 1300
+        self.assertEqual(self.budget.recover()['started'], [])
+        self.assertEqual(self.budget.read(wd.STATE)['pending'], [])
+
+    def test_external_watchdog_blocks_recovery_without_resetting_budget(self):
+        self.budget.now = lambda: 1000
+        self.budget.configure(1, 5)
+        self.budget.reserve(wd.UNITS[0], 'used')
+        self.states[wd.UNITS[0]] = {'NRestarts': '2', 'Result': 'exec-condition'}
+        self.assertFalse(self.budget.gate(wd.UNITS[0]))
+        before = self.budget.path(wd.STATE).read_bytes()
+        self.budget.now = lambda: 1300
+        self.controller.pollers = [{'conflict': True}]
+        with self.assertRaises(ValueError):
+            self.budget.recover()
+        self.assertEqual(self.budget.path(wd.STATE).read_bytes(), before)
+        self.assertEqual(self.commands, [('systemctl', 'daemon-reload')])
+
+    def test_failed_recovery_start_spends_one_attempt_and_waits_before_retry(self):
+        self.budget.now = lambda: 1000
+        self.budget.configure(1, 5)
+        unit = wd.UNITS[0]
+        self.budget.reserve(unit, 'used')
+        self.states[unit] = {'NRestarts': '2', 'Result': 'exec-condition'}
+        self.assertFalse(self.budget.gate(unit))
+        self.budget.now = lambda: 1300
+        original, starts = self.command, []
+        def run(*args):
+            if args[1] == 'reset-failed':
+                return ''
+            if args[1] == 'start':
+                starts.append(args)
+                raise RuntimeError('synthetic start failure')
+            return original(*args)
+        self.budget.run = run
+        with self.assertRaisesRegex(RuntimeError, 'synthetic start failure'):
+            self.budget.recover()
+        state = self.budget.read(wd.STATE)
+        self.assertEqual(state['spent'], 1)
+        self.assertEqual(state['pending'], [unit])
+        self.assertEqual(self.budget.recover()['status'], 'cooldown')
+        self.assertEqual(len(starts), 1)
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

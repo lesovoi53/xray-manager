@@ -12,7 +12,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/installer-common.sh" ]; then
     command -v curl >/dev/null || { echo 'curl is required to download the distribution' >&2; exit 1; }
     bundle=$(mktemp -d)
     trap 'rm -rf -- "$bundle"' EXIT
-    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.08.4.tar.gz" -o "$bundle/source.tar.gz"
+    curl -fL --retry 2 "https://github.com/lesovoi53/xray-manager/archive/refs/tags/v2026.10.11.0-rc1.tar.gz" -o "$bundle/source.tar.gz"
     mkdir "$bundle/source"
     tar -xzf "$bundle/source.tar.gz" --strip-components=1 -C "$bundle/source"
     bash "$bundle/source/install.sh" "$@"
@@ -700,6 +700,7 @@ install -m 0644 "$SCRIPT_DIR/scripts/webdav-access.py" /usr/local/share/x-manage
 install -m 0644 "$SCRIPT_DIR/scripts/installer-state.py" /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/"{service-control.py,openflux-resources.py,network-diagnostics.py,network-profile.py,watchdog-health.py,openflux-watchdog.py,snell6-endpoints.py,snell-switch.py} /usr/local/share/x-manager/scripts/
 install -m 0644 "$SCRIPT_DIR/scripts/reboot-schedule.py" /usr/local/share/x-manager/scripts/
+install -m 0644 "$SCRIPT_DIR/scripts/tuna-recovery.py" /usr/local/share/x-manager/scripts/
 # Capture prior timer existence: upgrades preserve an existing disabled timer.
 health_bootstrap_args=()
 if [ "$(systemctl show tuna-healthcheck.timer -p LoadState --value)" = not-found ]; then
@@ -709,6 +710,8 @@ fi
 # Existing administrator masks and lifecycle intent remain authoritative.
 xm_install_asset systemd/tuna-healthcheck.service /etc/systemd/system/tuna-healthcheck.service 0644
 xm_install_asset systemd/tuna-healthcheck.timer /etc/systemd/system/tuna-healthcheck.timer 0644
+xm_install_asset systemd/tuna-recovery.service /etc/systemd/system/tuna-recovery.service 0644
+xm_install_asset systemd/tuna-recovery.timer /etc/systemd/system/tuna-recovery.timer 0644
 xm_install_asset systemd/x-manager-reboot.service /etc/systemd/system/x-manager-reboot.service 0644
 xm_install_asset systemd/snell6@.service /etc/systemd/system/snell6@.service 0644
 systemctl daemon-reload
@@ -772,7 +775,10 @@ for unit, previous in json.load(open(sys.argv[1]))['services'].items():
         subprocess.run(['systemctl', 'disable', unit], check=True)
 PY
 # Complete within the installer backup transaction. Existing custom policies win.
-python3 /usr/local/share/x-manager/scripts/tuna-watchdog.py defaults --attempts 5 --delay 30
+XM_WATCHDOG_TRANSACTION=1 python3 /usr/local/share/x-manager/scripts/tuna-watchdog.py migrate-auto-reset
+python3 /usr/local/share/x-manager/scripts/tuna-watchdog.py defaults --attempts 5 --delay 5
+xm_enable tuna-recovery.timer
+xm_service tuna-recovery.timer
 python3 /usr/local/share/x-manager/scripts/watchdog-health.py bootstrap --install-lock-fd 9 "${health_bootstrap_args[@]}" --human
 rm -f /etc/x-manager/volga-preview.lock
 xm_finish

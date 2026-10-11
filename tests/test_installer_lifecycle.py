@@ -9,10 +9,11 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 
 class InstallerLifecycle(unittest.TestCase):
-    def exercise(self,operation,previous,policy=0):
+    def exercise(self,operation,previous,policy=0,unit='snell'):
         with tempfile.TemporaryDirectory() as d:
             base=Path(d);(base/'scripts').mkdir();(base/'backup').mkdir()
-            (base/'backup/state.json').write_text(json.dumps({'services':{'snell.service':previous}}))
+            name=unit if unit.endswith(('.service','.timer')) else unit+'.service'
+            (base/'backup/state.json').write_text(json.dumps({'services':{name:previous}}))
             (base/'scripts/service-control.py').write_text('raise SystemExit('+str(policy)+')\n')
             script=r'''
 set -e
@@ -21,11 +22,16 @@ SCRIPT_DIR="$FIXTURE"
 XM_BACKUP="$FIXTURE/backup"
 systemctl() { printf '%s\n' "$*" >> "$FIXTURE/commands"; }
 sleep() { :; }
-"$OPERATION" snell
+"$OPERATION" "$UNIT"
 '''
-            result=subprocess.run(['bash','-c',script],env=dict(os.environ,COMMON=str(ROOT/'scripts/installer-common.sh'),FIXTURE=d,OPERATION=operation),text=True,capture_output=True)
+            result=subprocess.run(['bash','-c',script],env=dict(os.environ,COMMON=str(ROOT/'scripts/installer-common.sh'),FIXTURE=d,OPERATION=operation,UNIT=unit),text=True,capture_output=True)
             commands=(base/'commands').read_text() if (base/'commands').exists() else ''
             return result,commands
+
+    def test_update_preserves_stopped_recovery_timer(self):
+        result,commands=self.exercise('xm_service',{'enabled':'enabled','active':False},unit='tuna-recovery.timer')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(commands,'')
 
     def test_update_never_reenables_existing_units(self):
         for mode in ('disabled','masked','masked-runtime','static','enabled','enabled-runtime'):
@@ -45,6 +51,7 @@ sleep() { :; }
     def test_update_restarts_previously_running_service(self):
         result,commands=self.exercise('xm_service',{'enabled':'enabled','active':True})
         self.assertEqual(result.returncode,0,result.stderr);self.assertIn('restart snell',commands)
+        self.assertLess(commands.index('reset-failed snell'), commands.index('restart snell'))
 
     def test_inhibit_wins_over_previous_active_state(self):
         result,commands=self.exercise('xm_service',{'enabled':'enabled','active':True},policy=1)

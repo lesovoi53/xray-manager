@@ -14,5 +14,6 @@ command=re.search(r'^Rollback: (.+)$',log.read_text(),re.M).group(1)
 assert '/usr/local/share/x-manager/distribution/install.sh' in command
 assert Path('/usr/local/share/x-manager/distribution/scripts/menu-actions.tsv').is_file()
 result=subprocess.run(['bash','-c',command],env=env,capture_output=True,text=True)
+Path('/tmp/xm-persistent-rollback.log').write_text(result.stdout + '\n' + result.stderr)
 assert result.returncode==0, 'Printed rollback command failed'
 print('PASS: complete persistent distribution installed; printed rollback command restores backup successfully')

@@ -30,9 +30,11 @@ patch --batch --forward --fuzz=0 -p1 -d "$work/openflux" < "$source_dir/patches/
 install -m 0644 "$source_dir/tests/openflux_cupsonline_memory_test.go" "$work/openflux/transport/cupsonline/memory_retention_test.go"
 install -m 0644 "$source_dir/tests/openflux_cupsonline_rooms_test.go" "$work/openflux/transport/cupsonline/configured_rooms_test.go"
 install -m 0644 "$source_dir/tests/openflux_boards_heartbeat_test.go" "$work/openflux/transport/yandex/boards_heartbeat_test.go"
+find "$work/openflux/transport" -name '*.go' -exec sed -i 's/\r$//' {} +
+patch --batch --forward --fuzz=0 -p1 -d "$work/openflux" < "$source_dir/patches/openflux-carriers-20261011.patch"
 (
     cd "$work/openflux"
-    export CGO_ENABLED=0 GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 GOFLAGS=-mod=readonly
+    export CGO_ENABLED=0 GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 GOFLAGS='-mod=readonly -buildvcs=false'
     go test ./...
     go build -trimpath -ldflags='-s -w' -o "$work/openflux-bin" .
     go build -trimpath -ldflags='-s -w' -o "$work/check-bin" ./cmd/volga-check

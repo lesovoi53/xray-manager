@@ -91,7 +91,7 @@ class Defaults(unittest.TestCase):
         self.assertEqual(first['changed'], ['snell', 'mita', 'xray', 'x-ui', 'snell6@1'])
         self.assertIn({'unit': 'snell6@2', 'reason': 'no-endpoint'}, first['skipped'])
         self.assertIn('StartLimitBurst=6', self.path('snell').read_text())
-        self.assertIn('RestartSec=30s', self.path('snell').read_text())
+        self.assertIn('RestartSec=5s', self.path('snell').read_text())
         self.assertEqual(self.controller.stopped, {'snell'})
         second = watchdog.defaults()
         self.assertEqual(second['changed'], [])
@@ -160,6 +160,28 @@ class Defaults(unittest.TestCase):
             watchdog.defaults()
         self.assertFalse(list(self.units.iterdir()))
         self.assertEqual(self.commands, [('daemon-reload',)])
+
+    def test_repeat_update_preserves_new_custom_policy(self):
+        self.file(self.path('mita'), watchdog.render(12, 17))
+        with patch.dict('os.environ', {'XM_WATCHDOG_TRANSACTION': '1'}), patch.object(watchdog, 'apply') as apply:
+            watchdog.migrate_auto_reset()
+        apply.assert_not_called()
+
+    def test_installer_migrates_only_exact_owned_policies(self):
+        old_header = '# Managed by TUNA watchdog; reset limit explicitly from the menu.\n'
+        def old_policy(restart, delay):
+            return (old_header + '[Unit]\nStartLimitIntervalSec=infinity\nStartLimitBurst=4\n'
+                    '[Service]\nRestart=' + restart + '\nRestartSec=' + str(delay) + 's\n')
+        self.file(self.path('snell'), old_policy('on-failure', 30))
+        self.file(self.path('x-ui'), old_policy('on-failure', 60))
+        self.file(self.path('mita'), '[Service]\nRestart=on-failure\nRestartSec=9s\n')
+        self.file(self.path('snell6@1'), old_policy('no', 30))
+        self.controller.off.add('snell6@1')
+        calls = []
+        with patch.dict('os.environ', {'XM_WATCHDOG_TRANSACTION': '1'}, clear=False), \
+             patch.object(watchdog, 'apply', side_effect=lambda *args: calls.append(args)):
+            watchdog.migrate_auto_reset()
+        self.assertEqual(calls, [('snell', 5, 5), ('x-ui', 5, 30)])
 
 
 if __name__ == '__main__':

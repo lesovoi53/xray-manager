@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local health checks with a guarded first-install Xray recovery default.
 
-Restart budgets persist until an explicit reset. External polling watchdogs,
+Restart budgets persist across processes and reset 300 seconds after exhaustion. External polling watchdogs,
 manual lifecycle inhibition, inactive units and installer maintenance inhibit
 restarts. TCP/HTTP checks are local observations, not VPN egress tests.
 """
@@ -56,7 +56,7 @@ def validate_spec(spec):
         raise ValueError("invalid health-check kind")
     if spec["host"] not in ("127.0.0.1", "::1"):
         raise ValueError("health checks require an explicit numeric loopback address")
-    for key, low, high in (("failures", 1, 20), ("cooldown", 30, 86400),
+    for key, low, high in (("failures", 1, 20), ("cooldown", 5, 86400),
                            ("max_restarts", 0, 20), ("timeout", 1, 5)):
         if type(spec[key]) is not int or not low <= spec[key] <= high:
             raise ValueError("invalid health-check " + key)
@@ -263,6 +263,17 @@ class Health:
             # Presence itself records ownership/opt-out, including an empty file.
             target = self.path(CONFIG)
             if target.exists():
+                if install_lock_fd is not None:
+                    config = self.read_json(CONFIG)
+                    previous = {"kind": "xray", "host": "127.0.0.1", "port": None, "path": "/",
+                                "failures": 2, "cooldown": 60, "max_restarts": 5, "timeout": 3}
+                    if config['units'].get('x-ui.service') == previous:
+                        backup = self.path('/var/backups/x-manager-health-migration/' + str(time.time_ns()) + '.json')
+                        control.atomic_write(backup, target.read_text(encoding='utf-8'))
+                        config['units']['x-ui.service']['cooldown'] = 30
+                        self.save(CONFIG, config)
+                        return dict(result, status='migrated', backup=str(backup),
+                                    reason='recognized Xray baseline migrated to 30 seconds; counters preserved')
                 return dict(result, reason="existing health configuration preserved")
             with self.controller.lock():
                 live = self.show("x-ui.service")
@@ -294,7 +305,7 @@ class Health:
                 # Validate counters before setup without erasing a previous budget.
                 self.read_json(STATE)
                 default = {"kind": "xray", "host": "127.0.0.1", "port": None, "path": "/",
-                           "failures": 2, "cooldown": 60, "max_restarts": 5, "timeout": 3}
+                           "failures": 2, "cooldown": 30, "max_restarts": 5, "timeout": 3}
                 healthy, reason = self.probe(default, int(live["MainPID"]))
                 if not healthy:
                     return dict(result, reason="Xray process layout was not verified: " + reason)
@@ -408,10 +419,20 @@ class Health:
                     if spec["max_restarts"] == 0:
                         outcome.update(status="monitor-only", reason="automatic health restarts are disabled")
                         continue
-                    if counter["attempts"] >= spec["max_restarts"]:
-                        outcome.update(status="exhausted", reason="restart allowance spent; explicit reset required")
-                        continue
                     now = int(self.now())
+                    if counter["attempts"] >= spec["max_restarts"]:
+                        # The final reserved attempt starts the recovery pause.
+                        # This timestamp is already persisted before systemctl;
+                        # restarting this checker cannot replenish the budget.
+                        if now < counter["last_restart"]:
+                            counter["last_restart"] = now
+                        remaining = 300 - (now - counter["last_restart"])
+                        if remaining > 0:
+                            outcome.update(status="exhausted", reason="automatic reset pending",
+                                           retry_after=remaining)
+                            continue
+                        counter.update(attempts=0)
+                        outcome["attempts"] = 0
                     if counter["attempts"] and now - counter["last_restart"] < spec["cooldown"]:
                         outcome["status"] = "cooldown"
                         continue
@@ -500,6 +521,8 @@ def human_result(result):
                   "blocked": "конфликт watchdog"}
         for row in result.get("units", []):
             print("  " + row["unit"] + ": " + states.get(row["status"], row["status"]))
+            if "retry_after" in row:
+                print("    До нового цикла восстановления: " + str(row["retry_after"]) + " с")
             if row.get("reason") and row["status"] in ("unhealthy", "restart-failed"):
                 print("    Причина: " + row["reason"])
 
@@ -513,8 +536,8 @@ def main(argv=None):
     parser.add_argument("--port", type=int)
     parser.add_argument("--path", default="/")
     parser.add_argument("--failures", type=int, default=3)
-    parser.add_argument("--cooldown", type=int, default=300)
-    parser.add_argument("--max-restarts", type=int, default=3)
+    parser.add_argument("--cooldown", type=int)
+    parser.add_argument("--max-restarts", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=3)
     parser.add_argument("--human", action="store_true", help="Readable menu output")
     parser.add_argument("--require-configured", action="store_true", help="Report exits 3 if no checks exist")
@@ -522,6 +545,8 @@ def main(argv=None):
     parser.add_argument("--new-timer", action="store_true", help="Installer created a previously absent timer")
     parser.add_argument("--enable-timer", action="store_true", help="Explicitly enable baseline timer, preserving lifecycle inhibits")
     args = parser.parse_args(argv)
+    if args.cooldown is None:
+        args.cooldown = 30 if args.unit in ("x-ui", "xray", "x-ui.service", "xray.service") else 5
     if args.require_configured and args.action != "report":
         parser.error("--require-configured is only valid for report")
     if (args.install_lock_fd is not None or args.new_timer or args.enable_timer) and args.action != "bootstrap":

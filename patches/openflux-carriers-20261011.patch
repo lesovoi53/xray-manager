@@ -1,0 +1,2065 @@
+--- a/transport/cupsonline/cupsonline.go
++++ b/transport/cupsonline/cupsonline.go
+@@ -42,6 +42,8 @@
+ 	BatchMaxPackets int
+ 	BatchMaxBytes   int
+ 	BatchTimeout    time.Duration
++	MaxMessageData  int
++	SendInterval    time.Duration
+ 
+ 	SendQueueSize int
+ 
+@@ -71,13 +73,15 @@
+ 		BatchMaxPackets: 64,
+ 		BatchMaxBytes:   32 * 1024,
+ 		BatchTimeout:    2 * time.Millisecond,
++		MaxMessageData:  4096,
++		SendInterval:    18 * time.Millisecond,
+ 
+ 		SendQueueSize: 65536,
+ 
+ 		ReadBufferSize:  32 << 20,
+ 		WriteBufferSize: 32 << 20,
+ 
+-		MaxPayloadBytes: 16_000_000,
++		MaxPayloadBytes: 65535,
+ 
+ 		NumRooms:        4,
+ 		RoomCreatePause: 500 * time.Millisecond,
+@@ -289,6 +293,8 @@
+ 	connected atomic.Bool
+ 
+ 	sendQueue chan []byte
++	recvBufs  map[string][]byte
++	lastSend  time.Time
+ 
+ 	stats *channelStats
+ }
+@@ -300,6 +306,9 @@
+ 	defer w.writeMu.Unlock()
+ 	if w.conn == nil {
+ 		return fmt.Errorf("ws not connected")
++	}
++	if err := w.conn.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
++		return err
+ 	}
+ 	return w.conn.WriteMessage(websocket.TextMessage, data)
+ }
+@@ -341,6 +350,8 @@
+ }
+ 
+ func (w *cupsWS) connectAndServe() error {
++	// Fragments belong to one websocket session; never join across reconnects.
++	w.recvBufs = make(map[string][]byte)
+ 	wsURL := strings.Replace(w.auth.connURL, "https://", "wss://", 1)
+ 	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
+ 	wsURL = strings.TrimRight(wsURL, "/") + "/websocket"
+@@ -500,22 +511,19 @@
+ 		buf.Write(p)
+ 		totalRaw += len(p)
+ 	}
+-	col := base64.RawStdEncoding.EncodeToString(buf.Bytes())
+-
+-	msg := map[string]interface{}{
+-		"rpc": map[string]interface{}{
+-			"method": "shared_editor_change_cursors",
+-			"data": map[string]interface{}{
+-				"cursors": []map[string]interface{}{{"row": 0, "column": col}},
+-				"ranges":  []interface{}{},
+-				"room":    w.auth.roomUUID,
+-				"user":    w.auth.userUUID,
+-			},
+-		},
+-		"id": w.nextID(),
+-	}
+-	if err := w.writeJSON(msg); err != nil {
+-		return err
++	blob := buf.Bytes()
++
++	// One message can only carry so much before the server drops it, so a
++	// batch is cut into chunks and each goes as its own message. The far side
++	// stitches them back together in order.
++	for off := 0; off < len(blob); off += w.config.MaxMessageData {
++		end := min(off+w.config.MaxMessageData, len(blob))
++		if err := w.pace(); err != nil {
++			return err
++		}
++		if err := w.sendChunk(blob[off:end]); err != nil {
++			return err
++		}
+ 	}
+ 	w.stats.packetsSent.Add(uint64(len(batch)))
+ 	w.stats.bytesSent.Add(uint64(totalRaw))
+@@ -524,73 +532,8 @@
+ }
+ 
+ func (w *cupsWS) handleMessage(raw []byte) {
+-	if len(raw) == 2 && raw[0] == '{' && raw[1] == '}' {
+-		_ = w.writeRaw([]byte("{}"))
+-		return
+-	}
+-	var obj map[string]interface{}
+-	if err := json.Unmarshal(raw, &obj); err != nil {
+-		return
+-	}
+-	push, ok := obj["push"].(map[string]interface{})
+-	if !ok {
+-		return
+-	}
+-	pub, _ := push["pub"].(map[string]interface{})
+-	data, _ := pub["data"].(map[string]interface{})
+-	if data == nil {
+-		return
+-	}
+-	if t, _ := data["type"].(string); t != "cursors_update" {
+-		return
+-	}
+-	payload, _ := data["payload"].(map[string]interface{})
+-	if payload == nil {
+-		return
+-	}
+-	if uuid, _ := payload["user_uuid"].(string); uuid == w.auth.userUUID {
+-		return
+-	}
+-	cursors, _ := payload["cursors"].([]interface{})
+-	if len(cursors) == 0 {
+-		return
+-	}
+-	c0, _ := cursors[0].(map[string]interface{})
+-	if c0 == nil {
+-		return
+-	}
+-	colStr, ok := c0["column"].(string)
+-	if !ok || colStr == "" {
+-		return
+-	}
+-	decoded, err := base64.RawStdEncoding.DecodeString(colStr)
+-	if err != nil {
+-		decoded, err = base64.StdEncoding.DecodeString(colStr)
+-		if err != nil {
+-			return
+-		}
+-	}
+-
+-	count := 0
+-	total := 0
+-	for len(decoded) >= 2 {
+-		ln := int(binary.BigEndian.Uint16(decoded[:2]))
+-		decoded = decoded[2:]
+-		if ln == 0 || len(decoded) < ln {
+-			break
+-		}
+-		pkt := decoded[:ln]
+-		decoded = decoded[ln:]
+-		if w.onData != nil {
+-			w.onData(pkt)
+-		}
+-		count++
+-		total += ln
+-	}
+-	if count > 0 {
+-		w.stats.packetsRecv.Add(uint64(count))
+-		w.stats.bytesRecv.Add(uint64(total))
+-		w.stats.batchesRecv.Add(1)
++	for _, line := range splitFrame(raw) {
++		w.handleReply(line)
+ 	}
+ }
+ 
+@@ -683,7 +626,6 @@
+ 	utils.Debugf("[CUPS] explicit rooms: %d", len(t.urls))
+ 	return t
+ }
+-
+ 
+ func (t *CupsonlineTransport) Start() error {
+ 	if t.clientErr != nil {
+@@ -944,3 +886,202 @@
+ 	}
+ 	return u
+ }
++
++func (w *cupsWS) sendChunk(chunk []byte) error {
++	payload := make([]byte, 2+len(chunk))
++	binary.BigEndian.PutUint16(payload[:2], uint16(len(chunk)))
++	copy(payload[2:], chunk)
++
++	msg := map[string]interface{}{
++		"rpc": map[string]interface{}{
++			"method": "shared_editor_change_cursors",
++			"data": map[string]interface{}{
++				"cursors": cursorsFromBytes(payload),
++				"ranges":  []interface{}{},
++				"room":    w.auth.roomUUID,
++				"user":    w.auth.userUUID,
++			},
++		},
++		"id": w.nextID(),
++	}
++	return w.writeJSON(msg)
++}
++
++func cursorsFromBytes(blob []byte) []map[string]interface{} {
++	nums := packNumbers(blob)
++	cursors := make([]map[string]interface{}, 0, (len(nums)+1)/2)
++	for i := 0; i < len(nums); i += 2 {
++		c := map[string]interface{}{"row": nums[i], "column": uint64(0)}
++		if i+1 < len(nums) {
++			c["column"] = nums[i+1]
++		}
++		cursors = append(cursors, c)
++	}
++	return cursors
++}
++
++func packNumbers(blob []byte) []uint64 {
++	n := (len(blob) + bytesPerNumber - 1) / bytesPerNumber
++	out := make([]uint64, n)
++	for i := range out {
++		var v uint64
++		for j := 0; j < bytesPerNumber; j++ {
++			v <<= 8
++			if idx := i*bytesPerNumber + j; idx < len(blob) {
++				v |= uint64(blob[idx])
++			}
++		}
++		out[i] = v
++	}
++	return out
++}
++
++func bytesFromNumbers(nums []uint64) []byte {
++	out := make([]byte, 0, len(nums)*bytesPerNumber)
++	for _, v := range nums {
++		var b [bytesPerNumber]byte
++		for j := bytesPerNumber - 1; j >= 0; j-- {
++			b[j] = byte(v)
++			v >>= 8
++		}
++		out = append(out, b[:]...)
++	}
++	return out
++}
++
++func asCursorInt(v interface{}) (uint64, bool) {
++	f, ok := v.(float64)
++	if !ok || f < 0 || f >= 1<<48 || f != float64(uint64(f)) {
++		return 0, false
++	}
++	return uint64(f), true
++}
++
++func (w *cupsWS) handleReply(raw []byte) {
++	if isPing(raw) {
++		_ = w.writeRaw([]byte("{}"))
++		return
++	}
++	var obj map[string]interface{}
++	if err := json.Unmarshal(raw, &obj); err != nil {
++		return
++	}
++	push, ok := obj["push"].(map[string]interface{})
++	if !ok {
++		return
++	}
++	pub, _ := push["pub"].(map[string]interface{})
++	data, _ := pub["data"].(map[string]interface{})
++	if data == nil {
++		return
++	}
++	if t, _ := data["type"].(string); t != "cursors_update" {
++		return
++	}
++	payload, _ := data["payload"].(map[string]interface{})
++	if payload == nil {
++		return
++	}
++	sender, _ := payload["user_uuid"].(string)
++	if sender == w.auth.userUUID {
++		return
++	}
++	cursors, _ := payload["cursors"].([]interface{})
++	if len(cursors) == 0 || len(cursors) > 1000 {
++		return
++	}
++	// Rebuild the blob from the cursor integers, two per cursor in order, the
++	// reverse of cursorsFromBytes.
++	nums := make([]uint64, 0, len(cursors)*2)
++	for _, c := range cursors {
++		m, _ := c.(map[string]interface{})
++		if m == nil {
++			return
++		}
++		row, ok := asCursorInt(m["row"])
++		if !ok {
++			return
++		}
++		col, valid := asCursorInt(m["column"])
++		if !valid {
++			return
++		}
++		nums = append(nums, row, col)
++	}
++	decoded := bytesFromNumbers(nums)
++	// Strip the padding: the first two bytes are how many real bytes follow.
++	if len(decoded) < 2 {
++		return
++	}
++	dataLen := int(binary.BigEndian.Uint16(decoded[:2]))
++	if dataLen == 0 || dataLen > w.config.MaxMessageData || 2+dataLen > len(decoded) {
++		return
++	}
++	chunk := decoded[2 : 2+dataLen]
++
++	// Append to the running stream and pull out whole packets; a packet split
++	// across messages completes once the rest of it arrives.
++	if w.recvBufs == nil {
++		w.recvBufs = make(map[string][]byte)
++	}
++	if _, exists := w.recvBufs[sender]; !exists && len(w.recvBufs) >= 128 {
++		return
++	}
++	buf := append(w.recvBufs[sender], chunk...)
++	adv, count, total := 0, 0, 0
++	for len(buf)-adv >= 2 {
++		ln := int(binary.BigEndian.Uint16(buf[adv : adv+2]))
++		if ln == 0 {
++			// Not a real length - the stream is out of sync; drop it.
++			adv = len(buf)
++			break
++		}
++		if len(buf)-adv < 2+ln {
++			break // rest of this packet hasn't arrived yet
++		}
++		pkt := buf[adv+2 : adv+2+ln]
++		if w.onData != nil {
++			w.onData(pkt)
++		}
++		adv += 2 + ln
++		count++
++		total += ln
++	}
++	// Keep only the unconsumed tail. onData ran already, so moving the bytes
++	// now can't disturb a packet still in flight. A member with nothing
++	// pending holds no buffer, so members who left cost nothing.
++	rest := append(buf[:0], buf[adv:]...)
++	switch {
++	case len(rest) == 0:
++		delete(w.recvBufs, sender)
++	case len(rest) > w.config.MaxPayloadBytes+w.config.MaxMessageData:
++		// A stream that never yields a packet must not grow without bound.
++		utils.Debugf("[CUPS] recv stream out of sync (%s), resetting", w.auth.roomUUID)
++		delete(w.recvBufs, sender)
++	default:
++		w.recvBufs[sender] = rest
++	}
++	if count > 0 {
++		w.stats.packetsRecv.Add(uint64(count))
++		w.stats.bytesRecv.Add(uint64(total))
++		w.stats.batchesRecv.Add(1)
++	}
++}
++
++const bytesPerNumber = 6
++
++func splitFrame(raw []byte) [][]byte { return bytes.Split(raw, []byte("\n")) }
++func isPing(raw []byte) bool         { return string(bytes.TrimSpace(raw)) == "{}" }
++func (w *cupsWS) pace() error {
++	if d := w.config.SendInterval - time.Since(w.lastSend); d > 0 {
++		timer := time.NewTimer(d)
++		defer timer.Stop()
++		select {
++		case <-timer.C:
++		case <-w.ctx:
++			return fmt.Errorf("closed")
++		}
++	}
++	w.lastSend = time.Now()
++	return nil
++}
+--- /dev/null
++++ b/transport/cupsonline/senders_test.go
+@@ -0,0 +1,60 @@
++package cupsonline
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"testing"
++)
++
++// cursorMessage is what the room pushes when member `from` moves its cursors to carry `chunk`.
++func cursorMessage(t *testing.T, from string, chunk []byte) []byte {
++	t.Helper()
++	blob := binary.BigEndian.AppendUint16(nil, uint16(len(chunk)))
++	blob = append(blob, chunk...)
++	raw, err := json.Marshal(map[string]interface{}{
++		"push": map[string]interface{}{"pub": map[string]interface{}{"data": map[string]interface{}{
++			"type":    "cursors_update",
++			"payload": map[string]interface{}{"user_uuid": from, "cursors": cursorsFromBytes(blob)},
++		}}},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return raw
++}
++
++// packet frames one payload as the stream carries it: 2-byte length, then the bytes.
++func packet(p []byte) []byte {
++	return append(binary.BigEndian.AppendUint16(nil, uint16(len(p))), p...)
++}
++
++// Two members send at once - a PHP exit's generations handing over. One packet of A is cut across two messages and
++// B's message lands between the halves: with one buffer for the room, B's bytes went into the middle of A's packet,
++// the stream went out of sync and both lost data.
++func TestEachMemberIsReassembledApart(t *testing.T) {
++	var got [][]byte
++	w := &cupsWS{config: DefaultCupsonlineConfig(), stats: &channelStats{}, onData: func(p []byte) { got = append(got, append([]byte(nil), p...)) }}
++	w.auth = &cupsAuth{userUUID: "me"}
++
++	bigA := bytes.Repeat([]byte("A"), 5000)
++	smallB1, smallB2 := []byte("b-first"), []byte("b-second")
++	streamA := packet(bigA)
++	w.handleMessage(cursorMessage(t, "gen-1", streamA[:2900]))
++	w.handleMessage(cursorMessage(t, "gen-2", append(packet(smallB1), packet(smallB2)...)))
++	w.handleMessage(cursorMessage(t, "gen-1", streamA[2900:]))
++	w.handleMessage(cursorMessage(t, "me", packet([]byte("my own echo")))) // our own cursors are never data
++
++	if len(got) != 3 {
++		t.Fatalf("got %d packets, want 3 (two of B, then all of A)", len(got))
++	}
++	if !bytes.Equal(got[0], smallB1) || !bytes.Equal(got[1], smallB2) {
++		t.Fatalf("B's packets came out as %q, %q", got[0], got[1])
++	}
++	if !bytes.Equal(got[2], bigA) {
++		t.Fatalf("A's packet came out %d bytes, want %d intact", len(got[2]), len(bigA))
++	}
++	if len(w.recvBufs) != 0 {
++		t.Fatalf("members with nothing pending still hold %d buffers", len(w.recvBufs))
++	}
++}
+--- /dev/null
++++ b/transport/mailru/cursor_test.go
+@@ -0,0 +1,69 @@
++package mailru
++
++import (
++	"encoding/base64"
++	"fmt"
++	"reflect"
++	"testing"
++	"time"
++
++	"openflux/transport"
++)
++
++func cursorEntry(payload string) string {
++	return fmt.Sprintf(`{"cursor":"18;%s","time":1790800029352,"user":"anonX","useridoriginal":"anonX"}`, payload)
++}
++
++func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
++
++// The server batches cursor entries into one message under load. Every data
++// entry must come out, in order, and keep-alives anywhere in the batch must
++// not cost the data around them.
++func TestCursorPayloadsBatch(t *testing.T) {
++	ka := cursorEntry("---KA---")
++	cases := []struct {
++		name string
++		text string
++		want []string
++	}{
++		{"one entry", `42["message",{"type":"cursor","messages":[` + cursorEntry(b64("one")) + `]}]`, []string{b64("one")}},
++		{"batched data", `42["message",{"type":"cursor","messages":[` + cursorEntry(b64("a")) + "," + cursorEntry(b64("b")) + "," + cursorEntry(b64("c")) + `]}]`, []string{b64("a"), b64("b"), b64("c")}},
++		{"keep-alive first, data behind it", `42["message",{"type":"cursor","messages":[` + ka + "," + cursorEntry(b64("data")) + `]}]`, []string{b64("data")}},
++		{"data, keep-alive, data", `42["message",{"type":"cursor","messages":[` + cursorEntry(b64("x")) + "," + ka + "," + cursorEntry(b64("y")) + `]}]`, []string{b64("x"), b64("y")}},
++		{"only a keep-alive", `42["message",{"type":"cursor","messages":[` + ka + `]}]`, nil},
++	}
++	for _, c := range cases {
++		if got := cursorPayloads(c.text); !reflect.DeepEqual(got, c.want) {
++			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
++		}
++	}
++}
++
++func TestHandleMessageDeliversEveryPacketOfABatch(t *testing.T) {
++	tr := NewMailruDocsTransport("Vuri/test", transport.DefaultConfig())
++	var got []string
++	tr.Receive(func(b []byte) { got = append(got, string(b)) })
++	msg := `42["message",{"type":"cursor","messages":[` + cursorEntry("---KA---") + "," +
++		cursorEntry(b64("first")) + "," + cursorEntry(b64("second")) + `]}]`
++	tr.handleMessage(&DocSession{}, []byte(msg))
++	if !reflect.DeepEqual(got, []string{"first", "second"}) {
++		t.Fatalf("delivered %v, want [first second]", got)
++	}
++}
++
++// A scheduled reconnect that is already waiting makes a second one a no-op.
++func TestSecondReconnectWhileOneIsWaitingReturnsAtOnce(t *testing.T) {
++	tr := NewMailruDocsTransport("AbCdEfGh1/IjKlMnOp2", transport.DefaultConfig())
++	if err := tr.BaseTransport.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer tr.BaseTransport.Stop()
++	tr.reconnecting.Store(true)
++	done := make(chan struct{})
++	go func() { tr.scheduleReconnect(0); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(300 * time.Millisecond):
++		t.Fatal("a second scheduled reconnect waited out its own backoff instead of yielding")
++	}
++}
+--- /dev/null
++++ b/transport/mailru/edit_test.go
+@@ -0,0 +1,23 @@
++package mailru
++
++import "testing"
++
++// A read-only public link ("edit": false) must not get saveChanges: the server answers it by
++// closing the connection (seen against the live service, docx, link without edit rights).
++func TestCanEdit(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		perm map[string]interface{}
++		want bool
++	}{
++		{"nothing known", nil, true},
++		{"no edit key", map[string]interface{}{"download": true}, true},
++		{"editable", map[string]interface{}{"edit": true, "download": true}, true},
++		{"read-only", map[string]interface{}{"edit": false, "download": true}, false},
++		{"odd value", map[string]interface{}{"edit": "false"}, true},
++	} {
++		if got := canEdit(tc.perm); got != tc.want {
++			t.Errorf("%s: canEdit = %v, want %v", tc.name, got, tc.want)
++		}
++	}
++}
+--- /dev/null
++++ b/transport/mailru/handshake_test.go
+@@ -0,0 +1,90 @@
++package mailru
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/gorilla/websocket"
++)
++
++func TestWaitMailruSocketIOHandshakeOrder(t *testing.T) {
++	upgrader := websocket.Upgrader{
++		CheckOrigin: func(r *http.Request) bool {
++			return true
++		},
++	}
++
++	serverErr := make(chan error, 1)
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, err := upgrader.Upgrade(w, r, nil)
++		if err != nil {
++			serverErr <- err
++			return
++		}
++		defer conn.Close()
++
++		// Mail.ru sends the Engine.IO open frame first.
++		if err := conn.WriteMessage(
++			websocket.TextMessage,
++			[]byte(`0{"sid":"engine-session","upgrades":[]}`),
++		); err != nil {
++			serverErr <- err
++			return
++		}
++
++		// The client must not send Socket.IO connect until the open frame
++		// above has been consumed.
++		_, message, err := conn.ReadMessage()
++		if err != nil {
++			serverErr <- err
++			return
++		}
++
++		want := `40{"token":"test-token"}`
++		if got := string(message); got != want {
++			serverErr <- fmt.Errorf("Socket.IO connect = %q, want %q", got, want)
++			return
++		}
++
++		if err := conn.WriteMessage(
++			websocket.TextMessage,
++			[]byte(`40{"sid":"socket-session"}`),
++		); err != nil {
++			serverErr <- err
++			return
++		}
++
++		serverErr <- nil
++	}))
++	defer server.Close()
++
++	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
++
++	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++
++	session := &DocSession{
++		Conn: conn,
++	}
++
++	if err := waitMailruSocketIO(session, "test-token"); err != nil {
++		t.Fatalf("waitMailruSocketIO: %v", err)
++	}
++
++	select {
++	case err := <-serverErr:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out waiting for WebSocket test server")
++	}
++}
+--- a/transport/mailru/mailru.go
++++ b/transport/mailru/mailru.go
+@@ -14,6 +14,8 @@
+ 	"math/rand"
+ 	"net"
+ 	"net/http"
++	"net/http/cookiejar"
++	"net/url"
+ 	"regexp"
+ 	"strings"
+ 	"sync"
+@@ -29,6 +31,17 @@
+ const mailruUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+ 
+ var cursorPayloadRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
++
++// saveChangesMessageTemplate — шаблон saveChanges-сообщения в формате
++// веб-клиента Mail.ru: две подстановки %s — UserId и UserShortId в
++// excelAdditionalInfo. Остальные поля (op-ы в changes, анкоры, версия)
++// оставлены ровно такими, какими их шлёт живой редактор; это шаблон, а не
++// «правильная» структура — формат оп закрытый, и мы только подставляем свои
++// значения участника.
++//
++// Поля isCoAuthoring/releaseLocks = false — особенность именно mail.ru
++// (у yandex.docs там true/true).
++const saveChangesMessageTemplate = `42["message",{"type":"saveChanges","changes":"[\"76;AgAAADEA//8BAOwbfF7pEAAALQEAAAMAAAAAAAAAAAAAAAAAAAAAAAAA9v///xoAAAAyADAAMgA2AC4AMgAuADEALgAyADIANgA4AA==\",\"35;BgAAADYAMgA3AAEAHAABAAAAAAAAAAEAAABhAAAAAAMAAAA=\",\"35;BgAAADYAMgA3AAEAHAABAAAAAQAAAAEAAABzAAAAAAMAAAA=\",\"35;BgAAADYAMgA3AAEAHAABAAAAAgAAAAEAAABkAAAAAAMAAAA=\"]","startSaveChanges":true,"endSaveChanges":true,"isCoAuthoring":false,"isExcel":false,"deleteIndex":null,"excelAdditionalInfo":"{\"UserId\":\"%s\",\"UserShortId\":\"%s\",\"CursorInfo\":\"14;BgAAADYAMgA3AAMAAAA=\"}","unlock":false,"releaseLocks":false}]`
+ 
+ type MailruDocsInfo struct {
+ 	Token        string
+@@ -53,17 +66,109 @@
+ func (s *DocSession) safeWrite(messageType int, data []byte) error {
+ 	s.writeMu.Lock()
+ 	defer s.writeMu.Unlock()
++	// A write into a half-open connection (NAT dropped it, the network
++	// changed) would otherwise block until the kernel gives up, minutes.
++	_ = s.Conn.SetWriteDeadline(time.Now().Add(docWriteTimeout))
+ 	return s.Conn.WriteMessage(messageType, data)
++}
++
++// docWriteTimeout bounds one WebSocket write to the document.
++const docWriteTimeout = 20 * time.Second
++
++const mailruSocketIOHandshakeTimeout = 15 * time.Second
++
++// waitMailruSocketIO completes the Engine.IO / Socket.IO handshake before
++// editor authentication is sent. Mail.ru currently requires the Engine.IO
++// open frame to be consumed before the Socket.IO connect packet is sent.
++func waitMailruSocketIO(session *DocSession, token string) error {
++	if session == nil || session.Conn == nil {
++		return fmt.Errorf("mailru: websocket session is nil")
++	}
++
++	conn := session.Conn
++
++	if err := conn.SetReadDeadline(time.Now().Add(mailruSocketIOHandshakeTimeout)); err != nil {
++		return fmt.Errorf("mailru: set handshake deadline: %w", err)
++	}
++	defer conn.SetReadDeadline(time.Time{})
++
++	waitFor := func(match func(string) bool) error {
++		for {
++			messageType, payload, err := conn.ReadMessage()
++			if err != nil {
++				return err
++			}
++
++			if messageType != websocket.TextMessage {
++				continue
++			}
++
++			text := string(payload)
++
++			// Engine.IO heartbeat may arrive while handshaking.
++			if text == "2" {
++				if err := session.safeWrite(websocket.TextMessage, []byte("3")); err != nil {
++					return fmt.Errorf("mailru: send Engine.IO pong: %w", err)
++				}
++				continue
++			}
++
++			if match(text) {
++				return nil
++			}
++
++			utils.Debugf("[M-DOCS] handshake: ignoring server frame %q", text)
++		}
++	}
++
++	// Engine.IO open:
++	//   0{"sid":"...", ...}
++	if err := waitFor(func(text string) bool {
++		return strings.HasPrefix(text, "0{")
++	}); err != nil {
++		return fmt.Errorf("mailru: wait for Engine.IO open: %w", err)
++	}
++
++	utils.Debugf("[M-DOCS] Engine.IO open")
++
++	socketConnect := fmt.Sprintf(`40{"token":"%s"}`, token)
++
++	if err := session.safeWrite(websocket.TextMessage, []byte(socketConnect)); err != nil {
++		return fmt.Errorf("mailru: send Socket.IO connect: %w", err)
++	}
++
++	// Socket.IO acknowledgement:
++	//   40{"sid":"..."}
++	if err := waitFor(func(text string) bool {
++		return strings.HasPrefix(text, "40")
++	}); err != nil {
++		return fmt.Errorf("mailru: wait for Socket.IO connect: %w", err)
++	}
++
++	utils.Debugf("[M-DOCS] Socket.IO connected")
++
++	return nil
+ }
+ 
+ type MailruDocsTransport struct {
+ 	*transport.BaseTransport
++	done     chan struct{}
++	stopOnce sync.Once
+ 
+ 	weblink string
+ 	session *DocSession
+ 
+ 	userCounter atomic.Int32
+ 	baseUserID  string
++
++	cookieJar *cookiejar.Jar
++	jarMu     sync.RWMutex
++
++	// reconnecting is set while a scheduled reconnect waits out its backoff:
++	// the reader's error and ApplyCookies both schedule one when the cookies
++	// are replaced under a live connection, and two reconnects open two
++	// sessions to the document.
++	reconnecting atomic.Bool
+ }
+ 
+ // NewMailruDocsTransport accepts either a bare weblink ("AbCdEfGh1/IjKlMnOp2")
+@@ -72,9 +177,12 @@
+ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *MailruDocsTransport {
+ 	t := &MailruDocsTransport{
+ 		BaseTransport: transport.NewBaseTransport(config),
++		done:          make(chan struct{}),
+ 		weblink:       normalizeWeblink(weblink),
+ 	}
+ 	t.baseUserID = randUserID()
++	jar, _ := cookiejar.New(nil)
++	t.cookieJar = jar
+ 	return t
+ }
+ 
+@@ -100,6 +208,7 @@
+ 
+ 	t.baseUserID = randUserID()
+ 	utils.SafeGo("mailru.keepAlive", t.keepAliveLoop)
++	utils.SafeGo("mailru.editorActivity", t.editorActivityLoop)
+ 	t.connectToDoc(0)
+ 
+ 	return nil
+@@ -167,7 +276,7 @@
+ 			}).DialContext,
+ 		}
+ 		headers := http.Header{}
+-		headers.Set("User-Agent", mailruUserAgent)
++		headers.Set("User-Agent", "OpenFlux/1.0")
+ 		headers.Set("Origin", "https://docs.datacloudmail.ru")
+ 
+ 		utils.Debugf("[M-DOCS] WebSocket dial %s", info.WsURL)
+@@ -195,6 +304,13 @@
+ 			UserID:     userID,
+ 		}
+ 
++		if err := waitMailruSocketIO(session, info.Token); err != nil {
++			utils.Debugf("[M-DOCS] Socket.IO handshake failed: %v", err)
++			_ = conn.Close()
++			t.scheduleReconnect(attempt)
++			return
++		}
++
+ 		t.Mu.Lock()
+ 		t.session = session
+ 		t.SetConnected(true)
+@@ -203,16 +319,6 @@
+ 		if existingSession == nil {
+ 			utils.SafeGo("mailru.writer", t.writerLoop)
+ 		}
+-
+-		// Auth - fired immediately, same as the Yandex.Docs transport. No
+-		// need to wait for the server's own "0{"/"40" handshake frames
+-		// first: Mail.ru's coauthoring server buffers and processes these
+-		// once its own session state catches up, and waiting for explicit
+-		// acks here only stretches the outage window on every reconnect
+-		// (Mail.ru can delay a fresh joiner's auth confirmation by up to
+-		// ~30s while it reconciles with the other participant).
+-		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
+-		session.safeWrite(websocket.TextMessage, []byte(auth1))
+ 
+ 		authMsg := map[string]interface{}{
+ 			"type":                "auth",
+@@ -275,8 +381,6 @@
+ }
+ 
+ func (t *MailruDocsTransport) writerLoop() {
+-	// The write queue is created once and preserved across reconnects, so we
+-	// capture it and block on it instead of polling with a sleep.
+ 	var queue chan []byte
+ 	for t.IsRunning() && queue == nil {
+ 		t.Mu.Lock()
+@@ -295,18 +399,21 @@
+ 	var pending []byte
+ 	for t.IsRunning() {
+ 		if pending == nil {
+-			packet, ok := <-queue
+-			if !ok {
++			select {
++			case packet, ok := <-queue:
++				if !ok {
++					return
++				}
++				pending = packet
++			case <-t.done:
+ 				return
+ 			}
+-			pending = packet
+ 		}
+ 
+ 		t.Mu.RLock()
+ 		session := t.session
+ 		t.Mu.RUnlock()
+ 		if session == nil || session.Conn == nil {
+-			// Mid-reconnect: hold the packet and retry rather than drop it.
+ 			time.Sleep(15 * time.Millisecond)
+ 			continue
+ 		}
+@@ -316,7 +423,7 @@
+ 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+ 			utils.Debugf("[M-DOCS] Write error: %v", err)
+ 			time.Sleep(15 * time.Millisecond)
+-			continue // keep pending; the reconnect will bring up a new conn
++			continue
+ 		}
+ 		pending = nil
+ 	}
+@@ -328,28 +435,103 @@
+ 	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
+ 
+ 	for t.IsRunning() {
+-		<-ticker.C
++		select {
++		case <-ticker.C:
++		case <-t.done:
++			return
++		}
+ 		t.Mu.Lock()
+ 		session := t.session
+ 		t.Mu.Unlock()
+ 
+ 		if session != nil && session.Conn != nil {
+ 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
+-				utils.Debugf("[M-DOCS] Keep-alive failed: %v", err)
++				utils.Debugf("[M-DOCS] Keep-alive failed, closing the connection to reconnect: %v", err)
+ 				t.SetConnected(false)
+-			}
+-		}
+-	}
++				_ = session.Conn.Close()
++			}
++		}
++	}
++}
++
++// editorActivityLoop периодически отправляет в документ saveChanges-сообщение
++// в формате веб-клиента Mail.ru: значения UserId/UserShortId подставляются
++// из текущей сессии, остальное — фиксированный шаблон (см.
++// saveChangesMessageTemplate). Задержка между отправками — случайная в
++// диапазоне [0.5 с, 5 с], чтобы поток выглядел как правки живого человека:
++// ровный по сути, но не метрономом. Сообщение уходит через ту же сессию, что
++// writerLoop и keepAliveLoop, и так же терпит переподключение — если сессии
++// сейчас нет, итерация просто пропускается.
++func (t *MailruDocsTransport) editorActivityLoop() {
++	const (
++		minDelay = 500 * time.Millisecond
++		maxDelay = 5 * time.Second
++	)
++	for t.IsRunning() {
++		span := int64(maxDelay - minDelay)
++		delay := minDelay + time.Duration(rand.Int63n(span+1))
++
++		select {
++		case <-time.After(delay):
++		case <-t.done:
++			return
++		}
++
++		t.Mu.RLock()
++		session := t.session
++		t.Mu.RUnlock()
++		if session == nil || session.Conn == nil {
++			continue
++		}
++
++		// A link that only lets the document be read ("edit": false) is not allowed to save: the
++		// server closes the connection (no close frame) on the first saveChanges, over and over.
++		if !canEdit(session.Info.Permissions) {
++			continue
++		}
++
++		msg := buildSaveChanges(session)
++		if err := session.safeWrite(websocket.TextMessage, msg); err != nil {
++			utils.Debugf("[M-DOCS] saveChanges write error: %v", err)
++		}
++	}
++}
++
++// canEdit says whether the document may be edited through the link this session joined with.
++// The server reports it in the document's permissions; a document that does not say is treated
++// as editable, as the transport always did.
++func canEdit(permissions map[string]interface{}) bool {
++	edit, ok := permissions["edit"].(bool)
++	return !ok || edit
++}
++
++// buildSaveChanges собирает saveChanges-сообщение под конкретную сессию:
++// UserId — настоящий id участника (info.EditorUserID, при отсутствии —
++// сгенерированный session.UserID), UserShortId — производная от UserId
++// (в веб-клиенте Mail.ru это UserId без последнего символа). Остальное — из
++// шаблона.
++func buildSaveChanges(session *DocSession) []byte {
++	userID := session.Info.EditorUserID
++	if userID == "" {
++		userID = session.UserID
++	}
++	return BuildSaveChanges(userID)
++}
++
++// BuildSaveChanges is the saveChanges message for one participant: a pure
++// function of the user id, exported so the JS port of this transport can be
++// compared with it byte for byte.
++func BuildSaveChanges(userID string) []byte {
++	short := userID
++	if len(short) > 1 {
++		short = short[:len(short)-1]
++	}
++	return []byte(fmt.Sprintf(saveChangesMessageTemplate, userID, short))
+ }
+ 
+ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
+ 	text := string(data)
+ 
+-	if strings.Contains(text, "---KA---") {
+-		return
+-	}
+-
+-	// Socket.IO ping - respond with pong
+ 	if text == "2" {
+ 		if session != nil && session.Conn != nil {
+ 			session.safeWrite(websocket.TextMessage, []byte("3"))
+@@ -366,28 +548,32 @@
+ 	}
+ 
+ 	if strings.Contains(text, "cursor") {
+-		base64Str := t.extractBase64String(text)
+-		if base64Str == "" {
+-			return
+-		}
+-
+-		decoded, err := base64.StdEncoding.DecodeString(base64Str)
+-		if err != nil {
+-			utils.Debugf("[M-DOCS] Base64 decode error: %v", err)
+-			return
+-		}
+-
+-		t.RecordReceive(len(decoded))
+-		t.CallReceive(decoded)
+-	}
+-}
+-
+-func (t *MailruDocsTransport) extractBase64String(response string) string {
+-	matches := cursorPayloadRe.FindStringSubmatch(response)
+-	if len(matches) > 1 {
+-		return matches[1]
+-	}
+-	return ""
++		for _, base64Str := range cursorPayloads(text) {
++			decoded, err := base64.StdEncoding.DecodeString(base64Str)
++			if err != nil {
++				utils.Debugf("[M-DOCS] Base64 decode error: %v", err)
++				continue
++			}
++			t.RecordReceive(len(decoded))
++			t.CallReceive(decoded)
++		}
++	}
++}
++
++// cursorPayloads returns the base64 payload of every cursor entry in a server
++// message, in order, without the keep-alive entries.
++func cursorPayloads(text string) []string { return CursorPayloads(text) }
++
++// CursorPayloads is the exported form of cursorPayloads (pure; the JS port is
++// compared with it in tests).
++func CursorPayloads(text string) []string {
++	var out []string
++	for _, m := range cursorPayloadRe.FindAllStringSubmatch(text, -1) {
++		if len(m) > 1 && m[1] != "---KA---" {
++			out = append(out, m[1])
++		}
++	}
++	return out
+ }
+ 
+ func (t *MailruDocsTransport) scheduleReconnect(attempt int) {
+@@ -396,9 +582,13 @@
+ 		return
+ 	}
+ 
++	if !t.reconnecting.CompareAndSwap(false, true) {
++		return // one is already waiting
++	}
+ 	d := reconnectBackoff(next)
+ 	utils.Debugf("[M-DOCS] reconnecting in %v (attempt %d)", d, next)
+ 	time.Sleep(d)
++	t.reconnecting.Store(false) // a failed connect schedules the next one itself
+ 	if !t.IsRunning() {
+ 		return
+ 	}
+@@ -420,7 +610,6 @@
+ 	if d > 15*time.Second {
+ 		d = 15 * time.Second
+ 	}
+-	// add up to +50% jitter
+ 	d += time.Duration(rand.Int63n(int64(d/2) + 1))
+ 	return d
+ }
+@@ -428,7 +617,17 @@
+ // fetchDocInfo POSTs to Mail.ru's public-document editor API and parses the
+ // response into the fields needed to open the collaborative WebSocket.
+ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, error) {
+-	client := &http.Client{Timeout: 15 * time.Second}
++	t.jarMu.RLock()
++	jar := t.cookieJar
++	t.jarMu.RUnlock()
++	if jar == nil {
++		var err error
++		jar, err = cookiejar.New(nil)
++		if err != nil {
++			return MailruDocsInfo{}, err
++		}
++	}
++	client := &http.Client{Jar: jar, Timeout: 15 * time.Second}
+ 
+ 	reqBody := map[string]string{
+ 		"x-email":  "anonym",
+@@ -476,9 +675,6 @@
+ 	fileType, _ := document["fileType"].(string)
+ 	docURL, _ := document["url"].(string)
+ 	docTitle, _ := document["title"].(string)
+-	// document.permissions is an object of booleans (comment/edit/download/…),
+-	// not a number - sending it as anything else makes the editor server
+-	// reject the auth message with "access deny".
+ 	permissions, _ := document["permissions"].(map[string]interface{})
+ 	if permissions == nil {
+ 		permissions = make(map[string]interface{})
+@@ -515,3 +711,71 @@
+ func randUserID() string {
+ 	return fmt.Sprintf("%010d", rand.New(rand.NewSource(time.Now().UnixNano())).Intn(1000000000))
+ }
++
++// ---- CookieExchanger ----
++
++// FetchCookies returns a snapshot of the transport's current cookie jar as
++// name -> value. Used by the exit node to answer a SubtypeCookiesRequest.
++func (t *MailruDocsTransport) FetchCookies() (map[string]string, error) {
++	t.jarMu.RLock()
++	jar := t.cookieJar
++	t.jarMu.RUnlock()
++	if jar == nil {
++		return nil, fmt.Errorf("mailru: cookie jar is nil")
++	}
++	u, err := url.Parse("https://cloud.mail.ru/")
++	if err != nil {
++		return nil, err
++	}
++	out := make(map[string]string)
++	for _, c := range jar.Cookies(u) {
++		out[c.Name] = c.Value
++	}
++	return out, nil
++}
++
++// ApplyCookies replaces the transport's cookie jar with the provided values
++// and forces the current session to reconnect.
++func (t *MailruDocsTransport) ApplyCookies(values map[string]string) error {
++	if len(values) == 0 {
++		return nil
++	}
++	u, _ := url.Parse("https://cloud.mail.ru/")
++	jar, _ := cookiejar.New(nil)
++	cookies := make([]*http.Cookie, 0, len(values))
++	for k, v := range values {
++		cookies = append(cookies, &http.Cookie{Name: k, Value: v, Path: "/"})
++	}
++	jar.SetCookies(u, cookies)
++
++	t.jarMu.Lock()
++	t.cookieJar = jar
++	t.jarMu.Unlock()
++
++	utils.Debugf("[M-DOCS] applied %d cookies, forcing reconnect", len(cookies))
++
++	t.Mu.Lock()
++	session := t.session
++	t.session = nil
++	t.SetConnected(false)
++	t.Mu.Unlock()
++	if session != nil && session.Conn != nil {
++		_ = session.Conn.Close()
++	}
++	if t.IsRunning() {
++		t.scheduleReconnect(0)
++	}
++	return nil
++}
++
++func (t *MailruDocsTransport) Stop() error {
++	err := t.BaseTransport.Stop()
++	t.stopOnce.Do(func() { close(t.done) })
++	t.Mu.RLock()
++	session := t.session
++	t.Mu.RUnlock()
++	if session != nil && session.Conn != nil {
++		session.Conn.Close()
++	}
++	return err
++}
+--- a/transport/yandex/boards.go
++++ b/transport/yandex/boards.go
+@@ -9,7 +9,6 @@
+ 	"fmt"
+ 	"io"
+ 	mrand "math/rand"
+-	"net"
+ 	"net/http"
+ 	"net/http/cookiejar"
+ 	"net/url"
+@@ -25,8 +24,8 @@
+ )
+ 
+ const (
+-	boardsBase              = "boards.yandex.ru"
+-	boardsUA                = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 " +
++	boardsBase = "boards.yandex.ru"
++	boardsUA   = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 " +
+ 		"(KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36"
+ 	boardsSocketHostDefault = "socket33.boards.yandex.ru"
+ 
+@@ -220,7 +219,7 @@
+ 
+ func (t *BoardsTransport) authorize(hash, name string) (boardsInfo, error) {
+ 	jar, _ := cookiejar.New(nil)
+-	client := &http.Client{
++	client := &http.Client{Transport: carrierTransport(),
+ 		Jar:     jar,
+ 		Timeout: 15 * time.Second,
+ 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+@@ -513,10 +512,7 @@
+ 
+ 	dialer := websocket.Dialer{
+ 		HandshakeTimeout: 15 * time.Second,
+-		NetDialContext: (&net.Dialer{
+-			Timeout:   10 * time.Second,
+-			KeepAlive: 30 * time.Second,
+-		}).DialContext,
++		NetDialContext:   dialIPv4First,
+ 	}
+ 	utils.Debugf("[BOARDS] dial %s", wsURL)
+ 	conn, resp, err := dialer.Dial(wsURL, header)
+@@ -737,33 +733,17 @@
+ 
+ // sendNotifyPosition — точная копия формата из Python-скрипта:
+ //
+-//   cmd_pos(x, y) -> send_dashboard("notify-position",
+-//       {"position": {"x": x, "y": y},
+-//        "vpt": {"translate": {"x": 0, "y": 0}, "scale": 1}})
++//	cmd_pos(x, y) -> send_dashboard("notify-position",
++//	    {"position": {"x": x, "y": y},
++//	     "vpt": {"translate": {"x": 0, "y": 0}, "scale": 1}})
+ //
+ // send_dashboard добавляет participant в envelope.
+ // payload кладём в position.x как base64-строку, position.y = 123.0,
+ // vpt.whyrugay = 1 (как в оригинале).
+ func (t *BoardsTransport) sendNotifyPosition(sess *boardsSession, pkt []byte) error {
+-	b64 := base64.StdEncoding.EncodeToString(pkt)
+-
+-	data := map[string]interface{}{
+-		"position": map[string]interface{}{
+-			"x": b64,
+-			"y": 123.0,
+-		},
+-		"vpt": map[string]interface{}{
+-			"translate": map[string]interface{}{"x": 0, "y": 0},
+-			"scale":     1,
+-			"whyrugay":  1,
+-		},
+-	}
+-
+-	obj := map[string]interface{}{
+-		"action":      "notify-position",
+-		"data":        data,
+-		"participant": *sess.participant.Load(),
+-	}
++	// Уникальный ID объекта и случайные координаты.
++	obj := buildModifyObjects(base64.StdEncoding.EncodeToString(pkt), randomHex(32),
++		mrand.Intn(2000), mrand.Intn(1200), *sess.creatorHash.Load(), *sess.participant.Load())
+ 	return sess.writeEventObj("dashboard", obj)
+ }
+ 
+@@ -871,10 +851,12 @@
+ // (position.x), затем массив (data[4]).
+ //
+ // Объект:
+-//   data.position.x — base64
++//
++//	data.position.x — base64
+ //
+ // Массив:
+-//   data[2] — имя отправителя, data[4] — base64
++//
++//	data[2] — имя отправителя, data[4] — base64
+ //
+ // Своё эхо фильтруем по:
+ //   - envelope.participant == наш participant (для объекта)
+@@ -944,54 +926,10 @@
+ }
+ 
+ func (t *BoardsTransport) handleServerModifyObjects(sess *boardsSession, raw json.RawMessage, action string) {
+-	var d struct {
+-		Dashboard string `json:"dashboard"`
+-		Name      string `json:"name"`
+-		Session   string `json:"session"`
+-		Objects   []struct {
+-			Attributes map[string]interface{} `json:"_attributes_"`
+-		} `json:"objects"`
+-	}
+-	if err := json.Unmarshal(raw, &d); err != nil {
+-		return
+-	}
+-	if len(d.Objects) == 0 {
+-		return
+-	}
+-
+-	myPart := *sess.participant.Load()
+-	myUser := sess.Info.userHash
+-	myName := sess.Info.name
+-
+-	for _, o := range d.Objects {
+-		val, _ := o.Attributes["value"].(string)
+-		if val == "" {
+-			continue
+-		}
+-		id, _ := o.Attributes["id"].(string)
+-		creator, _ := o.Attributes["creatorHash"].(string)
+-		typ, _ := o.Attributes["type"].(string)
+-
+-		if creator != "" && (creator == myPart || creator == myUser) {
+-			utils.Debugf("[BOARDS] %s: own echo (creator=%s), skip",
+-				action, shortStr(creator, 8))
+-			continue
+-		}
+-		if d.Name != "" && d.Name == myName {
+-			utils.Debugf("[BOARDS] %s: own echo (name=%q), skip", action, d.Name)
+-			continue
+-		}
+-
+-		decoded, err := base64.StdEncoding.DecodeString(val)
+-		if err != nil || len(decoded) == 0 {
+-			utils.Debugf("[BOARDS] %s: non-base64 value id=%s type=%s, skip",
+-				action, shortStr(id, 8), typ)
+-			continue
+-		}
+-
+-		utils.Debugf("[BOARDS<-] %s from=%q creator=%s id=%s pktlen=%d",
+-			action, d.Name, shortStr(creator, 8), shortStr(id, 8), len(decoded))
+-
++	payloads, toDelete := ModifyObjectsPayloads(raw, *sess.participant.Load(), sess.Info.userHash, sess.Info.name)
++
++	for _, decoded := range payloads {
++		utils.Debugf("[BOARDS<-] %s pktlen=%d", action, len(decoded))
+ 		t.RecordReceive(len(decoded))
+ 		t.onDataMu.RLock()
+ 		cb := t.onData
+@@ -999,6 +937,11 @@
+ 		if cb != nil {
+ 			cb(decoded)
+ 		}
++	}
++
++	// Удаляем принятые объекты
++	if len(toDelete) > 0 {
++		t.dropObjects(sess, toDelete)
+ 	}
+ }
+ 
+@@ -1059,3 +1002,108 @@
+ 		utils.Debugf("[BOARDS] creatorHash from 431/participantHash: %s", shortStr(ch, 8))
+ 	}
+ }
++
++func buildModifyObjects(b64, objID string, x, y int, creator, participant string) map[string]interface{} {
++	return map[string]interface{}{
++		"action": "modify-objects",
++		"data": map[string]interface{}{
++			"objects": []map[string]interface{}{
++				{
++					"_attributes_": map[string]interface{}{
++						"id":          objID,
++						"value":       b64, // payload как base64
++						"style":       "text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=1;",
++						"vertex":      "1",
++						"type":        "textbox",
++						"creatorHash": creator,
++						"parent":      "DASHBOARD",
++						"index":       "1",
++					},
++					"mxGeometry": []map[string]interface{}{
++						{
++							"_attributes_": map[string]interface{}{
++								"x":      fmt.Sprintf("%d", x),
++								"y":      fmt.Sprintf("%d", y),
++								"width":  "1",
++								"height": "1",
++								"as":     "geometry",
++							},
++						},
++					},
++					"hash": objID,
++				},
++			},
++			"valueChanges": map[string]bool{
++				objID: true,
++			},
++		},
++		"participant": participant,
++	}
++}
++
++func BoardsModifyObjects(b64, objID string, x, y int, creator, participant string) []byte {
++	body, _ := json.Marshal([]interface{}{"dashboard", buildModifyObjects(b64, objID, x, y, creator, participant)})
++	return body
++}
++
++func ModifyObjectsPayloads(raw json.RawMessage, myPart, myUser, myName string) (payloads [][]byte, toDelete []map[string]interface{}) {
++	var d struct {
++		Dashboard string `json:"dashboard"`
++		Name      string `json:"name"`
++		Session   string `json:"session"`
++		Objects   []struct {
++			Attributes map[string]interface{}   `json:"_attributes_"`
++			Hash       string                   `json:"hash"`
++			Geometry   []map[string]interface{} `json:"mxGeometry"`
++		} `json:"objects"`
++	}
++	if err := json.Unmarshal(raw, &d); err != nil {
++		return nil, nil
++	}
++	for _, o := range d.Objects {
++		val, _ := o.Attributes["value"].(string)
++		if val == "" {
++			continue
++		}
++		creator, _ := o.Attributes["creatorHash"].(string)
++
++		if creator != "" && (creator == myPart || creator == myUser) {
++			continue // own echo
++		}
++		if d.Name != "" && d.Name == myName {
++			continue // own echo
++		}
++
++		decoded, err := base64.StdEncoding.DecodeString(val)
++		if err != nil || len(decoded) == 0 {
++			continue
++		}
++		payloads = append(payloads, decoded)
++
++		// Собираем объект для удаления
++		toDelete = append(toDelete, map[string]interface{}{
++			"_attributes_": o.Attributes,
++			"mxGeometry":   o.Geometry,
++			"hash":         o.Hash,
++		})
++	}
++	return payloads, toDelete
++}
++
++func (t *BoardsTransport) dropObjects(sess *boardsSession, objects []map[string]interface{}) {
++	if len(objects) == 0 {
++		return
++	}
++	obj := map[string]interface{}{
++		"action": "drop-objects",
++		"data": map[string]interface{}{
++			"objects": objects,
++		},
++		"participant": *sess.participant.Load(),
++	}
++	if err := sess.writeEventObj("dashboard", obj); err != nil {
++		utils.Debugf("[BOARDS] drop-objects: %v", err)
++	} else {
++		utils.Debugf("[BOARDS] dropped %d objects", len(objects))
++	}
++}
+--- a/transport/yandex/boards_heartbeat_test.go
++++ b/transport/yandex/boards_heartbeat_test.go
+@@ -91,7 +91,7 @@
+ 			}
+ 			pong = pong || frame == "3"
+ 			dashboardHeartbeat = dashboardHeartbeat || strings.Contains(frame, `"action":"heartbeat"`)
+-			data = data || strings.Contains(frame, base64.StdEncoding.EncodeToString(outbound))
++			data = data || (strings.Contains(frame, `"action":"modify-objects"`) && strings.Contains(frame, base64.StdEncoding.EncodeToString(outbound)))
+ 		}
+ 	}))
+ 	defer server.Close()
+--- a/transport/yandex/captcha.go
++++ b/transport/yandex/captcha.go
+@@ -47,7 +47,7 @@
+ 		userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+ 	}
+ 
+-	client := &http.Client{
++	client := &http.Client{Transport: carrierTransport(),
+ 		Jar:     jar,
+ 		Timeout: 30 * time.Second,
+ 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+--- a/transport/yandex/cookies.go
++++ b/transport/yandex/cookies.go
+@@ -47,7 +47,9 @@
+ 		}
+ 		// Netscape session cookies may use either an empty expiry or zero.
+ 		expiry := fields[4]
+-		if expiry == "" { expiry = "0" }
++		if expiry == "" {
++			expiry = "0"
++		}
+ 		expires, err := strconv.ParseInt(expiry, 10, 64)
+ 		if err != nil {
+ 			return fmt.Errorf("Yandex cookie file line %d: invalid expiry", lineNo)
+--- a/transport/yandex/cookies_test.go
++++ b/transport/yandex/cookies_test.go
+@@ -23,21 +23,37 @@
+ }
+ 
+ func TestReloadUpdatedCookieFile(t *testing.T) {
+- path := writeCookieFile(t,".yandex.ru\tTRUE\t/\tTRUE\t0\ttest_session\told\n")
+- v:=NewYandexVolgaTransport("https://disk.yandex.ru/i/test",transport.DefaultConfig())
+- if err:=v.LoadCookieFile(path);err!=nil {t.Fatal(err)}
+- if err:=os.WriteFile(path,[]byte(".yandex.ru\tTRUE\t/\tTRUE\t0\ttest_session\tnew\n"),0600);err!=nil {t.Fatal(err)}
+- if err:=v.reloadCookieFile();err!=nil {t.Fatal(err)}
+- if cookieNamesFor(t,v.jar(),"https://disk.yandex.ru/")["test_session"]!="new" {t.Fatal("updated cookie was not loaded")}
+- if err:=os.Remove(path);err!=nil {t.Fatal(err)}
+- if err:=v.reloadCookieFile();err==nil {t.Fatal("missing file must not report success")}
++	path := writeCookieFile(t, ".yandex.ru\tTRUE\t/\tTRUE\t0\ttest_session\told\n")
++	v := NewYandexVolgaTransport("https://disk.yandex.ru/i/test", transport.DefaultConfig())
++	if err := v.LoadCookieFile(path); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, []byte(".yandex.ru\tTRUE\t/\tTRUE\t0\ttest_session\tnew\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := v.reloadCookieFile(); err != nil {
++		t.Fatal(err)
++	}
++	if cookieNamesFor(t, v.jar(), "https://disk.yandex.ru/")["test_session"] != "new" {
++		t.Fatal("updated cookie was not loaded")
++	}
++	if err := os.Remove(path); err != nil {
++		t.Fatal(err)
++	}
++	if err := v.reloadCookieFile(); err == nil {
++		t.Fatal("missing file must not report success")
++	}
+ }
+ 
+ func TestNetscapeEmptyExpiryIsSessionCookie(t *testing.T) {
+- path:=writeCookieFile(t,".yandex.ru\tTRUE\t/\tTRUE\t\tsession\tfixture\n")
+- v:=NewYandexVolgaTransport("https://disk.yandex.ru/i/test",transport.DefaultConfig())
+- if err:=v.LoadCookieFile(path);err!=nil {t.Fatal(err)}
+- if cookieNamesFor(t,v.jar(),"https://disk.yandex.ru/")["session"]!="fixture" {t.Fatal("session cookie discarded")}
++	path := writeCookieFile(t, ".yandex.ru\tTRUE\t/\tTRUE\t\tsession\tfixture\n")
++	v := NewYandexVolgaTransport("https://disk.yandex.ru/i/test", transport.DefaultConfig())
++	if err := v.LoadCookieFile(path); err != nil {
++		t.Fatal(err)
++	}
++	if cookieNamesFor(t, v.jar(), "https://disk.yandex.ru/")["session"] != "fixture" {
++		t.Fatal("session cookie discarded")
++	}
+ }
+ 
+ func cookieNamesFor(t *testing.T, jar *cookiejar.Jar, rawURL string) map[string]string {
+--- /dev/null
++++ b/transport/yandex/dial.go
+@@ -0,0 +1,82 @@
++package yandex
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"net/http"
++	"sort"
++	"time"
++)
++
++// The tunnel itself is IPv4: the L3 exit's raw sockets, the client's gVisor
++// stack and the L4 exit's re-dials all carry IPv4 only. A check the node asks
++// the client to pass (Yandex's SmartCaptcha) is shown to the client's browser
++// through that tunnel, so Yandex sees the node's IPv4 address, and the
++// "spravka" it issues is bound to that address. The node's own requests to
++// Yandex must therefore leave from the same address family. A dual-stack Go
++// dial goes out over IPv6 first wherever the host has an AAAA route, and
++// Yandex then rejects the browser's spravka for the node's IPv6 address: the
++// node is asked for the check again, over and over, whatever the client sends.
++//
++// Every connection of the Yandex carriers (document fetch, captcha PoW,
++// WebSocket, Volga relay) dials through dialIPv4First: IPv4 addresses first,
++// IPv6 only when none of them answers.
++
++// carrierDialTimeout bounds one connection attempt, so a dead IPv4 route
++// falls through to IPv6 in time instead of eating the whole connect budget.
++const carrierDialTimeout = 10 * time.Second
++
++// lookupIPAddr is the resolver; replaced in tests.
++var lookupIPAddr = net.DefaultResolver.LookupIPAddr
++
++// dialIPv4First is a DialContext that tries a host's IPv4 addresses before its
++// IPv6 ones. It follows the interface binding of package netbind.
++func dialIPv4First(ctx context.Context, network, address string) (net.Conn, error) {
++	if network != "tcp" {
++		return (&net.Dialer{Timeout: carrierDialTimeout}).DialContext(ctx, network, address)
++	}
++	host, port, err := net.SplitHostPort(address)
++	if err != nil || net.ParseIP(host) != nil {
++		return (&net.Dialer{Timeout: carrierDialTimeout}).DialContext(ctx, network, address)
++	}
++	addrs, err := lookupIPAddr(ctx, host)
++	if err != nil {
++		return nil, err
++	}
++	if len(addrs) == 0 {
++		return nil, fmt.Errorf("lookup %s: no addresses", host)
++	}
++	// Stable: the resolver's own order is kept inside each family.
++	sort.SliceStable(addrs, func(i, j int) bool {
++		return addrs[i].IP.To4() != nil && addrs[j].IP.To4() == nil
++	})
++	var firstErr error
++	for _, a := range addrs {
++		netw := "tcp6"
++		if a.IP.To4() != nil {
++			netw = "tcp4"
++		}
++		conn, err := (&net.Dialer{Timeout: carrierDialTimeout}).DialContext(ctx, netw, net.JoinHostPort(a.IP.String(), port))
++		if err == nil {
++			return conn, nil
++		}
++		if firstErr == nil {
++			firstErr = err
++		}
++		if ctx.Err() != nil {
++			break
++		}
++	}
++	return nil, firstErr
++}
++
++// carrierTransport is the default HTTP transport dialing through dialIPv4First.
++func carrierTransport() *http.Transport {
++	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
++		t := dt.Clone()
++		t.DialContext = dialIPv4First
++		return t
++	}
++	return &http.Transport{DialContext: dialIPv4First, ForceAttemptHTTP2: true}
++}
+--- /dev/null
++++ b/transport/yandex/dial_test.go
+@@ -0,0 +1,115 @@
++package yandex
++
++import (
++	"context"
++	"net"
++	"strings"
++	"testing"
++)
++
++func stubLookup(t *testing.T, addrs ...string) {
++	t.Helper()
++	old := lookupIPAddr
++	lookupIPAddr = func(_ context.Context, _ string) ([]net.IPAddr, error) {
++		out := make([]net.IPAddr, 0, len(addrs))
++		for _, a := range addrs {
++			out = append(out, net.IPAddr{IP: net.ParseIP(a)})
++		}
++		return out, nil
++	}
++	t.Cleanup(func() { lookupIPAddr = old })
++}
++
++// A host that resolves to IPv6 first is still reached over IPv4 when it
++// answers there: the browser's spravka is bound to the tunnel's IPv4 address.
++func TestDialIPv4FirstPrefersIPv4(t *testing.T) {
++	ln, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Skip("no IPv4 loopback:", err)
++	}
++	defer ln.Close()
++	go func() {
++		for {
++			c, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			c.Close()
++		}
++	}()
++	_, port, _ := net.SplitHostPort(ln.Addr().String())
++	stubLookup(t, "::1", "127.0.0.1") // the resolver's order: IPv6 first
++
++	conn, err := dialIPv4First(context.Background(), "tcp", net.JoinHostPort("carrier.test", port))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	if !strings.HasPrefix(conn.RemoteAddr().String(), "127.0.0.1:") {
++		t.Fatalf("connected to %s, want the IPv4 address", conn.RemoteAddr())
++	}
++}
++
++// IPv6 is the fallback: no IPv4 address answers, the IPv6 one does.
++func TestDialIPv4FirstFallsBackToIPv6(t *testing.T) {
++	ln, err := net.Listen("tcp6", "[::1]:0")
++	if err != nil {
++		t.Skip("no IPv6 loopback:", err)
++	}
++	defer ln.Close()
++	go func() {
++		for {
++			c, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			c.Close()
++		}
++	}()
++	_, port, _ := net.SplitHostPort(ln.Addr().String())
++	// Nothing listens on 127.0.0.1:<port>: the IPv4 attempt is refused.
++	stubLookup(t, "127.0.0.1", "::1")
++
++	conn, err := dialIPv4First(context.Background(), "tcp", net.JoinHostPort("carrier.test", port))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	if !strings.HasPrefix(conn.RemoteAddr().String(), "[::1]:") {
++		t.Fatalf("connected to %s, want the IPv6 fallback", conn.RemoteAddr())
++	}
++}
++
++func TestDialIPv4FirstLeavesLiteralsAlone(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Skip(err)
++	}
++	defer ln.Close()
++	go func() {
++		if c, err := ln.Accept(); err == nil {
++			c.Close()
++		}
++	}()
++	// A literal address never touches the resolver.
++	old := lookupIPAddr
++	lookupIPAddr = func(context.Context, string) ([]net.IPAddr, error) {
++		t.Error("resolver used for a literal address")
++		return nil, nil
++	}
++	defer func() { lookupIPAddr = old }()
++	conn, err := dialIPv4First(context.Background(), "tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	conn.Close()
++}
++
++// Every client of the carriers must go through the dialer; a plain
++// http.Client{} would quietly bring the IPv6-first dial back.
++func TestCarrierTransportDialsIPv4First(t *testing.T) {
++	tr := carrierTransport()
++	if tr.DialContext == nil {
++		t.Fatal("carrier transport has no DialContext")
++	}
++}
+--- a/transport/yandex/vyandex.go
++++ b/transport/yandex/vyandex.go
+@@ -166,6 +166,7 @@
+ 	session := &http.Client{
+ 		Jar: jar,
+ 		Transport: &http.Transport{
++			DialContext:         dialIPv4First,
+ 			MaxIdleConns:        100,
+ 			MaxIdleConnsPerHost: 100,
+ 			IdleConnTimeout:     90 * time.Second,
+@@ -561,6 +562,7 @@
+ 
+ func newRelayClient(auth *atomic.Pointer[volgaAuth], cfg VolgaConfig, stats *VolgaStats) *relayClient {
+ 	tr := &http.Transport{
++		DialContext:         dialIPv4First,
+ 		MaxIdleConns:        cfg.MaxIdleConns,
+ 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
+ 		IdleConnTimeout:     cfg.IdleConnTimeout,
+@@ -1047,6 +1049,7 @@
+ 	header.Set("Cookie", strings.Join(cookieParts, "; "))
+ 
+ 	dialer := websocket.Dialer{
++		NetDialContext:   dialIPv4First,
+ 		HandshakeTimeout: w.config.WSHandshakeTimeout,
+ 		ReadBufferSize:   4 << 20,
+ 		WriteBufferSize:  4 << 20,
+@@ -1237,9 +1240,9 @@
+ 	onDataMu sync.RWMutex
+ 	onData   func([]byte)
+ 
+-	cookieJar *cookiejar.Jar
++	cookieJar  *cookiejar.Jar
+ 	cookieFile string
+-	jarMu     sync.RWMutex
++	jarMu      sync.RWMutex
+ 
+ 	errNotifier func(err error, transportName, url, reason string)
+ 
+@@ -1309,7 +1312,9 @@
+ 	t.auth.Store(auth)
+ 	relay := newRelayClient(&t.auth, t.config, t.stats)
+ 	ws := newWSListener(&t.auth, func() (*volgaAuth, error) {
+-		if err := t.reloadCookieFile(); err != nil { return nil, err }
++		if err := t.reloadCookieFile(); err != nil {
++			return nil, err
++		}
+ 		return authorizeContext(t.ctx, t.docURL, t.jar())
+ 	}, t.config, t.stats, relay, func(data []byte) {
+ 		t.onDataMu.RLock()
+@@ -1496,7 +1501,9 @@
+ // LoadCookieFile imports a Netscape cookies.txt (yandex.ru cookies only)
+ // into the transport's cookie jar, so it opens the document signed in.
+ func (t *YandexVolgaTransport) LoadCookieFile(path string) error {
+-	if err := loadYandexCookies(path, t.jar()); err != nil { return err }
++	if err := loadYandexCookies(path, t.jar()); err != nil {
++		return err
++	}
+ 	t.jarMu.Lock()
+ 	t.cookieFile = path
+ 	t.jarMu.Unlock()
+@@ -1507,7 +1514,9 @@
+ 	t.jarMu.RLock()
+ 	path := t.cookieFile
+ 	t.jarMu.RUnlock()
+-	if path == "" { return nil }
++	if path == "" {
++		return nil
++	}
+ 	return loadYandexCookies(path, t.jar())
+ }
+ 
+--- a/transport/yandex/yandex.go
++++ b/transport/yandex/yandex.go
+@@ -8,7 +8,6 @@
+ 	"fmt"
+ 	"io"
+ 	"math/rand"
+-	"net"
+ 	"net/http"
+ 	"net/http/cookiejar"
+ 	"regexp"
+@@ -32,16 +31,18 @@
+ )
+ 
+ type YandexDocsInfo struct {
+-	CookieStr   string
+-	Token       string
+-	DocID       string
+-	CallbackURL string
+-	UserID      string
+-	Origin      string
+-	Host        string
+-	WsURL       string
+-	Permissions map[string]interface{}
+-	OpenCmd     map[string]interface{}
++	CookieStr    string
++	Token        string
++	DocID        string
++	CallbackURL  string
++	UserID       string
++	EditorUserID string
++	IsExcel      bool
++	Origin       string
++	Host         string
++	WsURL        string
++	Permissions  map[string]interface{}
++	OpenCmd      map[string]interface{}
+ }
+ 
+ type DocSession struct {
+@@ -59,14 +60,17 @@
+ func (s *DocSession) safeWrite(messageType int, data []byte) error {
+ 	s.writeMu.Lock()
+ 	defer s.writeMu.Unlock()
++	if err := s.Conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
++		return err
++	}
+ 	return s.Conn.WriteMessage(messageType, data)
+ }
+ 
+ type YandexDocsTransport struct {
+ 	*transport.BaseTransport
+ 
+-	url      string
+-	session  *DocSession
++	url     string
++	session *DocSession
+ 
+ 	userCounter atomic.Int32
+ 	baseUserID  string
+@@ -96,7 +100,6 @@
+ 	return t
+ }
+ 
+-
+ func (t *YandexDocsTransport) Start() error {
+ 	if err := t.BaseTransport.Start(); err != nil {
+ 		return err
+@@ -109,6 +112,7 @@
+ 	t.Mu.Unlock()
+ 
+ 	t.spawn("yandex.keepAlive", t.keepAliveLoop)
++	t.spawn("yandex.editorActivity", t.editorActivityLoop)
+ 	t.connectToDoc(0)
+ 
+ 	return nil
+@@ -230,11 +234,8 @@
+ 		// insufficient on iOS).
+ 		dialer := websocket.Dialer{
+ 			HandshakeTimeout: 15 * time.Second,
+-			NetDialContext: (&net.Dialer{
+-				Timeout:   10 * time.Second,
+-				KeepAlive: 30 * time.Second,
+-			}).DialContext,
+-			TLSClientConfig: t.tlsConfig,
++			NetDialContext:   dialIPv4First,
++			TLSClientConfig:  t.tlsConfig,
+ 		}
+ 		headers := http.Header{}
+ 		headers.Set("User-Agent", "Mozilla/5.0")
+@@ -585,7 +586,7 @@
+ 
+ func (t *YandexDocsTransport) fetchDocInfo(ctx context.Context, url, userID string) (YandexDocsInfo, error) {
+ 	jar, _ := cookiejar.New(nil)
+-	client := &http.Client{
++	client := &http.Client{Transport: carrierTransport(),
+ 		Jar: jar,
+ 		// НЕ следуем редиректам автоматически — обрабатываем вручную.
+ 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+@@ -723,7 +724,13 @@
+ 		perms = make(map[string]interface{})
+ 	}
+ 
++	editorID := ""
++	if user, ok := editorConfigRaw["user"].(map[string]interface{}); ok {
++		editorID, _ = user["id"].(string)
++	}
++	fileType, _ := document["fileType"].(string)
+ 	return YandexDocsInfo{
++		EditorUserID: editorID, IsExcel: isExcelFile(fileType),
+ 		CookieStr:   strings.Join(cookies, "; "),
+ 		Token:       token,
+ 		DocID:       docKey,
+@@ -743,7 +750,144 @@
+ 	}, nil
+ }
+ 
+-
+ func randUserID() string {
+ 	return fmt.Sprintf("%010d", rand.New(rand.NewSource(time.Now().UnixNano())).Intn(1000000000))
+ }
++
++const (
++	modelMetaOp  = "76;AgAAADEA//8BAJ+fl7jkAwIALQEAAAMAAAAAAAAAAAAAAAAAAAAAAAAA9v///xoAAAAyADAAMgA2AC4AMgAuADEALgAyADIANgA4AA=="
++	entityCursor = "35" // id потока курсора (совпадает с оригиналом)
++	cursorStream = "14" // id курсор-потока в CursorInfo
++)
++
++// cursorOp собирает один курсор-оп: "<entity>;<base64>". Base64-нагрузка —
++// та же форма, что в дампе (4-байтовый заголовок длины строки, затем строка
++// userShortID в UTF-16LE, затем фиксированные поля и байт seq), но с
++// настоящим userShortID и меняющимся счётчиком seq, поэтому каждое
++// сообщение отличается и выглядит живой активностью.
++func cursorOp(userShortID string, seq int) string {
++	payload := make([]byte, 0, 32)
++	payload = append(payload, 0x06, 0x00, 0x00, 0x00) // длина строки = 6 (UTF-16 units)
++	for _, r := range userShortID {
++		payload = append(payload, byte(r), 0x00)
++	}
++	payload = append(payload,
++		0x01, 0x00, 0x1c, 0x00, // позиция/флаг курсора
++		0x01, 0x00, 0x00, 0x00,
++		byte(seq), 0x00, 0x00, 0x00,
++		0x01, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00,
++	)
++	return entityCursor + ";" + base64.StdEncoding.EncodeToString(payload)
++}
++
++// cursorInfo строит CursorInfo-строку: "<stream>;<base64>". В base64 лежит
++// 6-байтовая строка userShortID (UTF-16LE) и 4 байта позиции; формат ровно
++// такой же, как в дампе, но id и позиция — настоящие.
++func cursorInfo(userShortID string, seq int) string {
++	payload := make([]byte, 0, 16)
++	payload = append(payload, 0x06, 0x00, 0x00, 0x00)
++	for _, r := range userShortID {
++		payload = append(payload, byte(r), 0x00)
++	}
++	payload = append(payload, 0x03, 0x00, 0x00, 0x00, byte(seq), 0x00)
++	return cursorStream + ";" + base64.StdEncoding.EncodeToString(payload)
++}
++
++// BuildSaveChanges is the saveChanges message for one participant and
++// iteration (see buildSaveChanges for how the pieces are chosen). A pure
++// function of its arguments, exported so the JS port of this transport can be
++// compared with it byte for byte.
++func BuildSaveChanges(userID string, isExcel bool, seq int) []byte {
++	short := userID
++	if len(short) > 10 {
++		short = short[:10]
++	}
++
++	changes := []string{
++		modelMetaOp,
++		cursorOp(short, seq),
++		cursorOp(short, seq+1),
++		cursorOp(short, seq+2),
++	}
++	changesJSON, _ := json.Marshal(changes) // ["...","..."]
++
++	excelInfo := map[string]string{
++		"UserId":      userID,
++		"UserShortId": short,
++		"CursorInfo":  cursorInfo(short, seq),
++	}
++	excelJSON, _ := json.Marshal(excelInfo)
++
++	msg := map[string]interface{}{
++		"type":                "saveChanges",
++		"changes":             string(changesJSON),
++		"startSaveChanges":    true,
++		"endSaveChanges":      true,
++		"isCoAuthoring":       true,
++		"isExcel":             isExcel,
++		"deleteIndex":         nil,
++		"excelAdditionalInfo": string(excelJSON),
++		"unlock":              false,
++		"releaseLocks":        true,
++	}
++	body, _ := json.Marshal([]interface{}{"message", msg})
++	return append([]byte("42"), body...)
++}
++
++// buildSaveChanges собирает saveChanges-сообщение под конкретную сессию и
++// номер итерации: актуальные UserId/UserShortId и слегка меняющиеся позиции
++// курсора. Оригинальные entity-префиксы и модель-оп сохранены побайтово;
++// меняется только то, что действительно зависит от участника.
++func (t *YandexDocsTransport) buildSaveChanges(session *DocSession, seq int) []byte {
++	userID := session.Info.EditorUserID
++	if userID == "" {
++		userID = session.UserID // fallback: псевдо-id, если jwt не дал реального
++	}
++	return BuildSaveChanges(userID, session.Info.IsExcel, seq)
++}
++
++func isExcelFile(fileType string) bool {
++	switch strings.ToLower(strings.TrimPrefix(fileType, ".")) {
++	case "xlsx", "xls", "xlsm", "csv":
++		return true
++	}
++	return false
++}
++
++func (t *YandexDocsTransport) editorActivityLoop() {
++	const (
++		minDelay = 500 * time.Millisecond
++		maxDelay = 5 * time.Second
++	)
++	seq := 0
++	for t.IsRunning() {
++		span := int64(maxDelay - minDelay)
++		delay := minDelay + time.Duration(rand.Int63n(span+1))
++
++		select {
++		case <-time.After(delay):
++		case <-t.runCtx().Done():
++			return
++		}
++
++		t.Mu.RLock()
++		session := t.session
++		t.Mu.RUnlock()
++		if session == nil || session.Conn == nil {
++			continue // mid-reconnect: nothing to write into
++		}
++
++		seq++
++		if edit, ok := session.Info.Permissions["edit"].(bool); ok && !edit {
++			continue
++		}
++		msg := t.buildSaveChanges(session, seq)
++		if err := session.safeWrite(websocket.TextMessage, msg); err != nil {
++			utils.Debugf("[YDOCS] saveChanges write error: %v", err)
++			// Держим цикл: следующая итерация попробует снова, а
++			// переподключение (keepAliveLoop / reader) поднимет новый conn.
++		}
++	}
++}

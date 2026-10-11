@@ -296,8 +296,8 @@ xm_watchdog_menu() {
             1) python3 "$script_dir/tuna-watchdog.py" menu || echo 'Не удалось открыть настройки watchdog.' >&2;;
             2) python3 "$script_dir/watchdog-health.py" report --human; xm_pause;;
             3)
-                xm_confirm 'Применить базовую защиту: до 5 повторных запусков с паузой 30 с; для OpenFlux общий лимит 20/30; добавить контроль Xray панели, если он ещё не настроен? Работающие службы не перезапускаются.' || continue
-                if python3 "$script_dir/tuna-watchdog.py" defaults --attempts 5 --delay 30; then
+                xm_confirm 'Применить базовую защиту: 5 попыток с паузой 5 с, для Xray 30 с; после исчерпания сброс через 5 минут? Работающие службы не перезапускаются.' || continue
+                if python3 "$script_dir/tuna-watchdog.py" defaults --attempts 5 --delay 5; then
                     python3 "$script_dir/watchdog-health.py" bootstrap --enable-timer --human || echo 'Контроль Xray не настроен; см. ошибку выше. Политики аварийного перезапуска применены.' >&2
                 else
                     echo 'Базовые политики не применены; см. ошибку выше.' >&2
@@ -311,7 +311,7 @@ xm_watchdog_menu() {
     done
 }
 xm_health_configure() {
-    local helper=$1 unit kind_pick kind host_pick host port path failures cooldown attempts
+    local helper=$1 unit kind_pick kind host_pick host port path failures cooldown attempts default_cooldown=5
     local -a args=()
     echo 'Укажите имя установленной службы, например xray, snell или openflux@1.'
     read -r -p 'Служба: ' unit || return 1
@@ -334,10 +334,12 @@ xm_health_configure() {
         fi
     fi
     read -r -p 'Последовательных ошибок до действия [Enter=3]: ' failures || return 1
-    read -r -p 'Пауза между попытками, секунд [Enter=300]: ' cooldown || return 1
-    read -r -p 'Всего перезапусков до ручного сброса; 0 — наблюдение [Enter=3]: ' attempts || return 1
-    args+=(--failures "${failures:-3}" --cooldown "${cooldown:-300}" --max-restarts "${attempts:-3}")
-    printf 'Служба: %s; проверка: %s; ошибок: %s; пауза: %s с; попыток: %s.\n' "$unit" "$kind" "${failures:-3}" "${cooldown:-300}" "${attempts:-3}"
+    case "$unit" in x-ui|xray|x-ui.service|xray.service) default_cooldown=30;; esac
+    read -r -p "Пауза между попытками, секунд [Enter=$default_cooldown]: " cooldown || return 1
+    read -r -p 'Перезапусков за цикл; 0 — наблюдение [Enter=5]: ' attempts || return 1
+    args+=(--failures "${failures:-3}" --cooldown "${cooldown:-$default_cooldown}" --max-restarts "${attempts:-5}")
+    printf 'Служба: %s; проверка: %s; ошибок: %s; пауза: %s с; попыток: %s.\n' "$unit" "$kind" "${failures:-3}" "${cooldown:-$default_cooldown}" "${attempts:-5}"
+    echo 'После исчерпания попыток — пауза 5 минут, затем новый цикл восстановления.'
     [ "$kind" = process ] || printf 'Локальная цель: %s:%s%s\n' "$host" "$port" "${path:-}"
     echo 'Настройка сохраняет проверку. Таймер включается отдельным пунктом; существующий лимит попыток не сбрасывается.'
     xm_confirm 'Сохранить эту проверку?' || return 0

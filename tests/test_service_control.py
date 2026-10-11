@@ -213,6 +213,16 @@ class ServiceControl(unittest.TestCase):
         self.assertIn("ConditionPathExists=!/etc/x-manager/service-control/off/volga-cookies.timer", data)
         self.assertTrue(self.control.allowed("volga-cookies.service"))
 
+    def test_missing_external_watchdogs_do_not_block_owned_service(self):
+        for unit in control.EXTERNAL_WATCHDOGS:
+            self.systemd.units[unit].update(LoadState="not-found", ActiveState="inactive")
+        self.assertEqual(self.control.conflicts(), [])
+        self.control.change("start", "mita")
+        self.assertEqual(self.control.status("mita")["ActiveState"], "active")
+        self.assertFalse(any(call[1] != "show" and len(call) > 2 and
+                             call[2] in control.EXTERNAL_WATCHDOGS
+                             for call in self.systemd.calls if call[0] == "systemctl"))
+
     def test_conflict_report_is_read_only_and_external_units_need_explicit_choice(self):
         self.control.reconcile()
         self.assertFalse(self.systemd.calls)

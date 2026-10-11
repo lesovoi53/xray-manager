@@ -34,7 +34,7 @@ xm_service() {
     fi
     if [ -n "${XM_BACKUP:-}" ] && python3 - "$XM_BACKUP/state.json" "$1" <<'PY'
 import json, sys
-name = sys.argv[2] if sys.argv[2].endswith('.service') else sys.argv[2]+'.service'
+name = sys.argv[2] if sys.argv[2].endswith(('.service','.timer')) else sys.argv[2]+'.service'
 previous = json.load(open(sys.argv[1]))['services'].get(name, {})
 sys.exit(0 if previous.get('enabled') not in ('not-found', '', None) and not previous.get('active') else 1)
 PY
@@ -42,6 +42,10 @@ PY
         echo "Preserving stopped service: $1"
         return
     fi
+    # Explicit maintenance starts must not exhaust systemd's lifetime window.
+    # Lifecycle checks above preserve stopped/off units; persistent recovery
+    # budgets are separate and are not changed by reset-failed.
+    systemctl reset-failed "$1"
     systemctl restart "$1"
     sleep 2
     systemctl is-active --quiet "$1" || xm_die "Service failed: $1 (inspect its journal locally)"

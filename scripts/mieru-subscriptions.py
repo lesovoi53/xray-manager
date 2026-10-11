@@ -92,7 +92,12 @@ def export(model, host, username, name):
     params.update(model['entropy'])
     address = '[' + host.strip('[]') + ']' if ':' in host else host
     password = users[0]['password']
-    uri = 'mierus://' + quote(username, safe='') + ':' + quote(password, safe='') + '@' + address + '/?' + urlencode(params)
+    # Keep the legacy Base64 slash/padding spelling for existing importers.
+    # Both are legal inside a query value. '+' MUST remain %2B: standard
+    # query parsers otherwise turn it into a space and corrupt the pattern.
+    query = '&'.join(urlencode({k: v}, safe='/=' if k == 'traffic-pattern' else '')
+                     for k, v in params.items())
+    uri = 'mierus://' + quote(username, safe='') + ':' + quote(password, safe='') + '@' + address + '/?' + query
     return dict(uri=uri, pattern=model['payload'], port=ports, protocol=protocol,
                 username=username, password=password, **model['entropy'])
 

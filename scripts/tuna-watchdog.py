@@ -15,6 +15,7 @@ ROOT=Path('/etc/systemd/system')
 BACKUPS=Path('/var/backups')
 ENDPOINTS=Path('/etc/snell6/endpoints')
 NAME='90-tuna-watchdog.conf'
+HEADER='# Managed by TUNA watchdog; automatic reset after 300s via tuna-recovery.timer.\n'
 
 def lifecycle():
     # Both the checkout and the installed share directory keep these siblings.
@@ -40,8 +41,8 @@ def openflux_menu():
         action=input('[1] Настроить общий лимит\n[2] Выключить автоперезапуск OpenFlux\n[3] Сбросить общий счётчик\n[0] Назад\nДействие: ').strip()
         if action=='0':return
         if action=='1':
-            count=int(input('Общее число попыток [Enter=20]: ').strip() or '20')
-            delay=int(input('Пауза, секунд [Enter=30]: ').strip() or '30')
+            count=int(input('Общее число попыток [Enter=5]: ').strip() or '5')
+            delay=int(input('Пауза, секунд [Enter=5]: ').strip() or '5')
             group.configure(count,delay)
             print('Общий лимит сохранён. Работающие каналы не перезапускались.')
         elif action=='2':
@@ -58,7 +59,7 @@ def show(unit):
     return dict(l.split('=',1) for l in ctl('show',unit,'-p','LoadState','-p','ActiveState','-p','UnitFileState','-p','DropInPaths','-p','Type','-p','Restart','-p','RestartUSec','-p','StartLimitBurst','-p','StartLimitIntervalUSec','-p','Result','-p','NRestarts').splitlines() if '=' in l)
 def render(attempts,delay):
     if not 0<=attempts<=20 or not 1<=delay<=3600:raise ValueError('Лимит 0–20, задержка 1–3600 секунд')
-    return ('# Managed by TUNA watchdog; reset limit explicitly from the menu.\n[Unit]\n'
+    return (HEADER+'[Unit]\n'
             'StartLimitIntervalSec=infinity\nStartLimitBurst='+str(attempts+1)+'\n[Service]\n'
             'Restart='+('on-failure' if attempts else 'no')+'\nRestartSec='+str(delay)+'s\n')
 def apply(unit,attempts,delay):
@@ -172,7 +173,7 @@ def verify_default(unit, attempts, delay):
         raise ValueError('Не подтверждена политика systemd для '+unit)
 
 
-def defaults(attempts=5, delay=30):
+def defaults(attempts=5, delay=5):
     """Add missing crash policies as one transaction; never activate a unit."""
     data = render(attempts, delay)
     controller = lifecycle()
@@ -209,13 +210,13 @@ def defaults(attempts=5, delay=30):
                 # Exclusive creation also preserves an unexpected concurrent edit.
                 with path.open('x', encoding='utf-8', newline='\n') as stream:
                     written.append(path)
-                    stream.write(data)
+                    stream.write(render(attempts, 30 if record['unit'] in ('x-ui','xray') else delay))
                     stream.flush()
                     os.fsync(stream.fileno())
                 path.chmod(0o644)
             ctl('daemon-reload')
             for unit in plan:
-                verify_default(unit, attempts, delay)
+                verify_default(unit, attempts, 30 if unit in ('x-ui','xray') else delay)
             changed.extend(plan)
         except BaseException:
             for path in reversed(written):
@@ -227,14 +228,32 @@ def defaults(attempts=5, delay=30):
         return result
 
 
+def migrate_auto_reset():
+    """Installer transaction owns backups; only exact generated policies migrate."""
+    if os.environ.get('XM_WATCHDOG_TRANSACTION') != '1':
+        raise ValueError('Миграция выполняется только внутри резервируемого обновления')
+    controller=lifecycle()
+    check_default_conflicts(controller)
+    for unit in UNITS:
+        if unit.startswith('openflux@') or controller.status(unit)['off']: continue
+        path=ROOT/(unit+'.service.d')/NAME
+        if not path.is_file() or path.is_symlink(): continue
+        old=path.read_text()
+        match=re.fullmatch(r'# Managed by TUNA watchdog; reset limit explicitly from the menu\.\n\[Unit\]\nStartLimitIntervalSec=infinity\nStartLimitBurst=(\d+)\n\[Service\]\nRestart=(on-failure|no)\nRestartSec=(\d+)s\n',old)
+        if not match: continue
+        attempts=5 if match[2]=='on-failure' else 0
+        delay=30 if unit in ('x-ui','xray') else 5
+        if old!=render(attempts,delay): apply(unit,attempts,delay)
+
+
 def menu():
     while True:
         controller=lifecycle()
         available=[]
         print('\nTUNA Watchdog — аварийный перезапуск служб')
-        print('Для настроенных политик после лимита запуск блокируется до ручного сброса. Штатный stop не вызывает перезапуск.')
+        print('После исчерпания попыток — 5 минут ожидания, автоматический сброс и новый запуск. Штатный stop не вызывает перезапуск.')
         print('OpenFlux: общий бюджет автоперезапусков, сохраняется после перезагрузки.')
-        print('Остальные службы: лимит systemd учитывает ручные старты и сбрасывается при перезагрузке.')
+        print('Остальные службы: лимит systemd учитывает также ручные старты; восстановление выполняет tuna-recovery.timer.')
         for conflict in controller.conflicts():
             if conflict['conflict']:
                 print('Конфликт владельцев перезапуска: '+conflict['unit']+'. Выберите watchdog в управлении службами; автоматического отключения нет.')
@@ -268,7 +287,8 @@ def menu():
         action=input('[1] Настроить лимит\n[2] Отключить автоперезапуск\n[3] Сбросить лимит и запустить\n[4] Логи\n[0] Назад\nДействие: ').strip()
         if action=='1':
             count=input('Число повторных попыток [1–20, Enter=5]: ').strip() or '5'
-            delay=input('Пауза в секундах [1–3600, Enter=30]: ').strip() or '30'
+            default_delay='30' if unit in ('x-ui','xray') else '5'
+            delay=input('Пауза в секундах [1–3600, Enter='+default_delay+']: ').strip() or default_delay
             apply(unit,int(count),int(delay))
         elif action=='2':apply(unit,0,30)
         elif action=='3':
@@ -276,16 +296,16 @@ def menu():
         elif action=='4':subprocess.run(['journalctl','-u',unit,'-n','30','--no-pager'],check=True)
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['menu','set','retire-legacy','defaults']);parser.add_argument('--unit');parser.add_argument('--attempts',type=int,default=5);parser.add_argument('--delay',type=int);parser.add_argument('--json',action='store_true')
+    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['menu','set','retire-legacy','defaults','migrate-auto-reset']);parser.add_argument('--unit');parser.add_argument('--attempts',type=int,default=5);parser.add_argument('--delay',type=int);parser.add_argument('--json',action='store_true')
     a=parser.parse_args()
-    if a.delay is None:a.delay=30
+    if a.delay is None:a.delay=30 if a.unit in ('xray','x-ui') else 5
     if a.action=='menu':menu()
     elif a.action=='defaults':
         result=defaults(a.attempts,a.delay)
         group=openflux_watchdog()
         state=group.status()
-        grouped=group.configure(state['attempts'] if state['configured'] else 20,
-                                state['delay'] if state['configured'] else 30)
+        grouped=group.configure(state['attempts'] if state['configured'] else 5,
+                                state['delay'] if state['configured'] else 5)
         if not a.json:print('OpenFlux: общий бюджет сохранён.' if state['configured'] else 'OpenFlux: настройка общего бюджета завершена.')
         result['openflux']=grouped
         if a.json:print(json.dumps(result,ensure_ascii=False))
@@ -298,6 +318,7 @@ def main():
                 if item['reason'] in ('not-installed','no-endpoint','oneshot'):continue
                 print(item['unit']+': '+reasons.get(item['reason'],'сохранена существующая конфигурация'))
             if result['backup']:print('Копия: '+result['backup'])
+    elif a.action=='migrate-auto-reset':migrate_auto_reset()
     elif a.action=='retire-legacy':retire_legacy(a.attempts,a.delay)
     else:apply(a.unit,a.attempts,a.delay)
 if __name__=='__main__':
